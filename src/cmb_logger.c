@@ -17,7 +17,6 @@
  */
 
 #include <inttypes.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -28,6 +27,7 @@
 #include "cmb_random.h"
 
 #include "cmi_config.h"
+#include "cmi_thread.h"
 
 /* Maximum length of a formatted time string before it gets truncated */
 #define TSTRBUF_SZ 32
@@ -65,7 +65,7 @@
 static CMB_THREAD_LOCAL uint32_t cmi_logger_mask = UINT32_C(0xFFFFFFFF);
 
 /* A mutex to ensure that only one thread can be writing at the same time */
-static pthread_mutex_t cmi_logger_mutex = PTHREAD_MUTEX_INITIALIZER;
+static cmi_mutex_t cmi_logger_mutex = CMI_MUTEX_INITIALIZER;
 
 /*
  * The index of the currently executing trial in this worker thread,
@@ -143,7 +143,7 @@ int cmb_logger_vfprintf(FILE *fp,
 {
     int ret = 0;
     if ((flags & cmi_logger_mask) != 0) {
-        pthread_mutex_lock(&cmi_logger_mutex);
+        cmi_mutex_lock(&cmi_logger_mutex);
         int r = 0;
         if (cmi_logger_trial_idx != CMI_NO_TRIAL_IDX) {
             r = fprintf(fp, "%" PRIu64 "\t", cmi_logger_trial_idx);
@@ -201,7 +201,7 @@ int cmb_logger_vfprintf(FILE *fp,
         ret += r;
 
         fflush(fp);
-        pthread_mutex_unlock(&cmi_logger_mutex);
+        cmi_mutex_unlock(&cmi_logger_mutex);
     }
 
     return ret;
@@ -238,7 +238,7 @@ void cmi_logger_error(FILE *fp,
         va_end(args);
     }
 
-    pthread_exit(NULL);
+    cmi_thread_exit();
     /* Not reached */
 }
 

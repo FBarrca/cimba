@@ -22,7 +22,8 @@ sources = files('cimba.c',
                 'cmi_hashheap.c',
                 'cmi_holdable.c',
                 'cmi_mempool.c',
-                'cmi_resourcebase.c'
+                'cmi_resourcebase.c',
+                'cmi_thread.c'
 )
 
 inc_int = include_directories('.')
@@ -38,27 +39,20 @@ install_headers(
     'cmi_mempool.h',
     'cmi_memutils.h',
     'cmi_process.h',
-    'cmi_resourcebase.h'
+    'cmi_resourcebase.h',
+    'cmi_thread.h'
 )
 
 # Platform and operating system dependent source code
 subdir('port')
 
-cimba_link_args = []
-if host_machine.system() == 'windows'
-    # Bundle static GCC libraries to avoid DLL confusion
-    cimba_link_args += ['-static-libgcc', '-static']
-endif
-
 cimba_lib = library('cimba',
                     sources,
                     include_directories : [inc_api, inc_int],
-                    link_args : cimba_link_args,
                     dependencies : [project_deps, codegen_deps],
                     install : true,
                     version : meson.project_version(),
-                    soversion : '1',
-                    native : true
+                    soversion : '1'
 )
 
 my_lib_dep = declare_dependency(

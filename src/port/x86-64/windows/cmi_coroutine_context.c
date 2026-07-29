@@ -16,7 +16,6 @@
  * limitations under the License.
  */
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>

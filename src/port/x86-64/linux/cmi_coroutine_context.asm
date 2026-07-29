@@ -24,7 +24,7 @@ bits 64
 default rel
 
 section .text
-global cmi_coroutine_context_switch
+global cmi_coroutine_context_switch_raw
 global cmi_coroutine_trampoline
 
 ;-------------------------------------------------------------------------------
@@ -87,7 +87,7 @@ global cmi_coroutine_trampoline
 ;   None - The samurai returns victorious or not at all. Loading a NULL stack
 ;          pointer will have immediate consequences, no assert() needed to trap.
 ;
-cmi_coroutine_context_switch:
+cmi_coroutine_context_switch_raw:
     ; Push all callee-saved registers to current stack
     save_context
     ; Store old stack pointer to address given as first argument RDI

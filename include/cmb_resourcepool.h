@@ -183,7 +183,7 @@ extern void cmb_resourcepool_release(struct cmb_resourcepool *rpp,
  * @param rsp Pointer to a resource pool.
  * @return A null-terminated string with the name of the resource pool.
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline const char *cmb_resourcepool_get_name(struct cmb_resourcepool *rsp)
 {
     cmb_assert_debug(rsp != NULL);
@@ -201,7 +201,7 @@ static inline const char *cmb_resourcepool_get_name(struct cmb_resourcepool *rsp
  * @param rsp Pointer to a resource pool
  * @return The number of units in use
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline uint64_t cmb_resourcepool_in_use(struct cmb_resourcepool *rsp)
 {
     cmb_assert_release(rsp != NULL);
@@ -218,7 +218,7 @@ static inline uint64_t cmb_resourcepool_in_use(struct cmb_resourcepool *rsp)
  * @param rsp Pointer to a resource pool
  * @return The number of units not in use
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline uint64_t cmb_resourcepool_available(struct cmb_resourcepool *rsp)
 {
     cmb_assert_release(rsp != NULL);

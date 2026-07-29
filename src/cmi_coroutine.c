@@ -29,8 +29,24 @@
 CMB_THREAD_LOCAL struct cmi_coroutine *coroutine_main = NULL;
 CMB_THREAD_LOCAL struct cmi_coroutine *coroutine_current = NULL;
 
-/* Assembly function, see src/port/x86-64/Linux/cmi_coroutine_context_*.asm */
+/* Assembly function supplied by the active architecture port. */
+extern void *cmi_coroutine_context_switch_raw(void **old,
+                                               void **new,
+                                               void *ret);
+
+#ifndef CMI_EXTERNAL_CONTEXT_SWITCH_WRAPPER
+/*
+ * Default pass-through wrapper. Embedders that need to save additional
+ * language-runtime state around stack switches can provide this symbol by
+ * enabling external_context_switch_wrapper.
+ */
+void *cmi_coroutine_context_switch(void **old, void **new, void *ret)
+{
+    return cmi_coroutine_context_switch_raw(old, new, ret);
+}
+#else
 extern void *cmi_coroutine_context_switch(void **old, void **new, void *ret);
+#endif
 
 /* OS-specific C code, see src/arch/cmi_coroutine_context_*.c */
 extern bool cmi_coroutine_stack_valid(const struct cmi_coroutine *cp);

@@ -21,7 +21,7 @@
  * limitations under the License.
  */
 
-#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <xmmintrin.h>
 
@@ -29,6 +29,7 @@
 
 #include "cmi_mempool.h"
 #include "cmi_memutils.h"
+#include "cmi_thread.h"
 
 /* Only used from here, no header file needed */
 extern uint32_t cmi_cpu_cores(void);
@@ -43,12 +44,9 @@ static uint64_t cmg_total_trials;
 static cimba_thread_init_func *cmg_thread_init_func = NULL;
 static void *cmg_thread_init_usrarg = NULL;
 static cimba_thread_exit_func *cmg_thread_exit_func = NULL;
-static pthread_mutex_t cmg_experiment_mutex = PTHREAD_MUTEX_INITIALIZER;
+static cmi_mutex_t cmg_experiment_mutex = CMI_MUTEX_INITIALIZER;
 
-/* Using GCC/Clang __atomic built-in rather than C11 stdatomic.h due to clangd
- * false positives that have no clean workaround as of early 2026. Hence
- * declaring cmg_next_trial_idx as plain static uint64_t instead of _Atomic */
-static uint64_t cmg_next_trial_idx;
+static _Atomic uint64_t cmg_next_trial_idx;
 
 /* User-defined context per thread */
 CMB_THREAD_LOCAL void *cmi_thread_context = NULL;
@@ -78,8 +76,7 @@ void *cimba_thread_context(void)
 }
 
 /*
- * thread_exit_wrapper - Internal function to simplify conditional pthread_cleanup_push
- * with its strange unbalanced braces and other weirdness. It is cleaner like this.
+ * thread_exit_wrapper - Run an optional embedding cleanup hook.
  */
 static void thread_exit_wrapper(void *context)
 {
@@ -103,16 +100,10 @@ static void *worker_thread_func(void *arg)
         cmi_thread_context = cmg_thread_init_func(cmg_thread_init_usrarg, tid);
     }
 
-    /* Make sure we free any thread local allocations before we exit */
-    pthread_cleanup_push(cmi_mempool_cleanup, NULL);
-
-    /* Any user-defined cleanup needed? */
-    pthread_cleanup_push(thread_exit_wrapper, cmi_thread_context);
-
     while (true) {
-        /* Using GCC/Clang __atomic built-in rather than C11 stdatomic.h due to
-         * clangd false positives with no clean workaround */
-        const uint64_t idx = __atomic_fetch_add(&cmg_next_trial_idx, 1, __ATOMIC_RELAXED);
+        const uint64_t idx = atomic_fetch_add_explicit(
+            &cmg_next_trial_idx, 1, memory_order_relaxed
+        );
         if (idx >= cmg_total_trials) {
             break;
         }
@@ -132,9 +123,8 @@ static void *worker_thread_func(void *arg)
         }
     }
 
-    /* Made it this far, execute the cleanup functions before exiting */
-    pthread_cleanup_pop(1);
-    pthread_cleanup_pop(1);
+    thread_exit_wrapper(cmi_thread_context);
+    cmi_mempool_cleanup(NULL);
 
     return NULL;
 }
@@ -158,10 +148,10 @@ void cimba_run_experiment(void *your_experiment_array,
     cmb_assert_release(trial_struct_size > 0u);
 
     /* A mutex to make sure the Cimba globals are protected */
-   pthread_mutex_lock(&cmg_experiment_mutex);
+    cmi_mutex_lock(&cmg_experiment_mutex);
 
     /* Initialize globals for the threads */
-    cmg_next_trial_idx = 0u;
+    atomic_store_explicit(&cmg_next_trial_idx, 0u, memory_order_relaxed);
     cmg_experiment_arr = your_experiment_array;
     cmg_trial_struct_sz = trial_struct_size;
     cmg_trial_func = your_trial_func;
@@ -169,20 +159,24 @@ void cimba_run_experiment(void *your_experiment_array,
 
     /* Start the worker threads and let them help themselves to the trials */
     const uint32_t ncores = cmi_cpu_cores();
-    pthread_t *threads = cmi_calloc(ncores, sizeof(*threads));
+    cmi_thread_t *threads = cmi_calloc(ncores, sizeof(*threads));
     for (uint64_t ui = 0u; ui < ncores; ui++) {
-        pthread_create(&threads[ui], NULL, worker_thread_func, (void *)ui);
+        const int r = cmi_thread_create(
+            &threads[ui], worker_thread_func, (void *)(uintptr_t)ui
+        );
+        cmb_assert_always(r == 0);
     }
 
     /* ...worker threads are executing your trials in the background here... */
 
     /* Wait for all worker threads to finish */
     for (uint64_t ui = 0u; ui < ncores; ui++) {
-        pthread_join(threads[ui], NULL);
+        const int r = cmi_thread_join(threads[ui]);
+        cmb_assert_always(r == 0);
     }
 
     cmi_free(threads);
 
     /* Only unlock when all is said and done */
-    pthread_mutex_unlock(&cmg_experiment_mutex);
+    cmi_mutex_unlock(&cmg_experiment_mutex);
 }

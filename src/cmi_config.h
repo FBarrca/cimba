@@ -21,25 +21,31 @@
 #define CIMBA_CMI_CONFIG_H
 
 /*
- * Identify the processor architecture. So far, only AMD64/x86-64 is supported.
+ * Identify the processor architecture.
  */
 #define CMI_AMD64 1
+#define CMI_ARM64 2
 #if (defined (__amd64__) || defined (__amd64) || defined (__x86_64__) || \
      defined (__x86_64) || defined (_M_X64) || defined (_M_AMD64))
   #define CMI_ARCH CMI_AMD64
+#elif defined (__aarch64__) || defined (__arm64__) || defined (_M_ARM64)
+  #define CMI_ARCH CMI_ARM64
 #else
   #error "Platform architecture not yet supported."
 #endif
 
 /*
- * Identify the operating system. So far, only Linux and Windows are supported.
+ * Identify the operating system.
  */
 #define CMI_LINUX 1
 #define CMI_WINDOWS 2
+#define CMI_MACOS 3
 #if defined (__linux__) || defined (__linux) || defined (linux)
   #define CMI_OS CMI_LINUX
 #elif defined (_WIN64) || defined (_WIN32) || defined (__WIN32__)
   #define CMI_OS CMI_WINDOWS
+#elif defined (__APPLE__) && defined (__MACH__)
+  #define CMI_OS CMI_MACOS
 #else
   #error "Platform operating system not yet supported."
 #endif
@@ -50,18 +56,35 @@
  */
 #define CMI_GCC 1
 #define CMI_CLANG 2
+#define CMI_MSVC 3
 #if defined (__clang__)
   #define CMI_COMPILER CMI_CLANG
 #elif defined (__GNUC__)
   #define CMI_COMPILER CMI_GCC
+#elif defined (_MSC_VER)
+  #define CMI_COMPILER CMI_MSVC
 #else
   #error "Compiler not yet supported."
 #endif
 
-#if CMI_OS == CMI_LINUX
+#if CMI_OS == CMI_LINUX && (CMI_COMPILER == CMI_GCC || CMI_COMPILER == CMI_CLANG)
     #define CMB_THREAD_LOCAL _Thread_local __attribute__((tls_model("initial-exec")))
+#elif CMI_COMPILER == CMI_MSVC
+    #define CMB_THREAD_LOCAL __declspec(thread)
 #else
     #define CMB_THREAD_LOCAL _Thread_local
+#endif
+
+#if CMI_COMPILER == CMI_MSVC
+    #define CMI_MAYBE_UNUSED
+    #define CMI_NORETURN __declspec(noreturn)
+#else
+    /*
+     * AppleClang 15 accepts -std=c2x but does not yet accept the C23
+     * CMI_MAYBE_UNUSED/CMI_NORETURN spelling used by newer compilers.
+     */
+    #define CMI_MAYBE_UNUSED __attribute__((unused))
+    #define CMI_NORETURN __attribute__((noreturn))
 #endif
 
 

@@ -20,7 +20,7 @@
 ; limitations under the License.
 
 section .text
-global cmi_coroutine_context_switch
+global cmi_coroutine_context_switch_raw
 global cmi_coroutine_trampoline
 global cmi_coroutine_stackbase
 global cmi_coroutine_stacklimit
@@ -150,7 +150,7 @@ cmi_coroutine_stackraw:
 ; Error handling:
 ;   None - the samurai returns victorious or not at all
 ;
-cmi_coroutine_context_switch:
+cmi_coroutine_context_switch_raw:
     ; Push all callee-saved registers to current stack
     save_context
 

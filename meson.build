@@ -8,9 +8,6 @@ project('cimba', 'c',
         ]
 )
 
-# We also need the portable Netwide Assembler for assembly code
-add_languages('nasm', required : true, native : true)
-
 # Check for compiler flags availability
 # DNDEBUG removes debug asserts
 # DNLOGINFO removes all internal Cimba logging
@@ -21,10 +18,17 @@ cc = meson.get_compiler('c')
 # Flags common to all build types
 common_flags = [
     '-Wno-pedantic',
-    '-D_POSIX_C_SOURCE=200809L',
     '-fno-semantic-interposition',
     '-DNMXCSR',
 ]
+
+if host_machine.system() == 'linux'
+    common_flags += '-D_POSIX_C_SOURCE=200809L'
+elif host_machine.system() == 'darwin'
+    # Keep declarations for Darwin extensions such as pthread_get_stackaddr_np
+    # and arc4random_buf visible while building the native runtime.
+    common_flags += '-D_DARWIN_C_SOURCE'
+endif
 
 if cc.has_argument('-std=c23')
     common_flags += '-std=c23'
@@ -85,9 +89,9 @@ if host_machine.system() == 'windows'
 endif
 
 supported_flags = cc.get_supported_arguments(desired_flags)
-add_project_arguments(supported_flags, language : 'c', native : true)
+add_project_arguments(supported_flags, language : 'c')
 if '-fprofile-generate' in supported_flags
-    add_project_link_arguments('-fprofile-generate', language : 'c', native : true)
+    add_project_link_arguments('-fprofile-generate', language : 'c')
 endif
 
 nasm_args = []
@@ -96,16 +100,28 @@ if '-DNMXCSR' in supported_flags
 endif
 
 # Need to link with the math library, linker flag -lm
-math_dep = cc.find_library('m', required : true)
-project_deps = [math_dep]
+math_dep = cc.find_library('m', required : false)
+project_deps = []
+if math_dep.found()
+    project_deps += math_dep
+endif
+
+if get_option('external_context_switch_wrapper')
+    add_project_arguments(
+        '-DCMI_EXTERNAL_CONTEXT_SWITCH_WRAPPER',
+        language : 'c',
+    )
+endif
 
 # Build Cimba
 subdir('include')
 subdir('codegen')
 subdir('src')
-subdir('test')
-subdir('tutorial')
-subdir('benchmark')
+if get_option('enable_extras')
+    subdir('test')
+    subdir('tutorial')
+    subdir('benchmark')
+endif
 
 pkg = import('pkgconfig')
 pkg.generate(

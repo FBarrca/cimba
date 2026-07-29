@@ -145,7 +145,7 @@ extern uint64_t cmb_random_fmix64(uint64_t seed, uint64_t nonce);
  *
  * See also https://en.wikipedia.org/wiki/Continuous_uniform_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random(void)
 {
     return ldexp((double)(cmb_random_sfc64() >> 11), -53);
@@ -161,7 +161,7 @@ static inline double cmb_random(void)
  *
  * See also https://en.wikipedia.org/wiki/Continuous_uniform_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_uniform(const double min, const double max)
 {
     cmb_assert_release(min < max);
@@ -202,7 +202,7 @@ extern double cmi_random_nor_not_hot(int64_t i_cand_x);
  *
  * See also https://en.wikipedia.org/wiki/Normal_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_std_normal(void)
 {
     uint64_t bits = cmb_random_sfc64();
@@ -226,7 +226,7 @@ static inline double cmb_random_std_normal(void)
  *
  * See also https://en.wikipedia.org/wiki/Normal_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_normal(const double mu, const double sigma)
 {
     cmb_assert_release(sigma > 0.0);
@@ -245,7 +245,7 @@ static inline double cmb_random_normal(const double mu, const double sigma)
  *
  * See also https://en.wikipedia.org/wiki/Log-normal_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_lognormal(const double m, const double s)
 {
     cmb_assert_release(s > 0.0);
@@ -263,7 +263,7 @@ static inline double cmb_random_lognormal(const double m, const double s)
  *
  * See also https://en.wikipedia.org/wiki/Logistic_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_logistic(const double m, const double s)
 {
     cmb_assert_release(s > 0.0);
@@ -286,7 +286,7 @@ static inline double cmb_random_logistic(const double m, const double s)
  *
  * See also https://en.wikipedia.org/wiki/Cauchy_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_cauchy(const double mode, const double scale)
 {
     cmb_assert_release(scale > 0.0);
@@ -315,7 +315,7 @@ extern double cmi_random_exp_not_hot(uint64_t u_cand_x);
  *
  * See also https://en.wikipedia.org/wiki/Exponential_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_std_exponential(void)
 {
     const uint64_t u_cand_x = cmb_random_sfc64();
@@ -340,7 +340,7 @@ static inline double cmb_random_std_exponential(void)
  *
  * See also https://en.wikipedia.org/wiki/Exponential_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_exponential(const double mean)
 {
     cmb_assert_release(mean > 0.0);
@@ -362,7 +362,7 @@ static inline double cmb_random_exponential(const double mean)
  *
  * See also https://en.wikipedia.org/wiki/Erlang_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_erlang(const unsigned k, const double m)
 {
     cmb_assert_release(k > 0u);
@@ -390,7 +390,7 @@ static inline double cmb_random_erlang(const unsigned k, const double m)
  *
  * See also https://en.wikipedia.org/wiki/Hypoexponential_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_hypoexponential(const unsigned n, const double *ma)
 {
     cmb_assert_release(n > 0);
@@ -447,7 +447,7 @@ extern double cmb_random_std_gamma(double shape);
  *
  * See also https://en.wikipedia.org/wiki/Gamma_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_gamma(const double shape, const double scale)
 {
     cmb_assert_release(shape > 0.0);
@@ -472,7 +472,7 @@ static inline double cmb_random_gamma(const double shape, const double scale)
  *
  * See also  https://en.wikipedia.org/wiki/Beta_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_std_beta(const double a, const double b)
 {
     cmb_assert_release(a > 0.0);
@@ -496,7 +496,7 @@ static inline double cmb_random_std_beta(const double a, const double b)
  *
  * See also https://en.wikipedia.org/wiki/Beta_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_beta(const double a, const double b,
                                      const double min, const double max)
 {
@@ -537,7 +537,7 @@ extern double cmb_random_PERT_mod(double min,
  *
  * See also https://en.wikipedia.org/wiki/PERT_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_PERT(const double min,
                                      const double mode,
                                      const double max)
@@ -567,7 +567,7 @@ static inline double cmb_random_PERT(const double min,
  *
  * See also https://en.wikipedia.org/wiki/Weibull_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_weibull(const double shape, const double scale)
 {
     cmb_assert_release(shape > 0.0);
@@ -591,7 +591,7 @@ static inline double cmb_random_weibull(const double shape, const double scale)
  *
  * See also https://en.wikipedia.org/wiki/Pareto_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_pareto(const double shape, const double mode)
 {
     cmb_assert_release(shape > 0.0);
@@ -614,7 +614,7 @@ static inline double cmb_random_pareto(const double shape, const double mode)
  *
  * See also https://en.wikipedia.org/wiki/Chi-squared_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_chisquared(const double k)
 {
     cmb_assert_release(k > 0.0);
@@ -635,7 +635,7 @@ static inline double cmb_random_chisquared(const double k)
  *
  * See also https://en.wikipedia.org/wiki/F-distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_F_dist(const double a, const double b)
 {
     cmb_assert_release(a > 0.0);
@@ -664,7 +664,7 @@ static inline double cmb_random_F_dist(const double a, const double b)
  *
  * See also https://en.wikipedia.org/wiki/Student%27s_t-distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_std_t_dist(const double v)
 {
     cmb_assert_release(v > 0.0);
@@ -689,7 +689,7 @@ static inline double cmb_random_std_t_dist(const double v)
  *
  * See also https://en.wikipedia.org/wiki/Student%27s_t-distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_t_dist(const double m,
                                 const double s,
                                 const double v)
@@ -710,7 +710,7 @@ static inline double cmb_random_t_dist(const double m,
  *
  * See also https://en.wikipedia.org/wiki/Rayleigh_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline double cmb_random_rayleigh(const double s)
 {
     cmb_assert_release(s > 0.0);
@@ -745,7 +745,7 @@ extern int cmb_random_flip(void);
  *
  * See also https://en.wikipedia.org/wiki/Bernoulli_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline unsigned cmb_random_bernoulli(const double p)
 {
     cmb_assert_release((p >= 0.0) && (p <= 1.0));
@@ -808,7 +808,7 @@ extern unsigned cmb_random_negative_binomial(unsigned m, double p);
  *
  * See also https://en.wikipedia.org/wiki/Negative_binomial_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline unsigned cmb_random_pascal(const unsigned m, const double p)
 {
     return cmb_random_negative_binomial(m, p);
@@ -836,7 +836,7 @@ extern unsigned cmb_random_poisson(double r);
  *
  * See also https://en.wikipedia.org/wiki/Discrete_uniform_distribution
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline long cmb_random_dice(const long a, const long b)
 {
     cmb_assert (a < b);
@@ -918,7 +918,7 @@ extern struct cmb_random_alias *cmb_random_alias_create(unsigned n,
  *        `pa[i]`
 
  */
-[[maybe_unused]]
+CMI_MAYBE_UNUSED
 static inline unsigned cmb_random_alias_sample(const struct cmb_random_alias *ap)
 {
     cmb_assert_release(ap != NULL);

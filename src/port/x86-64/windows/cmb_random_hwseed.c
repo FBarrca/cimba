@@ -16,48 +16,23 @@
  * limitations under the License.
  */
 
-#include <time.h>
+#define _CRT_RAND_S
+#include <stdlib.h>
 
 #include "cmb_assert.h"
 #include "cmb_random.h"
 
-/* Assembly functions, see cmi_random_hwseed.asm */
-extern int cmi_cpu_has_rdseed(void);
-extern int cmi_cpu_has_rdrand(void);
-extern uint64_t cmi_rdseed(void);
-extern uint64_t cmi_rdrand(void);
-extern uint32_t cmi_threadid(void);
-extern uint32_t cmi_rdtsc(void);
-
-/* Windows-specific code to get a suitable 64-bit seed from hardware */
+/* Windows-specific code to get a suitable 64-bit seed from the OS CSPRNG. */
 uint64_t cmb_random_hwseed(void)
 {
-    uint64_t seed = 0u;
-    if (cmi_cpu_has_rdseed()) {
-        /* Should be valid since Intel Broadwell (2014) and AMD Zen (2016) */
-        seed = cmi_rdseed();
-    }
-    else if (cmi_cpu_has_rdrand()) {
-        /* True for Intel since Ivy Bridge (2012) */
-        seed = cmi_rdrand();
-    }
-    else {
-        /* Some other (older?) CPU, build a decent seed ourselves */
-        /* Start with thread id in top 32 bits */
-        const uint64_t tid = cmi_threadid();
-        seed = (tid << 32);
+    unsigned int high = 0u;
+    unsigned int low = 0u;
+    const errno_t high_result = rand_s(&high);
+    const errno_t low_result = rand_s(&low);
+    cmb_assert_always(high_result == 0);
+    cmb_assert_always(low_result == 0);
 
-        /* Add a mashup of clock values into low 32 bits */
-        struct timespec ts;
-        const int r = clock_gettime(CLOCK_REALTIME, &ts);
-        cmb_assert_release(r == 0);
-        const uint64_t mash = (uint64_t)(ts.tv_nsec ^ ts.tv_sec);
-        seed += mash;
-
-        /* XOR the whole thing with the 64-bit CPU cycle count since reset */
-        seed ^= cmi_rdtsc();
-    }
-
+    const uint64_t seed = ((uint64_t)high << 32u) | (uint64_t)low;
     cmb_assert_debug(seed != 0u);
     return seed;
 }

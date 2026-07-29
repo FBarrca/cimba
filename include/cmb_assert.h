@@ -26,6 +26,8 @@
 #ifndef CIMBA_CMB_ASSERT_H
 #define CIMBA_CMB_ASSERT_H
 
+#include "cmi_config.h"
+
 /**
  * @brief The function that reports and aborts when a `cmb_assert_*`is
  * triggered.
@@ -34,7 +36,7 @@
  * function, and you will be able to see the call stack and variable
  * values at that point.
  */
-[[noreturn]]
+CMI_NORETURN
 extern void cmi_assert_failed(const char *sourcefile,
                               const char *func,
                               int line,
