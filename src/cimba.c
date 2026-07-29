@@ -23,7 +23,6 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
-#include <xmmintrin.h>
 
 #include "cimba.h"
 
