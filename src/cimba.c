@@ -75,7 +75,18 @@ static uint64_t leaking_trials;
 static CMB_THREAD_LOCAL cimba_trial_cleanup_func *trial_cleanup_func = NULL;
 static CMB_THREAD_LOCAL void *trial_cleanup_arg = NULL;
 
-#if CMI_ARCH == CMI_ARM64
+#if CMI_OS == CMI_WINDOWS && CMI_ARCH == CMI_AMD64
+/* Use the CRT context on Win64: older Clang builtins save an incorrect frame
+ * pointer (https://github.com/llvm/llvm-project/issues/51055). Coroutine stacks
+ * are independent: do not unwind frames between them. The memory registry
+ * handles trial cleanup instead. */
+static CMB_THREAD_LOCAL jmp_buf recovery_buf;
+#define recovery_set() setjmp(recovery_buf)
+#define recovery_jump() do { \
+    ((_JUMP_BUFFER *)recovery_buf)->Frame = 0; \
+    longjmp(recovery_buf, 1); \
+} while (0)
+#elif CMI_ARCH == CMI_ARM64
 /* Clang does not implement __builtin_setjmp on AArch64. */
 static CMB_THREAD_LOCAL jmp_buf recovery_buf;
 #define recovery_set() setjmp(recovery_buf)
