@@ -85,7 +85,6 @@ void *putterfunc(struct cmb_process *me, void *vctx)
     cmb_assert_always(vctx != NULL);
     struct cmb_buffer *bp = (struct cmb_buffer *) vctx;
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         int64_t sig = cmb_process_hold(cmb_random_exponential(1.0));
@@ -100,7 +99,7 @@ void *putterfunc(struct cmb_process *me, void *vctx)
         cmb_assert_always((n >= (uint64_t)1) && (n <= (uint64_t)15));
         uint64_t m = n;
         cmb_logger_user(stdout, USERFLAG1, "Putting %" PRIu64 " into %s...",
-                        n, cmb_buffer_get_name(bp));
+                        n, cmb_buffer_name(bp));
 
         sig = cmb_buffer_put(bp, &m);
         if (sig == CMB_PROCESS_SUCCESS) {
@@ -125,7 +124,6 @@ void *getterfunc(struct cmb_process *me, void *ctx)
 
     struct cmb_buffer *bp = (struct cmb_buffer *) ctx;
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         int64_t sig = cmb_process_hold(cmb_random_exponential(1.0));
@@ -139,7 +137,7 @@ void *getterfunc(struct cmb_process *me, void *ctx)
         const uint64_t n = cmb_random_dice(1, 15);
         cmb_assert_always((n >= (uint64_t)1) && (n <= (uint64_t)15));
         cmb_logger_user(stdout, USERFLAG1, "Getting %" PRIu64 " from %s...",
-                        n, cmb_buffer_get_name(bp));
+                        n, cmb_buffer_name(bp));
 
         uint64_t m = n;
         sig = cmb_buffer_get(bp, &m);
@@ -168,7 +166,6 @@ void *nuisancefunc(struct cmb_process *me, void *ctx)
     struct cmb_process **tgt = (struct cmb_process **)ctx;
     const long nproc = NUM_PUTTERS + NUM_GETTERS;
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         (void)cmb_process_hold(cmb_random_exponential(1.0));
@@ -188,7 +185,6 @@ void test_buffer(const double duration, const uint64_t seed)
     cmi_test_print_line("*");
     printf("*****************************   Testing buffers   ******************************\n");
     cmi_test_print_line("*");
-    printf("Cimba version %s\n", cimba_version());
     printf("Using seed: 0x%" PRIx64 "\n", seed);
 
     struct simulation *thesim = cmi_malloc(sizeof(*thesim));
@@ -212,7 +208,7 @@ void test_buffer(const double duration, const uint64_t seed)
     for (unsigned ui = 0; ui < 3; ui++) {
         struct cmb_process *putter = cmb_process_create();
         cmb_assert_always(putter != NULL);
-        cmb_assert_always(cmb_process_status(putter) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status(putter) == CMB_PROCESS_UNINITIALIZED);
         snprintf(scratchpad, sizeof(scratchpad), "Putter_%u", ui + 1u);
         const int64_t pri = cmb_random_dice(-5, 5);
         cmb_process_initialize(putter,
@@ -220,10 +216,10 @@ void test_buffer(const double duration, const uint64_t seed)
                                putterfunc,
                                thesim->buf,
                                pri);
-        cmb_assert_always(cmb_process_status(putter) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status(putter) == CMB_PROCESS_INITIALIZED);
         /* Non-blocking call, just schedules the start event until we yield */
         cmb_process_start(putter);
-        cmb_assert_always(cmb_process_status(putter) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status(putter) == CMB_PROCESS_INITIALIZED);
         thesim->putters[ui] = putter;
     }
 
@@ -231,7 +227,7 @@ void test_buffer(const double duration, const uint64_t seed)
     for (unsigned ui = 0; ui < 3; ui++) {
         struct cmb_process *getter = cmb_process_create();
         cmb_assert_always(getter != NULL);
-        cmb_assert_always(cmb_process_status(getter) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status(getter) == CMB_PROCESS_UNINITIALIZED);
         snprintf(scratchpad, sizeof(scratchpad), "Getter_%u", ui + 1u);
         const int64_t pri = cmb_random_dice(-5, 5);
         cmb_process_initialize(getter,
@@ -239,20 +235,20 @@ void test_buffer(const double duration, const uint64_t seed)
                                getterfunc,
                                thesim->buf,
                                pri);
-        cmb_assert_always(cmb_process_status(getter) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status(getter) == CMB_PROCESS_INITIALIZED);
         cmb_process_start(getter);
-        cmb_assert_always(cmb_process_status(getter) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status(getter) == CMB_PROCESS_INITIALIZED);
         thesim->getters[ui] = getter;
     }
 
     printf("Create a nuisance interrupting others at random times\n");
     thesim->nuisance = cmb_process_create();
     cmb_assert_always(thesim->nuisance != NULL);
-    cmb_assert_always(cmb_process_status(thesim->nuisance) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(thesim->nuisance) == CMB_PROCESS_UNINITIALIZED);
     cmb_process_initialize(thesim->nuisance, "Nuisance", nuisancefunc, thesim, 0);
-    cmb_assert_always(cmb_process_status(thesim->nuisance) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(thesim->nuisance) == CMB_PROCESS_INITIALIZED);
     cmb_process_start(thesim->nuisance);
-    cmb_assert_always(cmb_process_status(thesim->nuisance) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(thesim->nuisance) == CMB_PROCESS_INITIALIZED);
 
     printf("Schedule end event\n");
     const uint64_t end_evt_hdle = cmb_event_schedule(end_sim_evt, thesim, NULL, duration, 0);
@@ -278,6 +274,7 @@ void test_buffer(const double duration, const uint64_t seed)
     cmb_assert_always(cmb_process_status(thesim->nuisance) == CMB_PROCESS_FINISHED);
     cmb_process_terminate(thesim->nuisance);
     cmb_process_destroy(thesim->nuisance);
+    cmb_buffer_terminate(thesim->buf);
     cmb_buffer_destroy(thesim->buf);
     cmi_free(thesim);
 

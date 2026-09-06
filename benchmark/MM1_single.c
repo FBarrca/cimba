@@ -23,6 +23,8 @@
 
 #include <cimba.h>
 
+#include "cmi_mempool.h"
+
 #define NUM_OBJECTS 1000000u
 #define ARRIVAL_RATE 0.9
 #define SERVICE_RATE 1.0
@@ -110,14 +112,17 @@ void run_trial(void *vtrl)
 
     cmb_event_queue_execute();
 
-    cmb_process_stop(sim->service, NULL);
     cmb_process_terminate(sim->arrival);
-    cmb_process_terminate(sim->service);
     cmb_process_destroy(sim->arrival);
+    cmb_process_stop(sim->service, NULL);
+    cmb_process_terminate(sim->service);
     cmb_process_destroy(sim->service);
-
+    cmb_objectqueue_terminate(sim->queue);
     cmb_objectqueue_destroy(sim->queue);
+
     cmb_event_queue_terminate();
+    cmb_random_terminate();
+
     free(sim);
     free(ctx);
 }
@@ -134,6 +139,8 @@ int main(void)
     printf("Average system time %f (expected %f)\n",
             trl->sum_wait / (double)trl->obj_cnt,
             1.0 / (SERVICE_RATE - ARRIVAL_RATE));
+
+    free(trl);
 
     return 0;
 }

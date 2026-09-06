@@ -30,7 +30,9 @@
 #include "cmb_process.h"
 #include "cmb_random.h"
 
+#include "cmi_mempool.h"
 #include "cmi_memutils.h"
+
 #include "test.h"
 
 #define USERFLAG1 0x00000001
@@ -75,7 +77,6 @@ void *putterfunc(struct cmb_process *me, void *vctx)
     struct cmb_priorityqueue *qp = (struct cmb_priorityqueue *)vctx;
     const int64_t pri = cmb_process_priority(me);
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         int64_t sig = cmb_process_hold(cmb_random_exponential(1.0));
@@ -96,7 +97,7 @@ void *putterfunc(struct cmb_process *me, void *vctx)
         cmb_assert_always(cmb_priorityqueue_length(qp) <= qp->capacity);
         cmb_assert_always(cmb_priorityqueue_space(qp) <= qp->capacity);
         uint64_t handle = 0u;
-        sig = cmb_priorityqueue_put(qp, &object, pri, &handle);
+        sig = cmb_priorityqueue_put(qp, object, pri, &handle);
         cmb_assert_always(cmb_priorityqueue_length(qp) <= qp->capacity);
         cmb_assert_always(cmb_priorityqueue_space(qp) <= qp->capacity);
         if (sig == CMB_PROCESS_SUCCESS) {
@@ -119,7 +120,6 @@ void *getterfunc(struct cmb_process *me, void *ctx)
 
     struct cmb_priorityqueue *qp = (struct cmb_priorityqueue *)ctx;
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         int64_t sig = cmb_process_hold(cmb_random_exponential(1.0));
@@ -162,7 +162,6 @@ void *nuisancefunc(struct cmb_process *me, void *ctx)
     struct cmb_process **tgt = (struct cmb_process **)ctx;
     const unsigned nproc = NUM_PUTTERS + NUM_GETTERS;
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         double dt = cmb_random_exponential(1.0);
@@ -250,14 +249,16 @@ void test_priorityqueue(const uint64_t seed, const double duration)
     printf("Clean up\n");
     for (unsigned ui = 0; ui < 3; ui++) {
         cmb_process_terminate(quetst->putters[ui]);
-        cmb_process_terminate(quetst->getters[ui]);
         cmb_process_destroy(quetst->putters[ui]);
+        cmb_process_terminate(quetst->getters[ui]);
         cmb_process_destroy(quetst->getters[ui]);
     }
 
     cmb_process_terminate(quetst->nuisance);
     cmb_process_destroy(quetst->nuisance);
+    cmb_priorityqueue_terminate(quetst->queue);
     cmb_priorityqueue_destroy(quetst->queue);
+
     cmb_event_queue_terminate();
     cmi_free(quetst);
     cmb_random_terminate();
@@ -268,7 +269,7 @@ int main(const int argc, char *argv[])
 {
     bool timing_enabled = false;
     uint64_t seed = cmb_random_hwseed();
-    double dur = 1.0e6;
+    double dur = 100000.0;
 
     int opt;
     while ((opt = getopt(argc, argv, "d: s:t")) != -1) {

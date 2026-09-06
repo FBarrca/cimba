@@ -103,10 +103,11 @@ struct cmi_hashheap {
     cmi_heap_compare_func *heap_compare;
     uint64_t heap_size;     /* Max number of items */
     uint64_t heap_count;    /* Current number of items */
-    uint64_t item_counter;
-    bool map_active;
-    uint16_t heap_exp_init;
-    uint16_t heap_exp_cur;
+    uint64_t item_counter;  /* Running counter */
+    uint64_t tombstones;    /* Current number */
+    bool map_active;        /* Is the hash map turned on? */
+    uint16_t heap_exp_init; /* Initial sizing, */
+    uint16_t heap_exp_cur;  /* Current sizing */
 };
 
 /*
@@ -183,6 +184,7 @@ extern void **cmi_hashheap_dequeue(struct cmi_hashheap *hp);
 /*
  * cmi_hashheap_count - Returns the number of items currently in the queue.
  */
+CMB_MAYBE_UNUSED
 static inline uint64_t cmi_hashheap_count(const struct cmi_hashheap *hp)
 {
     cmb_assert_release(hp != NULL);
@@ -202,6 +204,7 @@ static inline bool cmi_hashheap_is_empty(const struct cmi_hashheap *hp)
  * cmi_hashheap_peek_item - Returns a pointer to the location of the item
  * currently at the top of the priority queue, without removing it.
  */
+CMB_MAYBE_UNUSED
 static inline void **cmi_hashheap_peek_item(const struct cmi_hashheap *hp)
 {
     cmb_assert_release(hp != NULL);
@@ -221,6 +224,7 @@ static inline void **cmi_hashheap_peek_item(const struct cmi_hashheap *hp)
  * These functions have no good way to return an out-of-band error value, will
  * fire an assert instead if called on an empty hashheap. Check first.
  */
+CMB_MAYBE_UNUSED
 static inline double cmi_hashheap_peek_drank(const struct cmi_hashheap *hp)
 {
     cmb_assert_release(hp != NULL);
@@ -232,6 +236,7 @@ static inline double cmi_hashheap_peek_drank(const struct cmi_hashheap *hp)
     return first->rank_d64;
 }
 
+CMB_MAYBE_UNUSED
 static inline int64_t cmi_hashheap_peek_irank(const struct cmi_hashheap *hp)
 {
     cmb_assert_release(hp != NULL);
@@ -253,6 +258,7 @@ extern bool cmi_hashheap_remove(struct cmi_hashheap *hp, uint64_t hashkey);
 /*
  * cmi_hashheap_cancel - Syntactic sugar for cmi_hashheap_remove
  */
+CMB_MAYBE_UNUSED
 static inline bool cmi_hashheap_cancel(struct cmi_hashheap *hp, const uint64_t hashkey)
 {
     return cmi_hashheap_remove(hp, hashkey);
@@ -266,6 +272,7 @@ extern uint64_t cmi_hash_find_index(struct cmi_hashheap *hp, uint64_t hashkey);
 /*
  * cmi_hashheap_is_enqueued - Is the given item currently in the queue?
  */
+CMB_MAYBE_UNUSED
 static inline bool cmi_hashheap_is_enqueued(struct cmi_hashheap *hp,
                                             const uint64_t hashkey)
 {
@@ -367,6 +374,7 @@ extern void cmi_hashheap_heap_print(const struct cmi_hashheap *hp, FILE *fp,
 
 extern void cmi_hashheap_hash_print(const struct cmi_hashheap *hp, FILE *fp);
 
+CMB_MAYBE_UNUSED
 static inline void cmi_hashheap_print(const struct cmi_hashheap *hp, FILE *fp,
                                       cmi_hashheap_item_formatter *hif)
 {

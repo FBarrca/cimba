@@ -6,7 +6,7 @@ MM1_single = executable('MM1_single',
                          link_with : cimba_lib,
                          dependencies : [project_deps],
                          install : false,
-                         native : true
+                         native : false
 )
 
 MM1_multi = executable('MM1_multi',
@@ -15,5 +15,5 @@ MM1_multi = executable('MM1_multi',
                         link_with : cimba_lib,
                         dependencies : [project_deps],
                         install : false,
-                        native : true
+                        native : false
 )

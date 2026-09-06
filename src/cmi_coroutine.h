@@ -74,9 +74,10 @@
  * be passed to coroutines in the running state.
  */
 enum cmi_coroutine_state {
-    CMI_COROUTINE_CREATED = 0,
-    CMI_COROUTINE_RUNNING = 1,
-    CMI_COROUTINE_FINISHED = 2
+    CMI_COROUTINE_UNINITIALIZED,
+    CMI_COROUTINE_INITIALIZED,
+    CMI_COROUTINE_RUNNING,
+    CMI_COROUTINE_FINISHED
 };
 
 /* Default size of a coroutine stack in bytes  */
@@ -137,8 +138,13 @@ struct cmi_coroutine {
     unsigned char *stack_limit;
     unsigned char *stack;
     unsigned char *stack_base;
+    size_t stack_size;
     cmi_coroutine_exit_func *cr_exit;
     void *exit_value;
+    void *tsan_fiber;
+    struct cmi_coroutine *reg_prev;
+    struct cmi_coroutine *reg_next;
+    bool pool_allocated;
 };
 
 /*
@@ -154,10 +160,8 @@ extern struct cmi_coroutine *cmi_coroutine_create(void);
  *
  * The coroutine function given as the second argument will eventually be called
  * as crfunction(cp, context). The stack size should be large enough for the
- * functions running in the coroutine. For a simple case without deeply nested
- * function calls and many local variables, 10 kB could be enough, 24 kB
- * probably on the safe side. The program will either trigger an assert or
- * segfault if the stack is too small.
+ * functions running in the coroutine. The program will either trigger an assert
+ * or segfault if the stack is too small.
  *
  * The exit function crexit will be called when/if the coroutine returns from
  * crfunction by intercepting the return and calling crexit from assembly.
@@ -246,6 +250,7 @@ static inline enum cmi_coroutine_state cmi_coroutine_status(const struct cmi_cor
  * cmi_coroutine_context - Return the current context pointer of the given
  * coroutine
  */
+CMB_MAYBE_UNUSED
 static inline void *cmi_coroutine_context(const struct cmi_coroutine *cp)
 {
     cmb_assert_release(cp != NULL);
@@ -257,6 +262,7 @@ static inline void *cmi_coroutine_context(const struct cmi_coroutine *cp)
  * cmi_coroutine_exit_value - Return the exit value of the given coroutine,
  * NULL if it has not yet returned (or if it returned NULL).
  */
+CMB_MAYBE_UNUSED
 static inline void *cmi_coroutine_exit_value(const struct cmi_coroutine *cp)
 {
     cmb_assert_release(cp != NULL);

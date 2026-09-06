@@ -13,10 +13,12 @@
 #include "cmb_assert.h"
 #include "cmi_coroutine.h"
 #include "cmi_memutils.h"
+#include "cmi_sanitizer.h"
 
 #define CMI_ARM64_CONTEXT_SIZE 176u
 
 extern void cmi_coroutine_trampoline(void);
+extern void *cmi_coroutine_launch(struct cmi_coroutine *cp, void *arg);
 
 bool cmi_coroutine_stack_valid(const struct cmi_coroutine *cp)
 {
@@ -58,7 +60,7 @@ void cmi_coroutine_context_init(struct cmi_coroutine *cp)
     (void)cmi_memset(stkptr, 0, CMI_ARM64_CONTEXT_SIZE);
 
     uintptr_t *registers = (uintptr_t *)stkptr;
-    registers[0] = (uintptr_t)cp->cr_function; /* X19 */
+    registers[0] = (uintptr_t)cmi_coroutine_launch; /* X19 */
     registers[1] = (uintptr_t)cp; /* X20 */
     registers[2] = (uintptr_t)cp->context; /* X21 */
     registers[3] = (uintptr_t)(
@@ -84,11 +86,12 @@ unsigned char *cmi_coroutine_stack_alloc(const size_t size,
     return raw;
 }
 
-void cmi_coroutine_stack_free(unsigned char *stack)
+void cmi_coroutine_stack_free(unsigned char *stack, size_t size)
 {
     cmb_assert_release(stack != NULL);
     const size_t pagesz = cmi_pagesize();
-    (void)mprotect(stack, pagesz, PROT_READ | PROT_WRITE);
+    cmi_asan_unpoison(stack + pagesz, size);
+    cmb_assert_always(mprotect(stack, pagesz, PROT_READ | PROT_WRITE) == 0);
     cmi_aligned_free(stack);
 }
 
@@ -106,4 +109,20 @@ unsigned char *cmi_coroutine_stacklimit(void)
 unsigned char *cmi_coroutine_stackraw(void)
 {
     return NULL;
+}
+
+/* macOS frees stacks immediately, so there is no recycled stack pool. */
+void cmi_coroutine_stack_cleanup(void) {}
+
+/* Darwin does not require updating OS stack bounds after longjmp. */
+void cmi_coroutine_os_adopt_stack(const struct cmi_coroutine *cp)
+{
+    cmb_unused(cp);
+}
+
+/* Both Darwin ports preserve floating-point control state on every switch. */
+bool cmi_coroutine_registers_valid(const struct cmi_coroutine *cp)
+{
+    cmb_unused(cp);
+    return true;
 }

@@ -24,7 +24,7 @@ foreach item : matrix
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
     )
 
     # test cmb_assert_debug in this build type
@@ -44,7 +44,7 @@ test_buffer = executable('test_buffer',
                          link_with : cimba_lib,
                          dependencies : [project_deps],
                          install : false,
-                         native : true
+                         native : false
 )
 
 test('buffer', test_buffer)
@@ -55,7 +55,7 @@ test_cimba = executable('test_cimba',
                          link_with : cimba_lib,
                          dependencies : [project_deps],
                          install : false,
-                         native : true
+                         native : false
 )
 
 # Make sure this one gets all cores to itself
@@ -67,7 +67,7 @@ test_condition = executable('test_condition',
                             link_with : cimba_lib,
                             dependencies : [project_deps],
                             install : false,
-                            native : true
+                            native : false
 )
 
 test('condition', test_condition)
@@ -78,7 +78,7 @@ test_coroutine = executable('test_coroutine',
                             link_with : cimba_lib,
                             dependencies : [project_deps],
                             install : false,
-                            native : true
+                            native : false
 )
 
 test('coroutine', test_coroutine)
@@ -89,7 +89,7 @@ test_data = executable( 'test_data',
                         link_with : cimba_lib,
                         dependencies : [project_deps],
                         install : false,
-                        native : true
+                        native : false
 )
 
 # may take a while
@@ -101,7 +101,7 @@ test_event = executable('test_event',
                         link_with : cimba_lib,
                         dependencies : [project_deps],
                         install : false,
-                        native : true
+                        native : false
 )
 
 test('event', test_event)
@@ -112,10 +112,21 @@ test_hashheap = executable('test_hashheap',
                         link_with : cimba_lib,
                         dependencies : [project_deps],
                         install : false,
-                        native : true
+                        native : false
 )
 
 test('hashheap', test_hashheap)
+
+test_lists = executable('test_lists',
+                           files('test_lists.c', 'test.h'),
+                           include_directories : [inc_api, inc_int],
+                           link_with : cimba_lib,
+                           dependencies : [project_deps],
+                           install : false,
+                           native : false
+)
+
+test('lists', test_lists)
 
 test_logger = executable('test_logger',
                          files('test_logger.c', 'test.h'),
@@ -123,7 +134,7 @@ test_logger = executable('test_logger',
                          link_with : cimba_lib,
                          dependencies : [project_deps],
                          install : false,
-                         native : true
+                         native : false
 )
 
 test('logger', test_logger)
@@ -134,7 +145,7 @@ test_mempool = executable('test_mempool',
                          link_with : cimba_lib,
                          dependencies : [project_deps],
                          install : false,
-                         native : true
+                         native : false
 )
 
 test('mempool', test_mempool)
@@ -145,7 +156,7 @@ test_objectqueue = executable('test_objectqueue',
                               link_with : cimba_lib,
                               dependencies : [project_deps],
                               install : false,
-                              native : true
+                              native : false
 )
 
 test('objectqueue', test_objectqueue)
@@ -156,7 +167,7 @@ test_priorityqueue = executable('test_priorityqueue',
                               link_with : cimba_lib,
                               dependencies : [project_deps],
                               install : false,
-                              native : true
+                              native : false
 )
 
 test('priorityqueue', test_priorityqueue)
@@ -167,7 +178,7 @@ test_process = executable('test_process',
                             link_with : cimba_lib,
                             dependencies : [project_deps],
                             install : false,
-                            native : true
+                            native : false
 )
 
 test('process', test_process)
@@ -178,7 +189,7 @@ test_random = executable('test_random',
                          link_with : cimba_lib,
                          dependencies : [project_deps],
                          install : false,
-                         native : true
+                         native : false
 )
 
 # will certainly take a while
@@ -190,10 +201,21 @@ test_resource = executable('test_resource',
                           link_with : cimba_lib,
                           dependencies : [project_deps],
                           install : false,
-                          native : true
+                          native : false
 )
 
 test('resource', test_resource)
+
+test_resourceguard = executable('test_resourceguard',
+                                files('test_resourceguard.c', 'test.h'),
+                                include_directories : [inc_api, inc_int],
+                                link_with : cimba_lib,
+                                dependencies : [project_deps],
+                                install : false,
+                                native : false
+)
+
+test('resourceguard', test_resourceguard)
 
 test_resourcepool = executable('test_resourcepool',
                            files('test_resourcepool.c', 'test.h'),
@@ -201,7 +223,7 @@ test_resourcepool = executable('test_resourcepool',
                            link_with : cimba_lib,
                            dependencies : [project_deps],
                            install : false,
-                           native : true
+                           native : false
 )
 
 test('resourcepool', test_resourcepool)
@@ -219,3 +241,9 @@ test('stochastic',
      workdir: meson.project_source_root(),
 )
 
+
+embedding_test = executable('test_embedding', 'test_embedding.c',
+                            include_directories : [inc_api, inc_int],
+                            link_with : cimba_lib,
+                            dependencies : project_deps)
+test('embedding', embedding_test)

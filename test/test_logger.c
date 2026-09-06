@@ -21,9 +21,7 @@
  * limitations under the License.
  */
 
-#include <assert.h>
 #include <errno.h>
-#include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,6 +48,9 @@ static void test_action(void *subject, void *object)
 /* Another event: Closes the bar for good */
 static void end_sim(void *subject, void *object)
 {
+    cmb_unused(subject);
+    cmb_unused(object);
+
     cmb_logger_info(stdout, "%p\t%s\t%s", (void *)end_sim, (char *)subject, (char *)object);
     cmb_logger_warning(stdout, "===> end_sim: game over <===");
     cmb_event_queue_clear();
@@ -62,7 +63,7 @@ static void end_sim(void *subject, void *object)
 #define FMTBUFLEN 20
 static char fmtbuf[FMTBUFLEN];
 
-static const char *hhhmmss_formatter(const double t)
+static const char *hhmmss_formatter(const double t)
 {
     double tmp = t;
     const unsigned days = (unsigned)(tmp / (24.0 * 60.0));
@@ -77,7 +78,12 @@ static const char *hhhmmss_formatter(const double t)
                                FMTBUFLEN,
                                "%02d-%02d:%02d:%06.3f",
                                days + 1u, hours, minutes, seconds);
-    assert((r > 0) && (r < FMTBUFLEN));
+    if ((r <= 0) || (r > FMTBUFLEN)) {
+        fprintf(stderr,
+            "hhmmss_formatter error: Given t = %f, buffer size %d, snprintf returned %d\n",
+            t, FMTBUFLEN, r);
+        abort();
+    }
 
     return fmtbuf;
 }
@@ -86,7 +92,7 @@ void test_logger(uint64_t seed)
 {
     cmb_random_initialize(seed);
     cmb_event_queue_initialize(0.0);
-    cmb_logger_timeformatter_set(hhhmmss_formatter);
+    cmb_logger_timeformatter_set(hhmmss_formatter);
 
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
@@ -103,9 +109,6 @@ void test_logger(uint64_t seed)
     const double two_days = 2.0 * 24.0 * 60.0;
     cmb_event_schedule(end_sim, NULL, NULL, two_days, 0);
     while (cmb_event_execute_next()) { }
-
-    /* Note that cmb_logger_error exits the current thread, exit code 0 */
-    cmb_logger_error(stdout, "Hard stop (intentional)");
 }
 
 int main(int argc, char *argv[])
@@ -130,9 +133,4 @@ int main(int argc, char *argv[])
     }
 
     test_logger(seed);
-
-    /* If we got here, something failed */
-    cmb_logger_fatal(stderr, "Returned from test_logger, cmb_logger_error() ignored!");
-
-    /* not reached */
 }

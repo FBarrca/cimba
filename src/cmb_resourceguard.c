@@ -20,7 +20,7 @@
  * item[2] - its context pointer
  * item[3] - not used here
  *
- * Copyright (c) Asbjørn M. Bonvik 2025.
+ * Copyright (c) Asbjørn M. Bonvik 2025-26.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,11 +53,11 @@ struct entry_peek {
 /* The observer list entries */
 struct observer_tag {
     struct cmb_resourceguard *observer;
-    struct cmi_slist_head listhead;
+    struct cmi_slist_node listhead;
 };
 
 /* Thread local mempool of tags for observer tags */
-CMB_THREAD_LOCAL struct cmi_mempool observer_tagpool
+static CMB_THREAD_LOCAL struct cmi_mempool observer_tagpool
     = CMI_MEMPOOL_STATIC_INIT(sizeof(struct observer_tag), 16u);
 
 /* Counter for assigning hash map handles and ensuring FIFO order */
@@ -65,8 +65,8 @@ static CMB_THREAD_LOCAL uint64_t enqueue_seq = 0u;
 
 /*
  * guard_queue_check - Test if heap_tag *a should go before *b. If so, return true.
- * Ranking higher priority (rank_d64) before lower, FIFO based on entry time,
- * then in hash_key (memory address) order.
+ * Higher priority (rank_i64) first, then earlier entry time (rank_d64) for FIFO,
+ * then lower enqueue key (hash_key) as a stable tie-break.
  */
 static bool guard_queue_check(const struct cmi_heap_tag *a,
                               const struct cmi_heap_tag *b)
@@ -74,19 +74,18 @@ static bool guard_queue_check(const struct cmi_heap_tag *a,
     cmb_assert_debug(a != NULL);
     cmb_assert_debug(b != NULL);
 
-    if (a->rank_i64 > b->rank_i64) {
-        return true;
+    /* Higher priority goes first */
+    if (a->rank_i64 != b->rank_i64) {
+        return a->rank_i64 > b->rank_i64;
     }
 
-    if (a->rank_d64 < b->rank_d64) {
-        return true;
+    /* Same priority: earlier queue entry time goes first (FIFO by arrival) */
+    if (a->rank_d64 != b->rank_d64) {
+        return a->rank_d64 < b->rank_d64;
     }
 
-    if (a->hash_key < b->hash_key) {
-        return true;
-    }
-
-    return false;
+    /* Same arrival time: lower enqueue key goes first (stable FIFO tie-break) */
+    return a->hash_key < b->hash_key;
 }
 
 /* Start very small and fast, 2^GUARD_INIT_EXP = 8 slots in the initial queue */
@@ -135,7 +134,13 @@ int64_t cmb_resourceguard_wait(struct cmb_resourceguard *rgp,
 
     const double entry_time = cmb_time();
     const int64_t priority = cmb_process_priority(pp);
-    const uint64_t hash_key = ++enqueue_seq;
+    /* The enqueue key is this entry's identity: the FIFO tie-breaker in the
+     * queue and the handle used to find it again for removal, cancellation, or
+     * reprioritization. Key 0 is reserved to mean "not enqueued". */
+    uint64_t hash_key = ++enqueue_seq;
+    if (hash_key == 0u) {
+        hash_key = ++enqueue_seq;
+    }
     const uint64_t key = cmi_hashheap_enqueue((struct cmi_hashheap *)rgp,
                                               (void *)pp,
                                               (void *)demand,
@@ -145,38 +150,91 @@ int64_t cmb_resourceguard_wait(struct cmb_resourceguard *rgp,
                                               entry_time,
                                               priority);
 
-    cmi_process_add_awaitable(pp, CMI_PROCESS_AWAITABLE_RESOURCE, rgp);
+    /* Record the key on the awaitable so cancel/remove/reprioritize can find
+     * this exact entry later given only the process and the guard. */
+    struct cmi_process_awaitable *awp = cmi_process_add_awaitable(pp,
+                                        CMI_PROCESS_AWAITABLE_RESOURCE, rgp);
+    awp->guard_key = key;
     cmb_logger_info(stdout, "Waits for %s", rgp->guarded_resource->name);
 
     /* Yield to the dispatcher, collect the return signal value when resumed */
     const int64_t sig = (int64_t)cmi_coroutine_yield(NULL);
 
-    /* Back here, possibly much later. Return the signal that resumed us. */
+    /* Back here, possibly much later. Clearly not waiting for this anymore. */
+    (void)cmi_process_remove_awaitable(pp, CMI_PROCESS_AWAITABLE_RESOURCE, rgp);
+    /* Make sure we do not accidentally cancel the wrong event. */
     if (sig != CMB_PROCESS_SUCCESS) {
-        cmi_hashheap_cancel((struct cmi_hashheap *)rgp, key);
+        if (cmi_hashheap_is_enqueued((struct cmi_hashheap *)rgp, key)) {
+            /* Still queued: an ordinary interrupt/timeout while waiting. ALl good. */
+            (void)cmi_hashheap_cancel((struct cmi_hashheap *)rgp, key);
+        }
+        else if (sig != CMB_PROCESS_CANCELLED) {
+            /* Special case: We were already dequeued (resource to be granted) but are
+             * now resumed by some other signal (e.g. a timeout at the same timestamp)
+             * before the scheduled wakeup event fired and the process actually resumed.
+             * Assumed intentional, so hand the resource opportunity to the next waiter.
+             * Our own grant event is now stale and will be discarded by
+             * wakeup_event_resource_granted's key check. */
+            (void)cmb_resourceguard_signal(rgp);
+        }
     }
 
     cmb_assert_debug(!cmi_hashheap_is_enqueued((struct cmi_hashheap *)rgp, key));
-    cmi_process_remove_awaitable(pp, CMI_PROCESS_AWAITABLE_RESOURCE, rgp);
-
     return sig;
 }
 
 /*
- * wakeup_event_resource - The event that actually resumes the process coroutine
- */
-static void wakeup_event_resource(void *vp, void *arg)
+ * wakeup_event_resource_granted - An event that actually resumes the process.
+ * A granted waiter is resumed with SUCCESS, but only if it is still parked in
+ * the guard wait this grant was issued for. arg carries the unique enqueue key;
+ * if the process has since left that wait (timeout, cancel, teardown), its
+ * RESOURCE awaitable is gone and this grant is stale — discard it silently. */
+static void wakeup_event_resource_granted(void *vp, void *arg)
 {
     cmb_assert_debug(vp != NULL);
 
     struct cmb_process *pp = (struct cmb_process *)vp;
-    cmb_logger_info(stdout, "Wakes %s signal %" PRIi64,
-                pp->name, (int64_t)arg);
+    const uint64_t key = (uint64_t)arg;
+    if (!cmi_process_awaiting_key(pp, key)) {
+        cmb_logger_info(stdout, "Stale grant for %s, discarded", pp->name);
+        return;
+    }
 
     struct cmi_coroutine *cp = (struct cmi_coroutine *)pp;
     if (cp->status == CMI_COROUTINE_RUNNING) {
-        (void)cmi_coroutine_resume(cp, arg);
+        (void)cmi_coroutine_resume(cp, (void *)CMB_PROCESS_SUCCESS);
     }
+}
+
+/*
+ * wakeup_event_resource_cancelled - An event that actually resumes the process.
+ * As above, but delivering CANCELLED. Same staleness guard.
+ */
+static void wakeup_event_resource_cancelled(void *vp, void *arg)
+{
+    cmb_assert_debug(vp != NULL);
+
+    struct cmb_process *pp = (struct cmb_process *)vp;
+    const uint64_t key = (uint64_t)arg;
+    if (!cmi_process_awaiting_key(pp, key)) {
+        cmb_logger_info(stdout, "Stale grant for %s, discarded", pp->name);
+        return;
+    }
+
+    struct cmi_coroutine *cp = (struct cmi_coroutine *)pp;
+    if (cp->status == CMI_COROUTINE_RUNNING) {
+        (void)cmi_coroutine_resume(cp, (void *)CMB_PROCESS_CANCELLED);
+    }
+}
+
+/* Cancel any pending grant/cancel wakeup targeting pp. The staleness check in
+ * the handlers dereferences pp, so no such event may outlive the process. */
+void cmi_resourceguard_cancel_wakeups(struct cmb_process *pp)
+{
+    cmb_assert_debug(pp != NULL);
+
+    cmb_event_pattern_cancel(wakeup_event_resource_granted, pp, CMB_ANY_OBJECT);
+    cmb_event_pattern_cancel(wakeup_event_resource_cancelled, pp, CMB_ANY_OBJECT);
 }
 
 /*
@@ -218,17 +276,19 @@ bool cmb_resourceguard_signal(struct cmb_resourceguard *rgp)
             /* Yes, pull the process off the queue and schedule wakeup event */
             cmb_logger_info(stdout, "Scheduling wakeup event for %s", pp->name);
             (void)cmi_hashheap_dequeue(hp);
+            /* Make sure we have the right wait target */
+            const uint64_t key = cmi_process_guard_key(pp, rgp);
+            cmb_assert_debug(key != UINT64_C(0));
             const double time = cmb_time();
             const int64_t priority = cmb_process_priority(pp);
-            (void)cmb_event_schedule(wakeup_event_resource, pp,
-                                    (void *)CMB_PROCESS_SUCCESS,
-                                    time, priority);
+            (void)cmb_event_schedule(wakeup_event_resource_granted, pp,
+                                     (void *)key, time, priority);
             ret = true;
         }
     }
 
     /* Forward the signal to any observers */
-    const struct cmi_slist_head *ohead = &(rgp->observers);
+    const struct cmi_slist_node *ohead = &(rgp->observers);
     while (ohead->next != NULL) {
         const struct observer_tag *ot = cmi_container_of(ohead->next,
                                                          struct observer_tag,
@@ -254,18 +314,36 @@ bool cmb_resourceguard_cancel(struct cmb_resourceguard *rgp,
 
     bool ret = false;
     struct cmi_hashheap *hp = (struct cmi_hashheap *)rgp;
-    const uint64_t key = (uint64_t)pp;
-    if (cmi_hashheap_is_enqueued(hp, key)) {
+    const uint64_t key = cmi_process_guard_key(pp, rgp);
+    if ((key != 0u) && cmi_hashheap_is_enqueued(hp, key)) {
         (void)cmi_hashheap_cancel(hp, key);
         const double time = cmb_time();
         const int64_t priority = cmb_process_priority(pp);
-        (void)cmb_event_schedule(wakeup_event_resource, pp,
-                                 (void *)CMB_PROCESS_CANCELLED,
-                                 time, priority);
+        (void)cmb_event_schedule(wakeup_event_resource_cancelled, pp,
+                                 (void *)key, time, priority);
         ret = true;
     }
 
     return ret;
+}
+
+/*
+ * cmi_resourceguard_remove_key - Remove the queue entry identified by `key`
+ * without resuming any process.
+ * Returns true if an entry was removed, false if there was none.
+ */
+bool cmi_resourceguard_remove_key(struct cmb_resourceguard *rgp,
+                                  const uint64_t key)
+{
+    cmb_assert_release(rgp != NULL);
+
+    struct cmi_hashheap *hp = (struct cmi_hashheap *)rgp;
+    if ((key != 0u) && cmi_hashheap_is_enqueued(hp, key)) {
+        (void)cmi_hashheap_cancel(hp, key);
+        return true;
+    }
+
+    return false;
 }
 
 /*
@@ -278,15 +356,7 @@ bool cmb_resourceguard_remove(struct cmb_resourceguard *rgp,
     cmb_assert_release(rgp != NULL);
     cmb_assert_release(pp != NULL);
 
-    bool ret = false;
-    struct cmi_hashheap *hp = (struct cmi_hashheap *)rgp;
-    const uint64_t key = (uint64_t)pp;
-    if (cmi_hashheap_is_enqueued(hp, key)) {
-        (void)cmi_hashheap_cancel(hp, key);
-        ret = true;
-    }
-
-    return ret;
+    return cmi_resourceguard_remove_key(rgp, cmi_process_guard_key(pp, rgp));
 }
 
 /*
@@ -320,7 +390,7 @@ bool cmb_resourceguard_unregister(struct cmb_resourceguard *rgp,
     cmb_assert_release(rgp != NULL);
     cmb_assert_release(obs != NULL);
 
-    struct cmi_slist_head *ohead = &(rgp->observers);
+    struct cmi_slist_node *ohead = &(rgp->observers);
     while (ohead->next != NULL) {
         struct observer_tag *op = cmi_container_of(ohead->next,
                                                    struct observer_tag,

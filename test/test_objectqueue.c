@@ -30,7 +30,9 @@
 #include "cmb_process.h"
 #include "cmb_random.h"
 
+#include "cmi_mempool.h"
 #include "cmi_memutils.h"
+
 #include "test.h"
 
 #define USERFLAG1 0x00000001
@@ -74,7 +76,6 @@ void *putterfunc(struct cmb_process *me, void *vctx)
 
     struct cmb_objectqueue *qp = (struct cmb_objectqueue *)vctx;
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         int64_t sig = cmb_process_hold(cmb_random_exponential(1.0));
@@ -112,7 +113,6 @@ void *getterfunc(struct cmb_process *me, void *ctx)
 
     struct cmb_objectqueue *qp = (struct cmb_objectqueue *) ctx;
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         int64_t sig = cmb_process_hold(cmb_random_exponential(1.0));
@@ -152,7 +152,6 @@ void *nuisancefunc(struct cmb_process *me, void *ctx)
     struct cmb_process **tgt = (struct cmb_process **)ctx;
     const unsigned nproc = NUM_PUTTERS + NUM_GETTERS;
 
-    // ReSharper disable once CppDFAEndlessLoop
     for (;;) {
         cmb_logger_user(stdout, USERFLAG1, "Holding ...");
         const int64_t ret = cmb_process_hold(cmb_random_exponential(1.0));
@@ -206,8 +205,8 @@ void test_queue(const uint64_t seed, const double dur)
                                putterfunc,
                                quetst->queue,
                                pri);
-        cmb_assert_always(cmb_process_priority(quetst->putters[ui]) == pri);;
-        cmb_assert_always(cmb_process_status(quetst->putters[ui]) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_priority(quetst->putters[ui]) == pri);
+        cmb_assert_always(cmb_process_status(quetst->putters[ui]) == CMB_PROCESS_INITIALIZED);
         cmb_assert_always(cmb_process_context(quetst->putters[ui]) == quetst->queue);
         cmb_process_start(quetst->putters[ui]);
     }
@@ -226,7 +225,7 @@ void test_queue(const uint64_t seed, const double dur)
                                quetst->queue,
                                pri);
         cmb_assert_always(cmb_process_priority(quetst->getters[ui]) == pri);
-        cmb_assert_always(cmb_process_status(quetst->getters[ui]) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status(quetst->getters[ui]) == CMB_PROCESS_INITIALIZED);
         cmb_assert_always(cmb_process_context(quetst->getters[ui]) == quetst->queue);
         cmb_process_start(quetst->getters[ui]);
     }
@@ -235,7 +234,7 @@ void test_queue(const uint64_t seed, const double dur)
     quetst->nuisance = cmb_process_create();
     cmb_assert_always(quetst->nuisance != NULL);
     cmb_process_initialize(quetst->nuisance, "Nuisance", nuisancefunc, quetst, 0);
-    cmb_assert_always(cmb_process_status(quetst->nuisance) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(quetst->nuisance) == CMB_PROCESS_INITIALIZED);
     cmb_assert_always(cmb_process_context(quetst->nuisance) == quetst);
     cmb_assert_always(cmb_process_priority(quetst->nuisance) == 0);
     cmb_process_start(quetst->nuisance);
@@ -264,6 +263,7 @@ void test_queue(const uint64_t seed, const double dur)
 
     cmb_process_terminate(quetst->nuisance);
     cmb_process_destroy(quetst->nuisance);
+    cmb_objectqueue_terminate(quetst->queue);
     cmb_objectqueue_destroy(quetst->queue);
     cmi_free(quetst);
 
@@ -277,7 +277,7 @@ int main(const int argc, char *argv[])
 {
     bool timing_enabled = false;
     uint64_t seed = cmb_random_hwseed();
-    double dur = 1.0e6;
+    double dur = 100000.0;
 
     int opt;
     while ((opt = getopt(argc, argv, "d:s:t")) != -1) {

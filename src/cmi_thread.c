@@ -74,7 +74,32 @@ CMI_NORETURN void cmi_thread_exit(void)
     abort();
 }
 
+static BOOL CALLBACK cmi_once_callback(PINIT_ONCE once, PVOID arg, PVOID *context)
+{
+    (void)once;
+    (void)context;
+    void (**func)(void) = arg;
+    (*func)();
+    return TRUE;
+}
+
+void cmi_call_once(cmi_once_t *once, void (*func)(void))
+{
+    if (!InitOnceExecuteOnce(once, cmi_once_callback, &func, NULL)) abort();
+}
+
+cmi_thread_id_t cmi_thread_self(void) { return GetCurrentThreadId(); }
+bool cmi_thread_equal(cmi_thread_id_t a, cmi_thread_id_t b) { return a == b; }
+
 #else
+
+void cmi_call_once(cmi_once_t *once, void (*func)(void))
+{
+    if (pthread_once(once, func) != 0) abort();
+}
+
+cmi_thread_id_t cmi_thread_self(void) { return pthread_self(); }
+bool cmi_thread_equal(cmi_thread_id_t a, cmi_thread_id_t b) { return pthread_equal(a, b); }
 
 void cmi_mutex_lock(cmi_mutex_t *mutex)
 {

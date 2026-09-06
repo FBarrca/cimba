@@ -22,24 +22,29 @@ sources = files('cimba.c',
                 'cmi_hashheap.c',
                 'cmi_holdable.c',
                 'cmi_mempool.c',
+                'cmi_memregistry.c',
                 'cmi_resourcebase.c',
                 'cmi_thread.c'
 )
 
 inc_int = include_directories('.')
 
-# Internal headers - installed to /usr/local/include
+# Internal headers installed alongside the public API.
+# Every header reachable by #include from a public header must
+# appear here. The linux-install CI job enforces this by compiling each public
+# header standalone against the installed tree only (see test/tools/verify_install.sh).
 install_headers(
     'cmi_config.h',
     'cmi_coroutine.h',
-    'cmi_dataset.h',
+    'cmi_dlist.h',
     'cmi_hashheap.h',
     'cmi_holdable.h',
     'cmi_slist.h',
     'cmi_mempool.h',
+    'cmi_memregistry.h',
     'cmi_memutils.h',
-    'cmi_process.h',
     'cmi_resourcebase.h',
+    'cmi_process.h',
     'cmi_thread.h'
 )
 

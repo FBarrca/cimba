@@ -3,7 +3,7 @@
  *
  * Multithreaded version of the harbor simulation.
  *
- * Copyright (c) Asbjørn M. Bonvik 2025.
+ * Copyright (c) Asbjørn M. Bonvik 2025-26.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,8 +46,8 @@ const unsigned num_berths[N_SIZES][N_LEVELS] = { { 6, 7, 8, 9, 10 },
                                                  { 3, 4, 5, 6, 7 } };
 const double unloading_time_avg[N_SIZES] = { 8.0, 12.0 };
 
-const double warmup_time = 24.0 * 30;
-const double duration = 24.0 * 7 * 52 * 10;
+const double warmup_h = 24.0 * 30;
+const double duration_h = 24.0 * 365;
 
 /* This implicitly assumes that N_SIZES == 2 */
 enum ship_size {
@@ -67,7 +67,7 @@ struct simulation {
     /* The fleet of tugboats */
     struct cmb_resourcepool *tugs;
     /* Small and large berths */
-    struct cmb_resourcepool *berths[2];
+    struct cmb_resourcepool *berths[N_SIZES];
     /* The radio channel */
     struct cmb_resource *comms;
 
@@ -79,10 +79,10 @@ struct simulation {
     /* A set of all active ships */
     struct cmi_hashheap active_ships;
     /* A list of departed ships  */
-    struct cmi_slist_head departed_ships;
+    struct cmi_slist_node departed_ships;
 
     /* Data collector for local use in this instance */
-    struct cmb_dataset *time_in_system[2];
+    struct cmb_dataset *time_in_system[N_SIZES];
 
 };
 
@@ -101,16 +101,16 @@ struct trial {
     double arrival_rate;
     double percent_large;
     unsigned num_tugs;
-    unsigned num_berths[2];
-    double unloading_time_avg[2];
+    unsigned num_berths[N_SIZES];
+    double unloading_time_avg[N_SIZES];
 
     /* Control parameters */
-    double warmup_time;
-    double duration;
+    double warmup_s;
+    double duration_h;
 
     /* Results */
     uint64_t seed_used;
-    double avg_time_in_system[2];
+    double avg_time_in_system[N_SIZES];
 };
 
 struct context {
@@ -126,13 +126,14 @@ struct ship {
     unsigned tugs_needed;
     double max_wind;
     double min_depth;
-    struct cmi_slist_head listhead;
+    struct cmi_slist_node listnode;
 };
 
 /* We'll do the object lifecycle properly with constructors and destructors. */
 struct ship *ship_create(void)
 {
     struct ship *shpp = malloc(sizeof(struct ship));
+    memset(shpp, 0, sizeof(*shpp));
     cmb_assert_release(shpp != NULL);
 
     return shpp;
@@ -347,7 +348,7 @@ void *ship_proc(struct cmb_process *me, void *vctx)
     /* One pass process, remove ourselves from the active set */
     cmi_hashheap_remove(&(simp->active_ships), hndl);
     /* List ourselves as departed instead */
-    cmi_slist_push(&(simp->departed_ships), &(shpp->listhead));
+    cmi_slist_push(&(simp->departed_ships), &(shpp->listnode));
     /* Inform Davy Jones that we are coming his way */
     cmb_condition_signal(simp->davyjones);
 
@@ -402,7 +403,7 @@ bool is_departed(const struct cmb_condition *cvp,
     const struct simulation *simp = ctxp->sim;
 
     /* Simple: One or more ships in the list of departed ships */
-    return cmi_slist_is_empty(&(simp->departed_ships)) ? false : true;
+    return !(cmi_slist_is_empty(&(simp->departed_ships)));
 }
 
 /* The departure process */
@@ -414,15 +415,15 @@ void *departure_proc(struct cmb_process *me, void *vctx)
     const struct context *ctxp = vctx;
     struct simulation *simp = ctxp->sim;
     const struct trial *trlp = ctxp->trl;
-    struct cmi_slist_head *dep_head = &(simp->departed_ships);
+    struct cmi_slist_node *dep_head = &(simp->departed_ships);
 
     while (true) {
         /* We do not need to loop here, since this is the only process waiting */
         cmb_condition_wait(simp->davyjones, is_departed, vctx);
 
         /* There is one, collect its exit value */
-        struct cmi_slist_head *shead = cmi_slist_pop(dep_head);
-        struct ship *shp = cmi_container_of(shead, struct ship, listhead);
+        struct cmi_slist_node *snode = cmi_slist_pop(dep_head);
+        struct ship *shp = cmi_slist_entry(snode, struct ship, listnode);
         double *t_sys_p = cmb_process_exit_value((struct cmb_process *)shp);
         cmb_assert_debug(t_sys_p != NULL);
         cmb_logger_user(stdout, USERFLAG1,
@@ -430,7 +431,7 @@ void *departure_proc(struct cmb_process *me, void *vctx)
                         ((struct cmb_process *)shp)->name,
                         *t_sys_p);
 
-        if (cmb_time() > trlp->warmup_time) {
+        if (cmb_time() > trlp->warmup_s) {
             /* Add it to the statistics */
             cmb_dataset_add(simp->time_in_system[shp->size], *t_sys_p);
         }
@@ -462,8 +463,8 @@ void end_sim(void *subject, void *object)
         void **item = cmi_hashheap_dequeue(&(simp->active_ships));
         struct ship *shpp = item[0];
         cmb_process_stop((struct cmb_process *)shpp, NULL);
-        cmb_process_terminate((struct cmb_process *)shpp);
-        free(shpp);
+        ship_terminate(shpp);
+        ship_destroy(shpp);
     }
 
     cmb_event_queue_clear();
@@ -502,9 +503,9 @@ void run_trial(void *vtrl)
     struct trial *trlp = vtrl;
 
     /* Using local variables, since it will only be used before this function exits */
-    struct environment env = {0};
-    struct simulation sim = {0};
-    struct context ctx = { &sim, &env, trlp };
+    struct environment env = { 0 };
+    struct simulation sim = { 0 };
+    struct context ctx = { .sim = &sim, .env = &env, .trl = trlp };
 
     /* Set up our trial housekeeping */
     cmb_logger_flags_off(CMB_LOGGER_INFO);
@@ -513,7 +514,7 @@ void run_trial(void *vtrl)
     trlp->seed_used = cmb_random_hwseed();
     cmb_random_initialize(trlp->seed_used);
 
-    cmb_logger_user(stdout, USERFLAG2, "seed: 0x%016" PRIx64, trlp->seed_used);
+    cmb_logger_user(stdout, USERFLAG2, "Started, seed 0x%016" PRIx64, trlp->seed_used);
 
     /* Create and initialize the statistics collectors */
     for (unsigned i = 0; i < N_SIZES; i++) {
@@ -566,9 +567,9 @@ void run_trial(void *vtrl)
     cmi_slist_initialize(&(sim.departed_ships));
 
     /* Schedule the simulation control events */
-    double t = trlp->warmup_time;
+    double t = trlp->warmup_s;
     cmb_event_schedule(start_rec, NULL, &ctx, t, 0);
-    t += trlp->duration;
+    t += trlp->duration_h;
     cmb_event_schedule(stop_rec, NULL, &ctx, t, 0);
     /* Set a large negative priority for the stop event to ensure normal events go first */
     cmb_event_schedule(end_sim, NULL, &ctx, t, -100);
@@ -578,26 +579,49 @@ void run_trial(void *vtrl)
 
     /* Report statistics, using built-in history statistics for the resources */
     for (unsigned i = 0; i < N_SIZES; i++) {
-        struct cmb_datasummary dsumm;
-        cmb_dataset_summarize(sim.time_in_system[i], &dsumm);
-        trlp->avg_time_in_system[i] = cmb_datasummary_mean(&dsumm);
+        struct cmb_datasummary dstmp;
+        cmb_datasummary_initialize(&dstmp);
+        cmb_dataset_summarize(sim.time_in_system[i], &dstmp);
+        trlp->avg_time_in_system[i] = cmb_datasummary_mean(&dstmp);
+        cmb_datasummary_terminate(&dstmp);
     }
 
     /* Clean up */
+    cmb_process_terminate(sim.weather);
+    cmb_process_destroy(sim.weather);
+    cmb_process_terminate(sim.tide);
+    cmb_process_destroy(sim.tide);
+    cmb_process_terminate(sim.arrivals);
+    cmb_process_destroy(sim.arrivals);
+    cmb_process_terminate(sim.departures);
+    cmb_process_destroy(sim.departures);
+
     for (unsigned i = 0; i < N_SIZES; i++) {
+        cmb_dataset_terminate(sim.time_in_system[i]);
         cmb_dataset_destroy(sim.time_in_system[i]);
+        cmb_resourcepool_terminate(sim.berths[i]);
         cmb_resourcepool_destroy(sim.berths[i]);
     }
 
+    cmb_condition_terminate(sim.harbormaster);
     cmb_condition_destroy(sim.harbormaster);
+    cmb_condition_terminate(sim.davyjones);
     cmb_condition_destroy(sim.davyjones);
+    cmb_resourcepool_terminate(sim.tugs);
     cmb_resourcepool_destroy(sim.tugs);
-    cmb_process_destroy(sim.weather);
-    cmb_process_destroy(sim.tide);
+    cmb_resource_terminate(sim.comms);
+    cmb_resource_destroy(sim.comms);
+
+    cmi_hashheap_terminate(&(sim.active_ships));
+    cmi_slist_terminate(&(sim.departed_ships));
 
     /* Final housekeeping to leave everything as we found it */
     cmb_event_queue_terminate();
     cmb_random_terminate();
+
+    cmb_logger_user(stdout, USERFLAG2,
+                    "Finished normally, seed 0x%016" PRIx64,
+                    trlp->seed_used);
 }
 
 void write_gnuplot_commands(void);
@@ -632,8 +656,8 @@ int main(void)
                 experiment[ui_trl].unloading_time_avg[SMALL] = unloading_time_avg[SMALL];
                 experiment[ui_trl].unloading_time_avg[LARGE] = unloading_time_avg[LARGE];
 
-                experiment[ui_trl].warmup_time = warmup_time;
-                experiment[ui_trl].duration = duration;
+                experiment[ui_trl].warmup_s = warmup_h;
+                experiment[ui_trl].duration_h = duration_h;
 
                 ui_trl++;
             }
@@ -654,8 +678,8 @@ int main(void)
                 experiment[ui_trl].unloading_time_avg[SMALL] = unloading_time_avg[SMALL];
                 experiment[ui_trl].unloading_time_avg[LARGE] = unloading_time_avg[LARGE];
 
-                experiment[ui_trl].warmup_time = warmup_time;
-                experiment[ui_trl].duration = duration;
+                experiment[ui_trl].warmup_s = warmup_h;
+                experiment[ui_trl].duration_h = duration_h;
 
                 ui_trl++;
             }
@@ -676,8 +700,8 @@ int main(void)
                 experiment[ui_trl].unloading_time_avg[SMALL] = unloading_time_avg[SMALL];
                 experiment[ui_trl].unloading_time_avg[LARGE] = unloading_time_avg[LARGE];
 
-                experiment[ui_trl].warmup_time = warmup_time;
-                experiment[ui_trl].duration = duration;
+                experiment[ui_trl].warmup_s = warmup_h;
+                experiment[ui_trl].duration_h = duration_h;
 
                 ui_trl++;
             }
@@ -698,8 +722,8 @@ int main(void)
                 experiment[ui_trl].unloading_time_avg[SMALL] = unloading_time_avg[SMALL];
                 experiment[ui_trl].unloading_time_avg[LARGE] = unloading_time_avg[LARGE];
 
-                experiment[ui_trl].warmup_time = warmup_time;
-                experiment[ui_trl].duration = duration;
+                experiment[ui_trl].warmup_s = warmup_h;
+                experiment[ui_trl].duration_h = duration_h;
 
                 ui_trl++;
             }
@@ -708,11 +732,11 @@ int main(void)
 
     printf("Configured %u trials\n", ui_trl);
     printf("Executing experiment\n");
-    cimba_run_experiment(experiment, n_trials, sizeof(*experiment), run_trial);
+    cimba_run(experiment, n_trials, sizeof(*experiment), run_trial);
 
     printf("Finished experiment, writing results to file\n");
     ui_trl = 0u;
-    FILE *datafp = fopen("tut_2_2.dat", "w");
+    FILE *datafp = fopen("tut_4_2.dat", "w");
     fprintf(datafp, "# arr_rate\tref_depth\tn_tg\tn_bts\tn_btl\tavg_t_small\tci_t_small\tavg_t_large\tci_t_small\n");
     for (unsigned ui_sc = 0u; ui_sc < N_SCENARIOS; ui_sc++) {
         /* Dredging levels */
@@ -863,84 +887,91 @@ int main(void)
     printf("It took %g sec\n", elapsed);
 
     write_gnuplot_commands();
-    (void)system("gnuplot -persistent tut_2_2.gp");
+    if (system("gnuplot -persistent tut_4_2.gp") != 0) {
+        cmb_logger_warning(stderr, "gnuplot launch failed");
+    }
+
 
     return 0;
 }
 
 void write_gnuplot_commands(void)
 {
-    FILE *cmdfp = fopen("tut_2_2.gp", "w");
+    static char labelbuf[32];
+    static const double row_label_y[N_SCENARIOS] = { 0.80, 0.50, 0.20 };
+    static const double column_label_x[N_PARAMS] = { 0.22, 0.44, 0.67, 0.89 };
+    static const char *xlabels[N_PARAMS] = {
+        "Dredged depth",
+        "Number of tugs",
+        "Number of small berths",
+        "Number of large berths"
+    };
+    static const char *xranges[N_PARAMS] = {
+        "[14.5:17.5]",
+        "[9:15]",
+        "[5:11]",
+        "[2:8]"
+    };
+    unsigned scenario;
+    unsigned param;
+    FILE *cmdfp = fopen("tut_4_2.gp", "w");
 
     fprintf(cmdfp, "set terminal qt size 1200,1000 enhanced font 'Arial,9'\n");
     fprintf(cmdfp, "set multiplot layout 3,4 rowsfirst \\\n");
     fprintf(cmdfp, "title \"Harbor improvement opportunities\" font 'Helvetica,16'\\\n");
-    fprintf(cmdfp, "margins 0.1, 0.95, 0.1, 0.9 spacing 0.1, 0.15\n");
+    fprintf(cmdfp, "margins 0.16, 0.95, 0.1, 0.88 spacing 0.1, 0.15\n");
     fprintf(cmdfp, "set grid\n");
     fprintf(cmdfp, "set ylabel \"Avg time in system\" font 'Arial,9'\n");
-    fprintf(cmdfp, "set yrange [0:24]\n");
-    fprintf(cmdfp, "datafile = 'tut_2_2.dat'\n");
+    fprintf(cmdfp, "set yrange [0:30]\n");
+    fprintf(cmdfp, "datafile = 'tut_4_2.dat'\n");
+    for (param = 0; param < N_PARAMS; ++param) {
+        fprintf(cmdfp,
+                "set label %u \"%s\" at screen %.2f,0.91 center font 'Helvetica,12'\n",
+                param + 10u, xlabels[param], column_label_x[param]);
+    }
 
-    fprintf(cmdfp, "set xlabel \"Dredged depth\"\n");
-    fprintf(cmdfp, "set xrange [14.5:17.5]\n");
-    fprintf(cmdfp, "plot datafile using 2:6:7 index 0 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 2:8:9 index 0 with errorbars notitle lc rgb \"red\"\n");
+    for (scenario = 0; scenario < N_SCENARIOS; ++scenario) {
+        (void)snprintf(labelbuf, sizeof(labelbuf), "Arrival rate %4.3f",
+            arrival_rate[scenario]);
+        fprintf(cmdfp,
+                "set label 1 \"%s\" at screen 0.05,%.2f center rotate by 90 "
+                "font 'Helvetica,12'\n",
+                labelbuf, row_label_y[scenario]);
 
-    fprintf(cmdfp, "set xlabel \"Number of tugs\"\n");
-    fprintf(cmdfp, "set xrange [9:15]\n");
-    fprintf(cmdfp, "plot datafile using 3:6:7 index 1 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 3:8:9 index 1 with errorbars notitle lc rgb \"red\"\n");
+        for (param = 0; param < N_PARAMS; ++param) {
+            unsigned index = scenario * N_PARAMS + param;
 
-    fprintf(cmdfp, "set xlabel \"Number of small berths\"\n");
-    fprintf(cmdfp, "set xrange [5:11]\n");
-    fprintf(cmdfp, "plot datafile using 4:6:7 index 2 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 4:8:9 index 2 with errorbars notitle lc rgb \"red\"\n");
+            fprintf(cmdfp, "set xlabel \"%s\"\n", xlabels[param]);
+            fprintf(cmdfp, "set xrange %s\n", xranges[param]);
+            if (scenario == 0u && param == 0u) {
+                fprintf(cmdfp,
+                        "set key at screen 0.95,0.965 top right opaque box spacing 1.0 "
+                        "font 'Helvetica,10'\n");
+                fprintf(cmdfp,
+                        "plot datafile using %u:6:7 index %u with errorbars title 'Small ships' "
+                        "lc rgb \"black\",\\\n",
+                        param + 2u, index);
+                fprintf(cmdfp,
+                        "     datafile using %u:8:9 index %u with errorbars title 'Large ships' "
+                        "lc rgb \"red\"\n",
+                        param + 2u, index);
+                fprintf(cmdfp, "unset key\n");
+            } else {
+                fprintf(cmdfp,
+                        "plot datafile using %u:6:7 index %u with errorbars notitle "
+                        "lc rgb \"black\",\\\n",
+                        param + 2u, index);
+                fprintf(cmdfp,
+                        "     datafile using %u:8:9 index %u with errorbars notitle "
+                        "lc rgb \"red\"\n",
+                        param + 2u, index);
+            }
 
-    fprintf(cmdfp, "set xlabel \"Number of large berths\"\n");
-    fprintf(cmdfp, "set xrange [2:8]\n");
-    fprintf(cmdfp, "plot datafile using 5:6:7 index 3 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 5:8:9 index 3 with errorbars notitle lc rgb \"red\"\n");
-
-    fprintf(cmdfp, "set xlabel \"Dredged depth\"\n");
-    fprintf(cmdfp, "set xrange [14.5:17.5]\n");
-    fprintf(cmdfp, "plot datafile using 2:6:7 index 4 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 2:8:9 index 4 with errorbars notitle lc rgb \"red\"\n");
-
-    fprintf(cmdfp, "set xlabel \"Number of tugs\"\n");
-    fprintf(cmdfp, "set xrange [9:15]\n");
-    fprintf(cmdfp, "plot datafile using 3:6:7 index 5 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 3:8:9 index 5 with errorbars notitle lc rgb \"red\"\n");
-
-    fprintf(cmdfp, "set xlabel \"Number of small berths\"\n");
-    fprintf(cmdfp, "set xrange [5:11]\n");
-    fprintf(cmdfp, "plot datafile using 4:6:7 index 6 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 4:8:9 index 6 with errorbars notitle lc rgb \"red\"\n");
-
-    fprintf(cmdfp, "set xlabel \"Number of large berths\"\n");
-    fprintf(cmdfp, "set xrange [2:8]\n");
-    fprintf(cmdfp, "plot datafile using 5:6:7 index 7 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 5:8:9 index 7 with errorbars notitle lc rgb \"red\"\n");
-
-    fprintf(cmdfp, "set xlabel \"Dredged depth\"\n");
-    fprintf(cmdfp, "set xrange [14.5:17.5]\n");
-    fprintf(cmdfp, "plot datafile using 2:6:7 index 8 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 2:8:9 index 8 with errorbars notitle lc rgb \"red\"\n");
-
-    fprintf(cmdfp, "set xlabel \"Number of tugs\"\n");
-    fprintf(cmdfp, "set xrange [9:15]\n");
-    fprintf(cmdfp, "plot datafile using 3:6:7 index 9 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 3:8:9 index 9 with errorbars notitle lc rgb \"red\"\n");
-
-    fprintf(cmdfp, "set xlabel \"Number of small berths\"\n");
-    fprintf(cmdfp, "set xrange [5:11]\n");
-    fprintf(cmdfp, "plot datafile using 4:6:7 index 10 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 4:8:9 index 10 with errorbars notitle lc rgb \"red\"\n");
-
-    fprintf(cmdfp, "set xlabel \"Number of large berths\"\n");
-    fprintf(cmdfp, "set xrange [2:8]\n");
-    fprintf(cmdfp, "plot datafile using 5:6:7 index 11 with errorbars notitle lc rgb \"black\",\\\n");
-    fprintf(cmdfp, "     datafile using 5:8:9 index 11 with errorbars notitle lc rgb \"red\"\n");
-
+            if (param == 0u) {
+                fprintf(cmdfp, "unset label 1\n");
+            }
+        }
+    }
 
     fprintf(cmdfp, "unset multiplot\n");
 

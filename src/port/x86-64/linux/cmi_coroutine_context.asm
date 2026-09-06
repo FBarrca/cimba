@@ -6,7 +6,20 @@
 ; See https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf
 ; Written in NASM syntax.
 ;
-; Copyright (c) Asbjørn M. Bonvik 2025.
+; Intel CET considerations: The context switch changes stacks by hand and
+; returns via 'pop r9 / jmp r9' instead of 'ret'. That deliberately bypasses the
+; shadow-stack (SHSTK) return check, which a stack switch would otherwise fail.
+; But that indirect jump (like the trampoline's 'call r12' / 'jmp r15') is not
+; an IBT-valid target (it lands on a normal return site, not an endbr64), so it
+; would fault if IBT were enforced. The linker AND-merges that note across all
+; inputs, so linking Cimba clears IBT/SHSTK from the library and the glibc
+; loader leaves Intel CET DISABLED for any process that links it. This is
+; intentional and accepted as the direct counterpart of the Windows build's
+; explicit -fcf-protection=none. Restoring CET would require per-coroutine
+; shadow-stack management (map_shadow_stack + token restore on each switch) plus
+; endbr64 landing pads. Perhaps in some future version of Cimba but not now.
+;
+; Copyright (c) Asbjørn M. Bonvik 2025-26.
 ;
 ; Licensed under the Apache License, Version 2.0 (the "License");
 ; you may not use this file except in compliance with the License.
@@ -23,6 +36,23 @@
 bits 64
 default rel
 
+; Explicit Intel CET posture: This object honors no CET features.
+; GNU_PROPERTY_X86_FEATURE_1_AND with value 0 -> no IBT, no SHSTK. The linker
+; AND-merges this across all inputs, so it keeps Intel CET disabled for any
+; binary that links cimba (see the CET note at the top of the file for why the
+; hand-rolled context switch cannot run under CET).
+section .note.gnu.property note alloc noexec nowrite align=8
+    dd 4                    ; n_namesz  = sizeof "GNU\0"
+    dd 16                   ; n_descsz  = size of the property array (incl. pad)
+    dd 5                    ; n_type    = NT_GNU_PROPERTY_TYPE_0
+    db "GNU", 0             ; n_name
+    dd 0xc0000002           ; pr_type   = GNU_PROPERTY_X86_FEATURE_1_AND
+    dd 4                    ; pr_datasz = 4
+    dd 0                    ; pr_data   = 0  -> no IBT (0x1), no SHSTK (0x2)
+    dd 0                    ; pad to 8-byte alignment
+
+section .note.GNU-stack noalloc noexec nowrite progbits
+
 section .text
 global cmi_coroutine_context_switch_raw
 global cmi_coroutine_trampoline
@@ -32,9 +62,6 @@ global cmi_coroutine_trampoline
 ; In effect taking a (sub-)continuation at this point in execution.
 ;
 %macro save_context 0
-    ; Save flags register
-    pushfq
-
     %ifndef NMXCSR
         ; Allocate space and save MXCSR (SSE status register)
         sub rsp, 8
@@ -68,8 +95,8 @@ global cmi_coroutine_trampoline
         add rsp, 8
     %endif
 
-    ; Restore flags
-    popfq
+    ; Enfore cleared direction flag
+    cld
 %endmacro
 
 ;-------------------------------------------------------------------------------
@@ -98,11 +125,12 @@ cmi_coroutine_context_switch_raw:
     load_context
     ; Load whatever was in the third argument RDX as return value in RAX
     mov rax, rdx
-    ; Return to wherever the new context was transferring from earlier
-    ; Note that we spell out the 'ret' as 'pop, jmp' for Intel CET reasons.
+    ; Return to wherever the new context was transferring from earlier.
+    ; Returns via indirect JMP, not RET, to bypass the SHSTK return check after
+    ; the stack switch. Safe only because CET is disabled for the process
+    ; (see the CET note at top).
     pop r9
     jmp r9
-
 
 ;-------------------------------------------------------------------------------
 ; cmi_coroutine_trampoline: Not callable, preloaded as stack return address when
@@ -122,13 +150,6 @@ cmi_coroutine_context_switch_raw:
 ;
 cmi_coroutine_trampoline:
     ; Is not a leaf function, needs to obey Linux ABI calling convention.
-    ; Expected struct cmi_coroutine layout (from cmi_coroutine.h):
-    ; - parent (8 bytes, offset 0)
-    ; - caller (8 bytes, offset 8)
-    ; - stack (8 bytes, offset 16)
-    ; - stack_base (8 bytes, offset 24)
-    ; - stack_limit (8 bytes, offset 32)
-    ;
     ; Will soon call coroutine function foo(cp, arg).
     ; The address of foo is now in R12, cp in R13, and arg in R14.
     ; The arguments for foo need to be in RDI and RSI, move them there.

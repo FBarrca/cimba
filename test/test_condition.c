@@ -48,13 +48,12 @@ struct simulation {
     struct cmb_process *tide;
     struct cmb_process *arrivals;
     struct cmb_process *departures;
-    struct cmb_process *entertainment;
     struct cmb_resourcepool *tugs;
     struct cmb_resourcepool *berths[2];
     struct cmb_condition *harbormaster;
     struct cmb_condition *davyjones;
     struct cmi_hashheap *active_ships;
-    struct cmi_slist_head *departed_ships;
+    struct cmi_slist_node *departed_ships;
  };
 
 /* The current sea and weather state */
@@ -77,7 +76,7 @@ struct trial {
     unsigned num_tugs;
     unsigned num_berths[2];
     double unloading_time_avg[2];
-    double duration;
+    double duration_h;
     /* Outcomes */
     struct cmb_dataset *system_time[2];
 };
@@ -90,7 +89,7 @@ struct ship {
     double min_depth;
     unsigned tugs;
     enum ship_size size;
-    struct cmi_slist_head listhead;
+    struct cmi_slist_node listnode;
 };
 
 /* The entire context for our simulation run */
@@ -110,7 +109,6 @@ void *weather_proc(struct cmb_process *me, void *vctx)
     struct env_state *env = ctx->state;
     const struct simulation *sim = ctx->sim;
 
-    // ReSharper disable once CppDFAEndlessLoop
     while (true) {
         /* Wind magnitude in meters per second */
         const double wmag = cmb_random_rayleigh(5.0);
@@ -152,7 +150,6 @@ void *tide_proc(struct cmb_process *me, void *vctx)
     const struct simulation *sim = ctx->sim;
     cmb_assert_always(sim != NULL);
 
-    // ReSharper disable once CppDFAEndlessLoop
     while (true) {
         /* A simple tide model with astronomical and weather-driven tides */
         const double t_raw = cmb_time();
@@ -301,9 +298,9 @@ void *ship_proc(struct cmb_process *me, void *vctx)
     const bool found = cmi_hashheap_remove(sim->active_ships, shp->id);
     cmb_assert_always(found);
     /* List ourselves as departed instead */
-    cmi_slist_push(sim->departed_ships, &(shp->listhead));
+    cmi_slist_push(sim->departed_ships, &(shp->listnode));
     /* Inform Davy Jones that we are coming his way */
-    uint64_t r = cmb_condition_signal(sim->davyjones);
+    const uint64_t r = cmb_condition_signal(sim->davyjones);
     cmb_assert_always(r == 1u);
 
     /* Store the time we spent working as an exit value in a separate heap object.
@@ -336,7 +333,6 @@ void *arrival_proc(struct cmb_process *me, void *vctx)
     const double p_large = trl->percent_large;
 
     uint64_t cnt = 0u;
-    // ReSharper disable once CppDFAEndlessLoop
     while (true) {
         cmb_process_hold(cmb_random_exponential(mean));
 
@@ -372,11 +368,11 @@ void *arrival_proc(struct cmb_process *me, void *vctx)
                          cnt, ((shp->size == SMALL) ? "_small" : "_large"));
         cmb_assert_always((r >= 0) && (r < (int)sizeof(namebuf)) && (namebuf[r] == '\0'));
         cmb_process_initialize((struct cmb_process *)shp, namebuf, ship_proc, vctx, 0);
-        cmb_assert_always(cmb_process_status((struct cmb_process *)shp) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status((struct cmb_process *)shp) == CMB_PROCESS_INITIALIZED);
 
         /* Start our new ship heading into the harbor */
         cmb_process_start((struct cmb_process *)shp);
-        cmb_assert_always(cmb_process_status((struct cmb_process *)shp) == CMB_PROCESS_CREATED);
+        cmb_assert_always(cmb_process_status((struct cmb_process *)shp) == CMB_PROCESS_INITIALIZED);
         cmb_logger_user(stdout, USERFLAG1, "Ship %s started", namebuf);
     }
 }
@@ -409,18 +405,17 @@ void *departure_proc(struct cmb_process *me, void *vctx)
     cmb_assert_always(sim != NULL);
     const struct trial *trl = ctx->trial;
     cmb_assert_always(trl != NULL);
-    struct cmi_slist_head *dep_head = sim->departed_ships;
+    struct cmi_slist_node *dep_head = sim->departed_ships;
 
-    // ReSharper disable once CppDFAEndlessLoop
     while (true) {
         /* We do not need to loop here, since this is the only process waiting */
         const int64_t sig = cmb_condition_wait(sim->davyjones, is_departed, vctx);
         cmb_assert_always(sig == CMB_PROCESS_SUCCESS);
 
         /* Got one, collect its exit value */
-        struct cmi_slist_head *shead = cmi_slist_pop(dep_head);
+        struct cmi_slist_node *shead = cmi_slist_pop(dep_head);
         cmb_assert_always(shead != NULL);
-        struct ship *shp = cmi_container_of(shead, struct ship, listhead);
+        struct ship *shp = cmi_container_of(shead, struct ship, listnode);
         cmb_assert_always(shp != NULL);
         double *t_sys_p = cmb_process_exit_value((struct cmb_process *)shp);
         cmb_assert_always(t_sys_p != NULL);
@@ -440,22 +435,6 @@ void *departure_proc(struct cmb_process *me, void *vctx)
     }
 }
 
-/* Just to keep ourselves amused while the simulation is running */
-void *entertainment_proc(struct cmb_process *me, void *vctx)
-{
-    cmb_unused(me);
-    cmb_unused(vctx);
-
-    // ReSharper disable once CppDFAEndlessLoop
-    while (true) {
-        /* Print one dot per simulated year */
-        const int64_t sig = cmb_process_hold(24.0 * 7 * 52);
-        cmb_assert_always(sig == CMB_PROCESS_SUCCESS);
-        printf(".");
-        fflush(stdout);
-    }
-}
-
 /* An event to shut down the simulation */
 void end_sim_evt(void *subject, void *object)
 {
@@ -467,7 +446,6 @@ void end_sim_evt(void *subject, void *object)
     cmb_process_stop(sim->tide, NULL);
     cmb_process_stop(sim->arrivals, NULL);
     cmb_process_stop(sim->departures, NULL);
-    cmb_process_stop(sim->entertainment, NULL);
 
     /* Also stop and recycle any still active ships */
     while (cmi_hashheap_count(sim->active_ships) > 0u) {
@@ -495,7 +473,7 @@ void set_test_parameters(struct trial *trl, double dur)
     trl->unloading_time_avg[SMALL] = 8.0;
     trl->unloading_time_avg[LARGE] = 12.0;
 
-    trl->duration = dur;
+    trl->duration_h = dur;
 }
 
 /* The test function running the simulation */
@@ -505,7 +483,6 @@ void test_condition(uint64_t seed, double dur)
     printf("***********************   Testing condition variables  *************************\n");
     cmi_test_print_line("*");
 
-    printf("Cimba version %s\n", cimba_version());
     printf("Using seed: 0x%" PRIx64 "\n", seed);
     cmb_random_initialize(seed);
     cmb_event_queue_initialize(0.0);
@@ -532,17 +509,17 @@ void test_condition(uint64_t seed, double dur)
 
     /* Create weather and tide processes */
     sim.weather = cmb_process_create();
-    cmb_assert_always(cmb_process_status(sim.weather) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim.weather) == CMB_PROCESS_UNINITIALIZED);
     cmb_assert_always(sim.weather != NULL);
-    cmb_assert_always(cmb_process_status(sim.weather) == CMB_PROCESS_CREATED);
     cmb_process_initialize(sim.weather, "Wind", weather_proc, &ctx, 0);
+    cmb_assert_always(cmb_process_status(sim.weather) == CMB_PROCESS_INITIALIZED);
     cmb_process_start(sim.weather);
 
     sim.tide = cmb_process_create();
     cmb_assert_always(sim.tide != NULL);
-    cmb_assert_always(cmb_process_status(sim.weather) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim.tide) == CMB_PROCESS_UNINITIALIZED);
     cmb_process_initialize(sim.tide, "Depth", tide_proc, &ctx, 0);
-    cmb_assert_always(cmb_process_status(sim.tide) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim.tide) == CMB_PROCESS_INITIALIZED);
     cmb_process_start(sim.tide);
 
     /* Create the resources, turn on history recording with no warmup period */
@@ -570,12 +547,12 @@ void test_condition(uint64_t seed, double dur)
     /* Create the arrival and departure processes */
     sim.arrivals = cmb_process_create();
     cmb_assert_always(sim.arrivals != NULL);
-    cmb_assert_always(cmb_process_status(sim.arrivals) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim.arrivals) == CMB_PROCESS_UNINITIALIZED);
     cmb_process_initialize(sim.arrivals, "Arrivals", arrival_proc, &ctx, 0);
     cmb_process_start(sim.arrivals);
     sim.departures = cmb_process_create();
     cmb_assert_always(sim.departures != NULL);
-    cmb_assert_always(cmb_process_status(sim.departures) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim.departures) == CMB_PROCESS_UNINITIALIZED);
     cmb_process_initialize(sim.departures, "Departures", departure_proc, &ctx, 0);
     cmb_process_start(sim.departures);
 
@@ -590,12 +567,6 @@ void test_condition(uint64_t seed, double dur)
     uint64_t evt_hdle = cmb_event_schedule(end_sim_evt, &sim, NULL, dur, 0);
     cmb_assert_always(evt_hdle != 0u);
 
-    sim.entertainment = cmb_process_create();
-    cmb_assert_always(sim.entertainment != NULL);
-    cmb_assert_always(cmb_process_status(sim.entertainment) == CMB_PROCESS_CREATED);
-    cmb_process_initialize(sim.entertainment, "Dot", entertainment_proc, NULL, 0);
-    cmb_process_start(sim.entertainment);
-
     /* Execute the simulation */
     cmb_event_queue_execute();
 
@@ -605,9 +576,11 @@ void test_condition(uint64_t seed, double dur)
         const unsigned n = cmb_dataset_count(trl.system_time[i]);
         if (n > 0) {
             struct cmb_datasummary dsumm;
+            cmb_datasummary_initialize(&dsumm);
             cmb_dataset_summarize(trl.system_time[i], &dsumm);
             cmb_datasummary_print(&dsumm, stdout, true);
             cmb_dataset_histogram_print(trl.system_time[i], stdout, 20, 0.0, 0.0);
+            cmb_datasummary_terminate(&dsumm);
         }
     }
 
@@ -617,9 +590,11 @@ void test_condition(uint64_t seed, double dur)
         const unsigned n = cmb_timeseries_count(hist);
         if (n > 0) {
             struct cmb_wtdsummary wsumm;
+            cmb_wtdsummary_initialize(&wsumm);
             cmb_timeseries_summarize(hist, &wsumm);
             cmb_wtdsummary_print(&wsumm, stdout, true);
             cmb_timeseries_histogram_print(hist, stdout, 20, 0.0, 0.0);
+            cmb_wtdsummary_terminate(&wsumm);
         }
     }
 
@@ -628,22 +603,42 @@ void test_condition(uint64_t seed, double dur)
     const unsigned n = cmb_timeseries_count(hist);
     if (n > 0) {
         struct cmb_wtdsummary wsumm;
+        cmb_wtdsummary_initialize(&wsumm);
         cmb_timeseries_summarize(hist, &wsumm);
         cmb_wtdsummary_print(&wsumm, stdout, true);
         cmb_timeseries_histogram_print(hist, stdout, 20, 0.0, 0.0);
+        cmb_wtdsummary_terminate(&wsumm);
     }
 
     /* Clean up */
     for (int i = 0; i < 2; i++) {
+        cmb_dataset_terminate(trl.system_time[i]);
         cmb_dataset_destroy(trl.system_time[i]);
+        cmb_resourcepool_terminate(sim.berths[i]);
         cmb_resourcepool_destroy(sim.berths[i]);
      }
 
+    cmb_condition_terminate(sim.harbormaster);
     cmb_condition_destroy(sim.harbormaster);
+    cmb_condition_terminate(sim.davyjones);
     cmb_condition_destroy(sim.davyjones);
+    cmb_resourcepool_terminate(sim.tugs);
     cmb_resourcepool_destroy(sim.tugs);
+
+    cmb_process_terminate(sim.weather);
     cmb_process_destroy(sim.weather);
+    cmb_process_terminate(sim.tide);
     cmb_process_destroy(sim.tide);
+
+    cmb_process_terminate(sim.arrivals);
+    cmb_process_destroy(sim.arrivals);
+    cmb_process_terminate(sim.departures);
+    cmb_process_destroy(sim.departures);
+
+    cmi_hashheap_terminate(sim.active_ships);
+    cmi_hashheap_destroy(sim.active_ships);
+    cmi_slist_terminate(sim.departed_ships);
+    cmi_slist_destroy(sim.departed_ships);
 
     cmb_event_queue_terminate();
     cmb_random_terminate();
@@ -655,7 +650,7 @@ int main(const int argc, char *argv[])
 {
     bool timing_enabled = false;
     uint64_t seed = cmb_random_hwseed();
-    double dur = 24.0 * 7 * 52 * 100;
+    double dur = 24.0 * 7 * 52.25;
 
     int opt;
     while ((opt = getopt(argc, argv, "d:s:t")) != -1) {

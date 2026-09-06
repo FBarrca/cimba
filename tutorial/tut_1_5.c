@@ -13,8 +13,8 @@ struct trial {
     /* Parameters */
     double arr_rate;
     double srv_rate;
-    double warmup_time;
-    double duration;
+    double warmup_s;
+    double duration_h;
     /* Results */
     double avg_queue_length;
 };
@@ -27,6 +27,7 @@ struct context {
 void end_sim(void *subject, void *object)
 {
     cmb_unused(subject);
+    cmb_assert_debug(object != NULL);
 
     const struct context *ctx = object;
     const struct simulation *sim = ctx->sim;
@@ -38,6 +39,7 @@ void end_sim(void *subject, void *object)
 static void start_rec(void *subject, void *object)
 {
     cmb_unused(subject);
+    cmb_assert_debug(object != NULL);
 
     const struct context *ctx = object;
     const struct simulation *sim = ctx->sim;
@@ -47,16 +49,17 @@ static void start_rec(void *subject, void *object)
 static void stop_rec(void *subject, void *object)
 {
     cmb_unused(subject);
+    cmb_assert_debug(object != NULL);
 
     const struct context *ctx = object;
     const struct simulation *sim = ctx->sim;
     cmb_buffer_recording_stop(sim->que);
 }
 
-
-void *arrival(struct cmb_process *me, void *vctx)
+void *arrival_proc(struct cmb_process *me, void *vctx)
 {
     cmb_unused(me);
+    cmb_assert_debug(vctx != NULL);
 
     const struct context *ctx = vctx;
     const struct simulation *sim = ctx->sim;
@@ -76,9 +79,10 @@ void *arrival(struct cmb_process *me, void *vctx)
     }
 }
 
-void *service(struct cmb_process *me, void *vctx)
+void *service_proc(struct cmb_process *me, void *vctx)
 {
     cmb_unused(me);
+    cmb_assert_debug(vctx != NULL);
 
     const struct context *ctx = vctx;
     const struct simulation *sim = ctx->sim;
@@ -100,7 +104,7 @@ void *service(struct cmb_process *me, void *vctx)
 
 void run_MM1_trial(void *vtrl)
 {
-    cmb_assert_release(vtrl != NULL);
+    cmb_assert_debug(vtrl != NULL);
     struct trial *trl = vtrl;
 
     struct context ctx = {};
@@ -111,8 +115,7 @@ void run_MM1_trial(void *vtrl)
     const uint64_t seed = cmb_random_hwseed();
     cmb_random_initialize(seed);
 
-    cmb_logger_flags_off(CMB_LOGGER_INFO);
-    cmb_logger_flags_off(USERFLAG1);
+    cmb_logger_flags_off(CMB_LOGGER_INFO | USERFLAG1);
 
     cmb_event_queue_initialize(0.0);
 
@@ -120,25 +123,28 @@ void run_MM1_trial(void *vtrl)
     cmb_buffer_initialize(ctx.sim->que, "Queue", CMB_UNLIMITED);
 
     ctx.sim->arr = cmb_process_create();
-    cmb_process_initialize(ctx.sim->arr, "Arrival", arrival, &ctx, 0);
+    cmb_process_initialize(ctx.sim->arr, "Arrival", arrival_proc, &ctx, 0);
     cmb_process_start(ctx.sim->arr);
 
     ctx.sim->srv = cmb_process_create();
-    cmb_process_initialize(ctx.sim->srv, "Service", service, &ctx, 0);
+    cmb_process_initialize(ctx.sim->srv, "Server", service_proc, &ctx, 0);
     cmb_process_start(ctx.sim->srv);
 
-    double t = trl->warmup_time;
+    double t = trl->warmup_s;
     cmb_event_schedule(start_rec, NULL, &ctx, t, 0);
-    t += trl->duration;
+    t += trl->duration_h;
     cmb_event_schedule(stop_rec, NULL, &ctx, t, 0);
     cmb_event_schedule(end_sim, NULL, &ctx, t, -100);
 
     cmb_event_queue_execute();
 
+    /* Make sure to initialize and terminate the wtdsummary */
     struct cmb_wtdsummary wtdsum;
+    cmb_wtdsummary_initialize(&wtdsum);
     const struct cmb_timeseries *ts = cmb_buffer_history(ctx.sim->que);
     cmb_timeseries_summarize(ts, &wtdsum);
     ctx.trl->avg_queue_length = cmb_wtdsummary_mean(&wtdsum);
+    cmb_wtdsummary_terminate(&wtdsum);
 
     cmb_process_terminate(ctx.sim->srv);
     cmb_process_destroy(ctx.sim->srv);
@@ -154,20 +160,13 @@ void run_MM1_trial(void *vtrl)
 
 }
 
-void load_params(struct trial *trlp)
-{
-    cmb_assert_release(trlp != NULL);
-
-    trlp->arr_rate = 0.75;
-    trlp->srv_rate = 1.0;
-    trlp->warmup_time = 1000.0;
-    trlp->duration = 1e6;
-}
-
 int main(void)
 {
     struct trial trl = {};
-    load_params(&trl);
+    trl.arr_rate = 0.75;
+    trl.srv_rate = 1.0;
+    trl.warmup_s = 1000.0;
+    trl.duration_h = 1e6;
 
     run_MM1_trial(&trl);
 

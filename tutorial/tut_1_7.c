@@ -18,6 +18,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <errno.h>
 #include <cimba.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -47,8 +48,8 @@ struct trial {
     /* Parameters */
     double arr_rate;
     double srv_rate;
-    double warmup_time;
-    double duration;
+    double warmup_s;
+    double duration_h;
     /* Results */
     uint64_t seed_used;
     double avg_queue_length;
@@ -104,7 +105,7 @@ static void stop_rec(void *subject, void *object)
 /*
  * The arrival process, a memoryless Poisson process
  */
-void *arrival(struct cmb_process *me, void *vctx)
+void *arrival_proc(struct cmb_process *me, void *vctx)
 {
     cmb_unused(me);
 
@@ -129,7 +130,7 @@ void *arrival(struct cmb_process *me, void *vctx)
 /*
  * The service process, exponentially distributed service times.
  */
-void *service(struct cmb_process *me, void *vctx)
+void *service_proc(struct cmb_process *me, void *vctx)
 {
     cmb_unused(me);
 
@@ -166,8 +167,7 @@ void run_MM1_trial(void *vtrl)
     ctx.trl = trl;
 
     /* Set up our trial housekeeping */
-    cmb_logger_flags_off(CMB_LOGGER_INFO);
-    cmb_logger_flags_off(USERFLAG1);
+    cmb_logger_flags_off(CMB_LOGGER_INFO | USERFLAG1);
     cmb_event_queue_initialize(0.0);
     cmb_random_initialize(trl->seed_used);
     cmb_logger_user(stdout, USERFLAG2,
@@ -180,18 +180,18 @@ void run_MM1_trial(void *vtrl)
 
     /* Create the arrival process */
     ctx.sim->arr = cmb_process_create();
-    cmb_process_initialize(ctx.sim->arr, "Arrival", arrival, &ctx, 0);
+    cmb_process_initialize(ctx.sim->arr, "Arrival", arrival_proc, &ctx, 0);
     cmb_process_start(ctx.sim->arr);
 
     /* Create the service process */
     ctx.sim->srv = cmb_process_create();
-    cmb_process_initialize(ctx.sim->srv, "Service", service, &ctx, 0);
+    cmb_process_initialize(ctx.sim->srv, "Server", service_proc, &ctx, 0);
     cmb_process_start(ctx.sim->srv);
 
     /* Schedule the simulation control events */
-    double t = trl->warmup_time;
+    double t = trl->warmup_s;
     cmb_event_schedule(start_rec, NULL, &ctx, t, 0);
-    t += trl->duration;
+    t += trl->duration_h;
     cmb_event_schedule(stop_rec, NULL, &ctx, t, 0);
     /* Set a large negative priority for the stop event to ensure normal events go first */
     cmb_event_schedule(end_sim, NULL, &ctx, t, -100);
@@ -201,9 +201,11 @@ void run_MM1_trial(void *vtrl)
 
     /* Done, collect statistics and store in the results field */
     struct cmb_wtdsummary wtdsum;
+    cmb_wtdsummary_initialize(&wtdsum);
     const struct cmb_timeseries *ts = cmb_buffer_history(ctx.sim->que);
     cmb_timeseries_summarize(ts, &wtdsum);
     ctx.trl->avg_queue_length = cmb_wtdsummary_mean(&wtdsum);
+    cmb_wtdsummary_terminate(&wtdsum);
 
     /* Clean up, one _terminate for each _initialize, one _destroy for each _create */
     cmb_process_terminate(ctx.sim->srv);
@@ -220,13 +222,14 @@ void run_MM1_trial(void *vtrl)
 }
 
 void write_gnuplot_commands(void);
+double t_crit_95(uint32_t n);
 
 int main(const int argc, char *argv[])
 {
     /* Can be set on command line */
     bool timing_enabled = false;
     uint64_t master_seed = cmb_random_hwseed();
-    unsigned n_reps = 10;
+    uint32_t n_reps = 10;
     double warmup_time = 1000.0;
     double duration = 1.0e6;
 
@@ -236,29 +239,57 @@ int main(const int argc, char *argv[])
     const double rho_step = 0.025;
     const double srv_rate = 1.0;
 
+    /* Parse command line options, if any */
     int opt;
     while ((opt = getopt(argc, argv, "d:n:s:tw:")) != -1) {
         switch (opt) {
-            case 'd':
-                duration = (double)strtod(optarg, NULL);
+            case 'd': {
+                errno = 0;
+                duration = strtod(optarg, NULL);
+                if (errno != 0 || duration <= 0.0) {
+                    fprintf(stderr, "Invalid argument %s\n", optarg);
+                    return EXIT_FAILURE;
+                }
                 break;
-            case 'n':
-                n_reps = (unsigned)strtoull(optarg, NULL, 0);
+            }
+            case 'n': {
+                errno = 0;
+                n_reps = (uint32_t)strtoul(optarg, NULL, 0);
+                if (errno != 0) {
+                    fprintf(stderr, "Invalid argument %s\n", optarg);
+                    return EXIT_FAILURE;
+                }
                 break;
-            case 's':
+            }
+            case 's': {
+                errno = 0;
                 master_seed = (uint64_t)strtoull(optarg, NULL, 0);
+                if (errno != 0 || master_seed == 0u) {
+                    fprintf(stderr, "Invalid argument %s\n", optarg);
+                    return EXIT_FAILURE;
+                }
                 break;
-            case 't':
+            }
+            case 't': {
                 timing_enabled = true;
                 break;
-            case 'w':
+            }
+            case 'w': {
+                errno = 0;
                 warmup_time = (double)strtod(optarg, NULL);
+                if (errno != 0 || warmup_time < 0.0) {
+                    fprintf(stderr, "Invalid argument %s\n", optarg);
+                    return EXIT_FAILURE;
+                }
                 break;
-            default:
+            }
+            default: {
                 fprintf(stderr, "Usage: %s [-d <duration>][-n <num_replications>][-s <seed>][-t][-w <warmup_time>]\n", argv[0]);
                 return EXIT_FAILURE;
+            }
         }
     }
+
     printf("Cimba version %s\n", cimba_version());
     struct timespec start_time;
     if (timing_enabled) {
@@ -266,8 +297,9 @@ int main(const int argc, char *argv[])
     }
 
     printf("Setting up experiment\n");
+    printf("Master seed: 0x%" PRIx64 "\n", master_seed);
     const unsigned n_trials = n_rhos * n_reps;
-    struct trial *experiment = calloc(n_trials, sizeof(*experiment));
+    struct trial *experiment = cmi_calloc(n_trials, sizeof(*experiment));
 
     uint64_t ui_exp = 0u;
     double rho = rho_start;
@@ -275,8 +307,8 @@ int main(const int argc, char *argv[])
         for (unsigned ui_rep = 0u; ui_rep < n_reps; ui_rep++) {
             experiment[ui_exp].arr_rate = rho * srv_rate;
             experiment[ui_exp].srv_rate = srv_rate;
-            experiment[ui_exp].warmup_time = warmup_time;
-            experiment[ui_exp].duration = duration;
+            experiment[ui_exp].warmup_s = warmup_time;
+            experiment[ui_exp].duration_h = duration;
             experiment[ui_exp].seed_used = cmb_random_fmix64(master_seed, ui_exp);
             experiment[ui_exp].avg_queue_length = 0.0;
 
@@ -287,11 +319,11 @@ int main(const int argc, char *argv[])
     }
 
     printf("Executing experiment\n");
-    cimba_run_experiment(experiment, n_trials, sizeof(*experiment), run_MM1_trial);
+    cimba_run(experiment, n_trials, sizeof(*experiment), run_MM1_trial);
 
     printf("Finished experiment, writing results to file\n");
     ui_exp = 0u;
-    FILE *datafp = fopen("tut_1_6.dat", "w");
+    FILE *datafp = fopen("tut_1_7.dat", "w");
     fprintf(datafp, "# utilization\tavg_queue_length\tconf_interval\n");
     for (unsigned ui_rho = 0u; ui_rho < n_rhos; ui_rho++) {
         const double ar = experiment[ui_exp].arr_rate;
@@ -308,13 +340,13 @@ int main(const int argc, char *argv[])
         cmb_assert_debug(cmb_datasummary_count(&cds) == n_reps);
         const double sample_avg = cmb_datasummary_mean(&cds);
         const double sample_sd = cmb_datasummary_stddev(&cds);
-        const double t_crit = 2.228;
+        const double t_crit = t_crit_95(n_reps);
         fprintf(datafp, "%f\t%f\t%f\n", rho_used, sample_avg, t_crit * sample_sd);
         cmb_datasummary_terminate(&cds);
     }
 
     fclose(datafp);
-    free(experiment);
+    cmi_free(experiment);
 
     if (timing_enabled) {
         struct timespec end_time;
@@ -325,14 +357,16 @@ int main(const int argc, char *argv[])
     }
 
     write_gnuplot_commands();
-    (void)system("gnuplot -persistent tut_1_6.gp");
+    if (system("gnuplot -persistent tut_1_7.gp") != 0) {
+        cmb_logger_warning(stderr, "gnuplot launch failed");
+    }
 
     return 0;
 }
 
 void write_gnuplot_commands(void)
 {
-    FILE *cmdfp = fopen("tut_1_6.gp", "w");
+    FILE *cmdfp = fopen("tut_1_7.gp", "w");
 
     fprintf(cmdfp, "set terminal qt size 1200,700 enhanced font 'Arial,12'\n");
     fprintf(cmdfp, "set title \"Impact of utilization in M/M/1 queue\" font \"Times Bold, 18\" \n");
@@ -342,9 +376,61 @@ void write_gnuplot_commands(void)
     fprintf(cmdfp, "set xrange [0.0:1.0]\n");
     fprintf(cmdfp, "set yrange [0:50]\n");
     fprintf(cmdfp, "f(x) = x**2 / (1.0 - x)\n");
-    fprintf(cmdfp, "datafile = 'tut_1_6.dat'\n");
+    fprintf(cmdfp, "datafile = 'tut_1_7.dat'\n");
     fprintf(cmdfp, "plot datafile with yerrorbars lc rgb \"black\", \\\n");
     fprintf(cmdfp, "        f(x) title \"M/M/1\" with lines lw 2 lc rgb \"gray\"\n");
 
     fclose(cmdfp);
+}
+
+/*
+ * Table lookup for the critical values for two-sided 95 % confidence intervals,
+ * see https://www.stat.purdue.edu/~lfindsen/stat503/t-Dist.pdf
+ */
+double t_crit_95(const uint32_t n)
+{
+    cmb_assert_debug(n > 0u);
+
+    #define NUM_TVALS 62u
+    static uint32_t n_vals[NUM_TVALS] = {
+         1,  2,  3,  4,  5,  6,  7,  8,  9, 10,
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+        31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+        41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+        60, 70, 80, 90,100,120,140,180,200,500,
+        1000, UINT32_MAX
+    };
+
+    static double t_vals[NUM_TVALS] = {
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+         2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+         2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+         2.040, 2.037, 2.035, 2.032, 2.030, 2.028, 2.026, 2.024, 2.023, 2.021,
+         2.020, 2.018, 2.017, 2.015, 2.014, 2.013, 2.012, 2.011, 2.010, 2.009,
+         2.000, 1.994, 1.990, 1.987, 1.984, 1.980, 1.977, 1.973, 1.972, 1.965,
+         1.962, 1.960
+    };
+
+    for (uint32_t ui = 0u; ui < NUM_TVALS; ui++) {
+        if (n_vals[ui] == n) {
+            return t_vals[ui];
+        }
+
+        if (n_vals[ui] > n) {
+            /* Interpolate between values */
+            const uint32_t n_range = n_vals[ui] - n_vals[ui - 1];
+            const double t_range = t_vals[ui] - t_vals[ui - 1];
+            const double frac = (double)(n - n_vals[ui - 1]) / (double)n_range;
+            cmb_assert_debug(frac >= 0.0 && frac <= 1.0);
+            const double t_ret = t_vals[ui] - frac * t_range;
+
+            cmb_assert_debug((t_ret >= t_vals[ui -1]) && (t_ret <= t_vals[ui]));
+            return t_ret;
+        }
+    }
+
+    /* Should never get this far */
+    cmb_logger_error(stderr, "Critical value lookup failed");
+    #undef NUM_TVALS
 }

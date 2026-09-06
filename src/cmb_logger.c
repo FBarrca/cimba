@@ -17,6 +17,9 @@
  */
 
 #include <inttypes.h>
+#include "cmi_thread.h"
+#include <setjmp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -27,7 +30,10 @@
 #include "cmb_random.h"
 
 #include "cmi_config.h"
-#include "cmi_thread.h"
+#include "cmi_memregistry.h"
+
+/* Just declare this one function as extern to avoid including all headers */
+extern void cimba_trial_abandon(void);
 
 /* Maximum length of a formatted time string before it gets truncated */
 #define TSTRBUF_SZ 32
@@ -41,15 +47,18 @@
  * The standard assert() macro does not obey our NASSERT convention, only NDEBUG.
  * Define file scope custom asserts to avoid unintended recursion.
  */
+#define do_assert(x)  do { \
+                       if (!(x)) { \
+                          fprintf(stderr, \
+                          "assert(%s) failed in file %s line %d\n", \
+                          #x, CMB_FILE_NAME, __LINE__); \
+                          abort(); \
+                       } \
+                    } while (0)
+
+#define logger_assert_always(x) do_assert(x)
+
 #ifndef NASSERT
-  #define do_assert(x)  do { \
-                           if (!(x)) { \
-                              fprintf(stderr, \
-                              "assert(%s) failed in file %s line %d\n", \
-                              #x, __FILE__, __LINE__); \
-                              abort(); \
-                           } \
-                        } while (0)
   #define logger_assert_release(x)  do_assert(x)
   #ifndef NDEBUG
     #define logger_assert_debug(x)  do_assert(x)
@@ -61,8 +70,10 @@
   #define logger_assert_debug(x)  do { (void)sizeof(x); } while (0)
 #endif
 
-/* The current logging level. Initially everything on. */
-static CMB_THREAD_LOCAL uint32_t cmi_logger_mask = UINT32_C(0xFFFFFFFF);
+
+/* The current logging level. A single mask shared by all threads, so changing
+ * it affects logging from every thread. Accessed atomically. Initially all on. */
+static uint32_t cmi_logger_mask = UINT32_C(0xFFFFFFFF);
 
 /* A mutex to ensure that only one thread can be writing at the same time */
 static cmi_mutex_t cmi_logger_mutex = CMI_MUTEX_INITIALIZER;
@@ -72,6 +83,14 @@ static cmi_mutex_t cmi_logger_mutex = CMI_MUTEX_INITIALIZER;
  * see worker_thread_func() in cimba.c
  */
 CMB_THREAD_LOCAL uint64_t cmi_logger_trial_idx = CMI_NO_TRIAL_IDX;
+
+/*
+ * For recovering from trial-ending cmb_logger_error calls,
+ * defined in cimba.c. Effectively throwing an exception.
+ */
+extern CMB_THREAD_LOCAL jmp_buf cmi_worker_recovery;
+extern CMB_THREAD_LOCAL bool cmi_recovery_armed;
+extern void cmi_event_queue_cleanup(void);
 
 /*
  * Default time formatting function.
@@ -90,14 +109,14 @@ static const char *time_to_string(const double t)
     return timestrbuf;
 }
 
-/* Pointer to current time formatting function */
-static CMB_THREAD_LOCAL const char *(*timeformatter)(double) = time_to_string;
+/* Pointer to current time formatting function, global scope */
+static const char *(*timeformatter)(double) = time_to_string;
 
 void cmb_logger_timeformatter_set(cmb_timeformatter_func *fp)
 {
     logger_assert_release(fp != NULL);
 
-    timeformatter = fp;
+    __atomic_store_n(&timeformatter, fp, __ATOMIC_RELAXED);
 }
 
 /*
@@ -108,7 +127,7 @@ void cmb_logger_flags_on(const uint32_t flags)
 {
     logger_assert_release(flags != 0u);
 
-    cmi_logger_mask |= flags;
+    (void)__atomic_or_fetch(&cmi_logger_mask, flags, __ATOMIC_RELAXED);
 }
 
 /*
@@ -119,7 +138,12 @@ void cmb_logger_flags_off(const uint32_t flags)
 {
     logger_assert_release(flags != 0u);
 
-    cmi_logger_mask &= ~flags;
+    (void)__atomic_and_fetch(&cmi_logger_mask, ~flags, __ATOMIC_RELAXED);
+}
+
+static inline uint32_t logger_mask(void)
+{
+    return __atomic_load_n(&cmi_logger_mask, __ATOMIC_RELAXED);
 }
 
 /*
@@ -142,7 +166,7 @@ int cmb_logger_vfprintf(FILE *fp,
                         va_list args)
 {
     int ret = 0;
-    if ((flags & cmi_logger_mask) != 0) {
+    if ((flags & logger_mask()) != 0) {
         cmi_mutex_lock(&cmi_logger_mutex);
         int r = 0;
         if (cmi_logger_trial_idx != CMI_NO_TRIAL_IDX) {
@@ -151,7 +175,10 @@ int cmb_logger_vfprintf(FILE *fp,
             ret += r;
         }
 
-        r = fprintf(fp, "%s\t", timeformatter(cmb_time()));
+        const char *(*tff)(double) = NULL;
+        tff = __atomic_load_n(&timeformatter, __ATOMIC_RELAXED);
+        logger_assert_debug(tff != NULL);
+        r = fprintf(fp, "%s\t", tff(cmb_time()));
         logger_assert_debug(r > 0);
         ret += r;
 
@@ -196,7 +223,7 @@ int cmb_logger_vfprintf(FILE *fp,
             ret += r;
         }
 
-        r += fprintf(fp, "\n");
+        r = fprintf(fp, "\n");
         logger_assert_debug(r > 0);
         ret += r;
 
@@ -210,10 +237,10 @@ int cmb_logger_vfprintf(FILE *fp,
 void cmi_logger_fatal(FILE *fp,
                       const char *func,
                       const int line,
-                      char *fmtstr,
+                      const char *fmtstr,
                       ...)
 {
-    if ((CMB_LOGGER_FATAL & cmi_logger_mask) != 0) {
+    if ((CMB_LOGGER_FATAL & logger_mask()) != 0) {
         fflush(NULL);
         va_list args;
         va_start(args, fmtstr);
@@ -221,16 +248,20 @@ void cmi_logger_fatal(FILE *fp,
         va_end(args);
     }
 
+    cmi_event_queue_cleanup();
     abort();
 }
 
 void cmi_logger_error(FILE *fp,
                       const char *func,
                       const int line,
-                      char *fmtstr,
+                      const char *fmtstr,
                       ...)
 {
-    if ((CMB_LOGGER_ERROR & cmi_logger_mask) != 0) {
+    /* We should never end back here during an ongoing teardown */
+    logger_assert_always(!cmi_memregistry_is_demolishing);
+
+    if ((CMB_LOGGER_ERROR & logger_mask()) != 0) {
         fflush(NULL);
         va_list args;
         va_start(args, fmtstr);
@@ -238,17 +269,19 @@ void cmi_logger_error(FILE *fp,
         va_end(args);
     }
 
-    cmi_thread_exit();
+    cimba_trial_abandon();
+
     /* Not reached */
+    logger_assert_always(false);
 }
 
 void cmi_logger_warning(FILE *fp,
                         const char *func,
                         const int line,
-                        char *fmtstr,
+                        const char *fmtstr,
                         ...)
 {
-    if ((CMB_LOGGER_WARNING & cmi_logger_mask) != 0) {
+    if ((CMB_LOGGER_WARNING & logger_mask()) != 0) {
         fflush(NULL);
         va_list args;
         va_start(args, fmtstr);
@@ -260,10 +293,10 @@ void cmi_logger_warning(FILE *fp,
 void cmi_logger_info(FILE *fp,
                      const char *func,
                      const int line,
-                     char *fmtstr,
+                     const char *fmtstr,
                      ...)
 {
-    if ((CMB_LOGGER_INFO & cmi_logger_mask) != 0) {
+    if ((CMB_LOGGER_INFO & logger_mask()) != 0) {
         va_list args;
         va_start(args, fmtstr);
         (void)cmb_logger_vfprintf(fp, CMB_LOGGER_INFO, func, line, fmtstr, args);
@@ -275,10 +308,10 @@ void cmi_logger_user(FILE *fp,
                      const uint32_t flags,
                      const char *func,
                      const int line,
-                     char *fmtstr,
+                     const char *fmtstr,
                      ...)
 {
-    if ((flags & cmi_logger_mask) != 0) {
+    if ((flags & logger_mask()) != 0) {
         va_list args;
         va_start(args, fmtstr);
         (void)cmb_logger_vfprintf(fp, flags, func, line, fmtstr, args);

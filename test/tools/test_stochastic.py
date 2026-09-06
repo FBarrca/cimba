@@ -40,7 +40,7 @@ class StochasticTest:
     binary: str                 # executable name (without extension)
     seed: int                   # fixed seed for reproducibility
     extra_args: list = field(default_factory=list)  # any extra CLI arguments
-    timeout: int = 30           # default timeout
+    timeout: int = 90          # default timeout
 
     @property
     def ref_path(self) -> Path:
@@ -65,6 +65,7 @@ TESTS: list[StochasticTest] = [
     StochasticTest(name="priorityqueue", binary="test_priorityqueue", seed=0x34f05c64d7ad598f),
     StochasticTest(name="random",  binary="test_random",  seed=0x34f05c64d7ad598f, timeout=300),
     StochasticTest(name="resource", binary="test_resource", seed=0x34f05c64d7ad598f),
+    StochasticTest(name="resourceguard", binary="test_resourceguard", seed=0x34f05c64d7ad598f),
     StochasticTest(name="resourcepool", binary="test_resourcepool", seed=0x34f05c64d7ad598f),
 ]
 

@@ -25,27 +25,46 @@ global cmi_coroutine_trampoline
 global cmi_coroutine_stackbase
 global cmi_coroutine_stacklimit
 global cmi_coroutine_stackraw
+global cmi_coroutine_set_stack_teb
 
 ;-------------------------------------------------------------------------------
 ; Callable function to return the current StackBase (top of allocated stack)
 ;
 cmi_coroutine_stackbase:
-    mov rax, [gs:8]
+    mov rax, [gs:0x8]
     ret
 
 ;-------------------------------------------------------------------------------
 ; Callable funnction to return the current StackLimit (bottom of allocated stack)
 ;
 cmi_coroutine_stacklimit:
-    mov rax, [gs:16]
+    mov rax, [gs:0x10]
     ret
 
 ;-------------------------------------------------------------------------------
 ; Callable function to return the current DeallocationStack
 ;
 cmi_coroutine_stackraw:
-    mov rax, [gs:1478]
+    mov rax, [gs:0x1478]
     ret
+
+;-------------------------------------------------------------------------------
+; Callable function void cmi_coroutine_set_stack_teb(void *base,
+;                                                    void *limit,
+;                                                    void *dealloc)
+; Write the three TEB stack fields directly, without touching the stack itself.
+; Arguments (Win64): RCX = StackBase, RDX = StackLimit, R8 = DeallocationStack.
+; Used by cmi_coroutine_reset_to_main to reinstall the thread's main stack after
+; a longjmp out of a coroutine bypassed the normal context switch and left the
+; TEB describing the abandoned coroutine's stack. These are the same fields, at
+; the same offsets, that cmi_coroutine_context_switch swaps.
+;
+cmi_coroutine_set_stack_teb:
+    mov [gs:0x8], rcx       ; StackBase
+    mov [gs:0x10], rdx      ; StackLimit
+    mov [gs:0x1478], r8     ; DeallocationStack
+    ret
+
 
 ;-------------------------------------------------------------------------------
 ; Macro to store relevant registers to current stack
@@ -54,9 +73,6 @@ cmi_coroutine_stackraw:
 ; this macro (i.e. it was 16-byte aligned, then RIP got pushed, now we are here)
 ;
 %macro save_context 0
-    ; Save flags register
-    pushfq
-
     %ifndef NMXCSR
         ; Allocate space and save MXCSR (SSE status register)
         sub rsp, 8
@@ -75,11 +91,11 @@ cmi_coroutine_stackraw:
     ;
     ; Save XMM registers
     %ifndef NMXCSR
-        ; Add 8 bytes padding for alignment
-        sub rsp, 168
-    %else
         ; No padding needed, even number of pushes
         sub rsp, 160
+    %else
+        ; Add 8 bytes padding for alignment
+        sub rsp, 168
     %endif
     ;
     movaps [rsp + 144], xmm15
@@ -110,9 +126,9 @@ cmi_coroutine_stackraw:
     movaps xmm14, [rsp + 128]
     movaps xmm15, [rsp + 144]
     %ifndef NMXCSR
-        add rsp, 168
-    %else
         add rsp, 160
+    %else
+        add rsp, 168
     %endif
     ;
     ; Restore general purpose registers
@@ -131,8 +147,8 @@ cmi_coroutine_stackraw:
         add rsp, 8
     %endif
     ;
-    ; Restore flags
-    popfq
+    ; Clear direction flag
+    cld
 %endmacro
 
 ;-------------------------------------------------------------------------------
@@ -155,11 +171,11 @@ cmi_coroutine_context_switch_raw:
     save_context
 
     ; Push the TIB DeallocationStack, StackLimit, and StackBase entries
-    mov r9, [gs:1478]      ; DeallocationStack
+    mov r9, [gs:0x1478]      ; DeallocationStack
     push r9
-    mov r9, [gs:16]        ; StackLimit
+    mov r9, [gs:0x10]        ; StackLimit
     push r9
-    mov r9, [gs:8]         ; StackBase
+    mov r9, [gs:0x8]         ; StackBase
     push r9
     ;
     ; Store old stack pointer to address given as first argument RCX
@@ -174,9 +190,9 @@ cmi_coroutine_context_switch_raw:
     mov rax, [r9 + 16]      ; New DeallocationStack
     ;
     ; Write the new stack info to Windows TIB without touching the stack
-    mov [gs:8], r10         ; Update StackBase
-    mov [gs:16], r11        ; Update StackLimit
-    mov [gs:1478], rax      ; Update DeallocationStack
+    mov [gs:0x8], r10         ; Update StackBase
+    mov [gs:0x10], r11        ; Update StackLimit
+    mov [gs:0x1478], rax      ; Update DeallocationStack
     ;
     ; Done, safe to switch to the new stack, advancing past the used TIB entries
     mov rsp, r9

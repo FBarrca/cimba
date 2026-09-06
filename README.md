@@ -1,27 +1,73 @@
 ![large logo](images/logo_large.jpg)
 
-## A multithreaded discrete event simulation library in C
+Cimba is a general purpose, fast discrete event simulation library written in C and assembly,
+providing an expressive process-oriented simulation worldview combined with multithreaded
+trial parallelism in a shared memory space for high performance on modern
+desktop computers. The simulated processes are implemented as stackful coroutines 
+("fibers") inside the pthreads. Cimba can also use massive GPU parallelism to
+calculate model physics within the processes or events of the simulation. As far as we 
+know, there is no other discrete event simulation tool that can provide 
+a similar combination of powerful features and performance. 
 
-### What is it?
-A fast discrete event simulation library written in C and assembly with POSIX pthreads 
-for running multiple trials in parallel on multi-core CPUs. Simulated processes are 
-implemented as stackful coroutines ("fibers") inside the pthreads.
-As far as we know, there is no other open source library that can provide these features.
+It is currently implemented for both Linux and Windows on the x86-64 architecture, 
+with other platforms planned.
 
-Implementation status:
-* x86-64: Stable for Linux and Windows 10 + 11.
-* Apple Silicon: Planned
-* ARM: Planned
+#### Important status note for Release Candidate 1 (Aug 2026): 
+From 3.0.0 RC1, the Cimba object lifecycle Create - Initialize - Terminate - Destroy is
+enforced more strictly than in the Beta versions. This means that all objects in the 
+`cmb_ `namespace _must_ be initialized before they can be used, and that they _must_ be 
+terminated before going out of scope. This also goes for objects with automatic 
+storage duration, i.e., local objects declared on the stack. Also, every 
+`cmb_X_initialize()` for some class `X` _must_ be matched by a `cmb_X_terminate()`, and 
+every `cmb_X_create()` by a `cmb_X_destroy()`. 
 
-Cimba models run 40-50 times faster than SimPy equivalents. The chart below shows the 
-number of simulated events processed per second of wall clock time on a simple M/M/1 
-queue implemented in SimPy and Cimba. _Cimba runs twice as fast (32M events/sec) on a 
-single CPU core as SimPy does when using all 64 cores (16M events/sec)._
-
-![Speed_test_AMD_3970x.png](images/Speed_test_AMD_3970x.png)
+Previously, omitting `_terminate` or `_destroy` would be a silent memory leak. This 
+will naturally happen when a trial is abandoned midway by calling `cmb_logger_error()`. 
+Over a long experiment, this could accumulate to cause an out-of-memory crash. Cimba RC1 
+will now pass a Leak Sanitizer (LSan) test also with abandoned trials. To provide this 
+reliable memory leak detection and memory recovery from abandoned trials, tightened 
+enforcement of (already documented) lifecycle management was needed to avoid 
+corrupting the internal state. It may break existing models that appeared to work correctly 
+until now (including some of our own tutorials). If so, please check for missing 
+steps in the object lifecycles, with a missing `_initialize`or `_terminate` for a 
+`cmb_` object declared as a local variable on the stack as the prime suspect.
 
 ### Why should I use it?
-It is fast, powerful, reliable, and free.
+It is powerful, fast, reliable, and free.
+
+* *Powerful*: Cimba provides a comprehensive toolkit for discrete event simulation:
+
+  * Processes implemented as asymmetric stackful coroutines. A simulated process can
+    yield and resume control from any level of a function call stack, allowing
+    well-structured coding of arbitrarily large simulation models.
+    A simulated process can run in an infinite loop
+    or act as a one-shot customer passing through the system, being both an active
+    agent and a passive object as needed.
+
+  * Pre-packaged process interaction mechanisms like resources, resource pools, buffers,
+    object queues, priority queues, and timeouts. Cimba also provides condition variables
+    where your simulated processes can wait for arbitrarily complex conditions to become
+    true – anything you can express as a function returning a binary true or false result.
+
+  * A wide range of fast, high-quality random number generators, both
+    of academically important and more empirically oriented types. Important
+    distributions like normal and exponential are implemented by state-of-the-art
+    ziggurat rejection sampling for speed and accuracy.
+
+  * Integrated logging and data collection features that make it easy
+    to get a model running and understand what is happening inside it, including
+    custom asserts to pinpoint sources of errors.
+
+  * An entire experiment design is expressed as an array of trials with various
+    parameters, all trials executed in parallel and statistics calculated, all in the
+    same program. Cimba's architecture strongly encourages applying Design of
+    Experiments principles when setting up the trial array.
+
+  * As a C library, Cimba allows easy integration with other libraries and programs. You
+    could call CUDA routines to calculate model physics or to enhance your simulation
+    models with GPU-powered agentic behavior.
+    You could even call the Cimba simulation engine from other programming languages,
+    since the C calling convention is standard and well-documented.
 
 * *Fast*: The speed from multithreaded parallel execution translates to high
   resolution in your simulation modeling. You can run hundreds of replications
@@ -29,55 +75,61 @@ It is fast, powerful, reliable, and free.
   intervals in your experiments and a high density of data points along parameter
   variations.
 
-  In the benchmark shown above, Cimba reduces the run time by 98 % compared to the 
-  same model in SimPy using all CPU cores. This translates into doing your simulation 
-  experiments in seconds instead of minutes, or in minutes instead of hours.
+  * A relevant benchmark is the Python simulation package SimPy. Cimba models run 
+    30-60 times faster than SimPy equivalents. The chart below shows the
+    number of simulated events processed per second of wall clock time on a simple M/M/1
+    queue implemented in SimPy and Cimba. _Cimba runs more than twice as fast (41.8M 
+    events/sec) on a single CPU core as SimPy does when using all 64 logical cores 
+  * (16M events/sec combined)._
 
-  If you need even more speed, CUDA kernels can be used for massively parallel 
-  computation inside each simulated process, e.g. for AI-enabled agents or for 
-  intricate physics calculations.
+    ![Speed_test_AMD_3970x.png](images/Speed_test_AMD_3970x.png)
 
-* *Powerful*: Cimba provides a comprehensive toolkit for discrete event simulation:
+    In this benchmark, Cimba reduces the run time by 98 % compared to the
+    same model in SimPy using all CPU cores. This translates into doing your simulation
+    experiments in seconds instead of minutes, or in minutes instead of hours. The reason for
+    the performance advantage is simply that compiled C code and hand-rolled assembly will
+    always run much faster than Python code that needs to be interpreted at runtime.
 
-  * Processes implemented as asymmetric stackful coroutines. A simulated process can
-    yield and resume control from any level of a function call stack, allowing 
-    well-structured coding of arbitrarily large simulation models. This makes it 
-    natural to express agentic behavior by conceptually placing oneself "inside" that 
-    process and describing what it does. A simulated process can run in an infinite loop 
-    or act as a one-shot customer passing through the system, being both an active 
-    agent and a passive object as needed.
+  * Another performance reference point is found in the literature on large-scale
+    parallel discrete event simulation (PDES). In these models, each simulation run is
+    distributed across many physical cores.
+    [Fujimoto (2015)](https://informs-sim.org/wsc15papers/004.pdf) states that performance
+    for the PDES algorithms has leveled out at around 250 K events/second/core
+    on massively parallel supercomputers due to inherent clock speed limitations on each core. Further 
+    performance improvement in recent years only comes from increasing the number of cores. 
+    *Cimba runs two orders of magnitude faster than this on a per-core basis.* The CPU used 
+    in the benchmark above has 32 _physical_ cores, running two threads per physical core.
+    Cimba runs about 42 M events/sec on a single core and about 28 M events/second/core on 32
+    physical cores. The reason is that keeping our entire event queue in "hot" CPU cache memory
+    is orders of magnitude faster than communicating the events across a link between separate devices.
 
-  * Pre-packaged process interaction mechanisms like resources, resource pools, buffers, 
-    object queues, priority queues, and timeouts. Cimba also provides condition variables 
-    where your simulated processes can wait for arbitrarily complex conditions to become 
-    true – anything you can express as a function returning a binary true or false result.
+  * If you need even higher speed, CUDA kernels can be used for massively parallel 
+    computation inside each simulated process, e.g., for AI-enabled agents or for 
+    intricate physics calculations. In 
+    [one of our tutorials](https://cimba.readthedocs.io/en/latest/tutorial.html#adding-cuda-gpu-power-for-simulation-physics), 
+    we demonstrate how to combine multithreaded trials with CUDA functions running on 
+    multiple GPUs.
 
-  * A wide range of fast, high-quality random number generators, both
-    of academically important and more empirically oriented types. Important 
-    distributions like normal and exponential are implemented by state-of-the-art 
-    ziggurat rejection sampling for speed and accuracy.
+* *Reliable*: Cimba is well-engineered open source. There is no mystery to the results you get.
+
+  * The code is written with liberal use of assertions 
+    to enforce preconditions, invariants, and postconditions in each function. The 
+    assertions act as self-enforcing documentation on expected inputs to and outputs from 
+    the Cimba functions. About 13 % of all code lines are assertions, a very high density.
   
-  * Integrated logging and data collection features that make it easy
-    to get a model running and understand what is happening inside it, including 
-    custom asserts to pinpoint sources of errors. 
+  * There are unit tests for each module. Running the unit test battery in debug mode (all
+    assertions active) verifies the correct operation in great detail. You can do that 
+    by the one-liner ``meson test -C build`` from the terminal command line. 
+  
+  * Cimba is compatible with sanitizers for undefined behavior (UBSan), memory address safety 
+    (ASan), thread safety (TSan), and memory leaks (LeakSan). These sanitizers are executed automatically as 
+    GitHub runners on every push to the repository as public verification of our reliability 
+    claim, right here: https://github.com/ambonvik/cimba/actions
 
-  * As a C library, Cimba allows easy integration with other libraries and programs. You 
-    could call CUDA routines to enhance your simulation models with GPU-powered agentic 
-    behavior or drive a fancy graphics interface like a 3D visualization of a 
-    manufacturing plant. 
-    You could even call the Cimba simulation engine from other programming languages, 
-    since the C calling convention is standard and well-documented. 
-
-* *Reliable*: Cimba is well-engineered open source. There is no
-  mystery to the results you get.
-  The code is written with liberal use of assertions 
-  to enforce preconditions, invariants, and postconditions in each function. The 
-  assertions act as self-enforcing documentation on expected inputs to and outputs from 
-  the Cimba functions. About 13 % of all code lines in the Cimba library are 
-  asssertions, a very high density.
-  There are unit tests for each module. Running the unit test battery in debug mode (all
-  assertions active) verifies the correct operation in great detail. You can do that by the
-  one-liner ``meson test -C build`` from the terminal command line.
+  * The code is routinely reviewed by the latest and greatest AI tools as they become 
+    available, most recently Anthropic Claude Fable 5 (July 2026) and Claude Opus 5
+    (August 2026). Any bugs identified by these reviews are fixed and a follow-up review 
+    done. The latest reviews can be found here: https://github.com/ambonvik/cimba/tree/main/code_reviews
 
 * *Free*: Cimba should fit well into the budget of most research groups.
 
@@ -94,14 +146,6 @@ It is a general-purpose discrete event simulation library, in the spirit of a
 * urban systems like public transport and garbage collection,
 * and quite a few more application domains of similar kinds, where overall system 
   complexity arises from interactions between relatively simple components.
-
-As an example, this screen shot shows one frame from a simulation of an AWACS 
-trying to detect 1000 ground targets across a 1000 x 1000 nm synthetic map. The size of 
-each target is its current radar cross section, the color is the current detection status. 
-The vectors on the sphere representing the AWACS indicate the current direction of the 
-platform and the current direction of the radar lobe. The visualization was done in ParaView.
-
-![AWACS racetrack](images/tut_5_1.png)
 
 If you look under the hood, you will also find additional reusable internal components.
 Cimba contains stackful coroutines doing their own thing on thread-safe cactus stacks. 
@@ -120,12 +164,13 @@ benchmark](https://github.com/ambonvik/cimba/tree/main/benchmark) mentioned abov
     
     #include <cimba.h>
     
+    #include "cmi_mempool.h"
+    
     #define NUM_OBJECTS 1000000u
     #define ARRIVAL_RATE 0.9
     #define SERVICE_RATE 1.0
-    #define NUM_TRIALS 100
     
-    CMB_THREAD_LOCAL struct cmi_mempool objectpool = CMI_MEMPOOL_STATIC_INIT(8u, 512u);
+    CMB_THREAD_LOCAL struct cmi_mempool objectpool = CMI_MEMPOOL_STATIC_INIT(sizeof(void *), 512u);
     
     struct simulation {
         struct cmb_process *arrival;
@@ -136,6 +181,7 @@ benchmark](https://github.com/ambonvik/cimba/tree/main/benchmark) mentioned abov
     struct trial {
         double arr_mean;
         double srv_mean;
+        
         uint64_t obj_cnt;
         double sum_wait;
         double avg_wait;
@@ -150,11 +196,14 @@ benchmark](https://github.com/ambonvik/cimba/tree/main/benchmark) mentioned abov
     {
         cmb_unused(me);
         const struct context *ctx = vctx;
+        
         struct cmb_objectqueue *qp = ctx->sim->queue;
         const double mean_hld = ctx->trl->arr_mean;
+        
         for (uint64_t ui = 0; ui < NUM_OBJECTS; ui++) {
             const double t_hld = cmb_random_exponential(mean_hld);
             cmb_process_hold(t_hld);
+            
             void *object = cmi_mempool_alloc(&objectpool);
             double *dblp = object;
             *dblp = cmb_time();
@@ -168,18 +217,21 @@ benchmark](https://github.com/ambonvik/cimba/tree/main/benchmark) mentioned abov
     {
         cmb_unused(me);
         const struct context *ctx = vctx;
+        
         struct cmb_objectqueue *qp = ctx->sim->queue;
         const double mean_srv = ctx->trl->srv_mean;
         uint64_t *cnt = &(ctx->trl->obj_cnt);
         double *sum = &(ctx->trl->sum_wait);
+        
         while (true) {
             void *object = NULL;
             cmb_objectqueue_get(qp, &object);
+            
             const double *dblp = object;
             const double t_srv = cmb_random_exponential(mean_srv);
             cmb_process_hold(t_srv);
-            const double t_sys = cmb_time() - *dblp;
-            *sum += t_sys;
+            
+            *sum += cmb_time() - *dblp;
             *cnt += 1u;
             cmi_mempool_free(&objectpool, object);
         }
@@ -192,6 +244,7 @@ benchmark](https://github.com/ambonvik/cimba/tree/main/benchmark) mentioned abov
         cmb_logger_flags_off(CMB_LOGGER_INFO);
         cmb_random_initialize(cmb_random_hwseed());
         cmb_event_queue_initialize(0.0);
+        
         struct context *ctx = malloc(sizeof(*ctx));
         ctx->trl = trl;
         struct simulation *sim = malloc(sizeof(*sim));
@@ -203,66 +256,54 @@ benchmark](https://github.com/ambonvik/cimba/tree/main/benchmark) mentioned abov
         sim->arrival = cmb_process_create();
         cmb_process_initialize(sim->arrival, "Arrival", arrivalfunc, ctx, 0);
         cmb_process_start(sim->arrival);
+        
         sim->service = cmb_process_create();
         cmb_process_initialize(sim->service, "Service", servicefunc, ctx, 0);
         cmb_process_start(sim->service);
     
         cmb_event_queue_execute();
     
-        cmb_process_stop(sim->service, NULL);
         cmb_process_terminate(sim->arrival);
-        cmb_process_terminate(sim->service);
         cmb_process_destroy(sim->arrival);
+        
+        cmb_process_stop(sim->service, NULL);
+        cmb_process_terminate(sim->service);
         cmb_process_destroy(sim->service);
-    
+        
+        cmb_objectqueue_terminate(sim->queue);
         cmb_objectqueue_destroy(sim->queue);
+    
         cmb_event_queue_terminate();
+        cmb_random_terminate();
+    
         free(sim);
         free(ctx);
     }
     
     int main(void)
     {
-        struct trial *experiment = calloc(NUM_TRIALS, sizeof(*experiment));
-        for (unsigned ui = 0; ui < NUM_TRIALS; ui++) {
-            struct trial *trl = &experiment[ui];
-            trl->arr_mean = 1.0 / ARRIVAL_RATE;
-            trl->srv_mean = 1.0 / SERVICE_RATE;
-            trl->obj_cnt = 0u;
-            trl->sum_wait = 0.0;
-        }
+        struct trial *trl = malloc(sizeof(*trl));
+        trl->arr_mean = 1.0 / ARRIVAL_RATE;
+        trl->srv_mean = 1.0 / SERVICE_RATE;
+        trl->obj_cnt = 0u;
+        trl->sum_wait = 0.0;
+        
+        run_trial(trl);
     
-        cimba_run_experiment(experiment,
-                             NUM_TRIALS,
-                             sizeof(*experiment),
-                             run_trial);
+        printf("Average system time %f (expected %f)\n",
+                trl->sum_wait / (double)trl->obj_cnt,
+                1.0 / (SERVICE_RATE - ARRIVAL_RATE));
     
-        struct cmb_datasummary summary;
-        cmb_datasummary_initialize(&summary);
-        for (unsigned ui = 0; ui < NUM_TRIALS; ui++) {
-            const double avg_tsys = experiment[ui].sum_wait / (double)(experiment[ui].obj_cnt);
-            cmb_datasummary_add(&summary, avg_tsys);
-        }
+        free(trl);
     
-        const unsigned un = cmb_datasummary_count(&summary);
-        if (un > 1) {
-            const double mean_tsys = cmb_datasummary_mean(&summary);
-            const double sdev_tsys = cmb_datasummary_stddev(&summary);
-            const double serr_tsys = sdev_tsys / sqrt((double)un);
-            const double ci_w = 1.96 * serr_tsys;
-            const double ci_l = mean_tsys - ci_w;
-            const double ci_u = mean_tsys + ci_w;
-    
-            printf("Average system time %f (n %u, conf.int. %f - %f, expected %f)\n",
-                   mean_tsys, un, ci_l, ci_u, 1.0 / (SERVICE_RATE - ARRIVAL_RATE));
-    
-            return 0;
-        }
+        return 0;
     }
 
 ```
-See [our tutorial](https://cimba.readthedocs.io/en/latest/tutorial.html) at ReadTheDocs for more usage examples.
-
+Note that we have intentionally left out comments in the code above, hopefully 
+demonstrating that it is fairly self-explanatory. We have also used one "internal"
+`cmi_` feature, the memory pool for fast allocation of the queue objects. See
+[our tutorial](https://cimba.readthedocs.io/en/latest/tutorial.html) at ReadTheDocs for more usage examples with explanations.
 
 ### So, what can I use all that speed for?
 As shown above, it is some 45 times faster than SimPy in a relevant benchmark. It means 
@@ -271,7 +312,9 @@ delay breaking your line of thought.
 
 If you can run, say, 10 replications with SimPy within a certain budget for time and 
 computing resources, you can run 450 with Cimba. That will tighten the confidence 
-intervals in your results by a factor of about 8.
+intervals in your results by a factor of about 8. The details are in our 
+blog post on the topic, 
+[Speed is (statistical) power](https://ambonvik.github.io/speed-is-power/).
 
 For another illustration of how to benefit from the sheer speed, the experiment in 
 [test_cimba.c](test/test_cimba.c)
@@ -282,9 +325,31 @@ combination, in total 4 * 5 * 10 = 200 trials. Each trial lasts for one million
 time units, where the average service time always is 1.0 time units. 
 
 This entire simulation runs in *about 1.5 seconds* on an AMD Threadripper 3970X with 
-Arch Linux and produces the chart below. 
+Arch Linux and produces the chart below.
 
 ![M/G/1 queue](images/MG1%20example.png)
+
+Or, for a more "real" example, see 
+[our tutorial 5](https://cimba.readthedocs.io/en/latest/tutorial.html#adding-cuda-gpu-power-for-simulation-physics).
+Using the same 64-core Threadripper and dual RTX 3090 GPUs, it runs 300 trials of an AWACS
+scenario with detailed three-dimensional
+physics in 78 seconds. Each trial is a six-hour simulation of a thousand target
+processes (coroutines) and one sensor process (coroutine) on a 1000 x 1000 nm
+synthetic terrain with one arcsecond resolution. The sensor process models a scanning S-band 
+surveillance radar including 
+line-of-sight geometry, terrain masking, constant-gamma clutter with CA-CFAR detection, 
+and specular multipath. The model uses radar dwell itervals (time steps) of 0.04 seconds.
+
+The screenshot below shows one frame from this simulation. The size of
+each target is its current radar cross-section, the color is the current detection status.
+The vectors on the sphere representing the AWACS indicate the current direction of the
+platform and the current direction of the radar lobe. The visualization is done in 
+ParaView.
+
+![AWACS racetrack](images/tut_5_1c.png)
+
+Cimba is able to harness all the computing power available in modern computer 
+architectures for your simulation purposes, whatever they are.
 
 ### What do you mean by "well engineered"?
 Discrete event simulation fits well with an object-oriented paradigm. That is
@@ -303,6 +368,12 @@ can find [more details here](https://cimba.readthedocs.io/en/latest/background.h
 
 ![Stackful coroutines](images/stack_1.png)
 
+The stackful coroutines for simulated processes are combined with a higher
+level of concurrency in the Posix pthreads managing the trials and replications in an
+experiment design, and with a lower level of massive parallelism in GPGPU-based
+physics calculations. These three layers of concurrency have clearly separated
+semantics in the model code.
+
 The C code is liberally sprinkled with `assert` statements testing for preconditions,
 invariants, and postconditions wherever possible, applying 
 [Design by Contract](https://en.wikipedia.org/wiki/Design_by_contract) 
@@ -317,10 +388,15 @@ model when you are ready for it, while turning off the release asserts as well g
 a small incremental improvement. (Again, 
 [more explanation here](https://cimba.readthedocs.io/en/latest/background.html#error-handling-the-loud-crashing-noise).)
 
-This is then combined with extensive unit testing of each module, ensuring that
-all lower level functionality works as expected before moving on to higher levels. 
+Extensive unit testing of each module ensures that
+all lower-level functionality works as expected before moving on to higher levels. 
 You will find the test files corresponding to each code module in the [test](./test) 
 directory.
+
+Moreover, Cimba supports sanitizer tools like Address Sanitizer, Undefined Behavior
+Sanitizer, Thread Sanitizer, and the CUDA Compute Sanitizer. ASan, UBSan, and TSan are
+run automatically on each push to the GitHub repo. The details can be found in the 
+GitHub repo, including the results of successive test runs.
 
 But do read the [LICENSE](LICENSE). We are not giving any warranties here.
 

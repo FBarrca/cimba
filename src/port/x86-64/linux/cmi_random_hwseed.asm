@@ -4,7 +4,7 @@
 ; For 64-bits Linux on AMD64/x86-64 architecture.
 ; Written in NASM syntax.
 ;
-; Copyright (c) Asbjørn M. Bonvik 2025.
+; Copyright (c) Asbjørn M. Bonvik 2025-26.
 ;
 ; Licensed under the Apache License, Version 2.0 (the "License");
 ; you may not use this file except in compliance with the License.
@@ -19,6 +19,22 @@
 ; limitations under the License.
 
 default rel
+
+; Explicit Intel CET posture: This object honors no CET features.
+; GNU_PROPERTY_X86_FEATURE_1_AND with value 0 -> no IBT, no SHSTK. The linker
+; AND-merges this across all inputs, so it keeps Intel CET disabled for any
+; binary that links Cimba.
+section .note.gnu.property note alloc noexec nowrite align=8
+    dd 4                    ; n_namesz  = sizeof "GNU\0"
+    dd 16                   ; n_descsz  = size of the property array (incl. pad)
+    dd 5                    ; n_type    = NT_GNU_PROPERTY_TYPE_0
+    db "GNU", 0             ; n_name
+    dd 0xc0000002           ; pr_type   = GNU_PROPERTY_X86_FEATURE_1_AND
+    dd 4                    ; pr_datasz = 4
+    dd 0                    ; pr_data   = 0  -> no IBT (0x1), no SHSTK (0x2)
+    dd 0                    ; pad to 8-byte alignment
+
+section .note.GNU-stack noalloc noexec nowrite progbits
 
 section .text
 global cmi_cpu_has_rdseed
@@ -49,17 +65,30 @@ cmi_cpu_has_rdrand:
     pop rbx            ; Restore RBX
     ret
 
+%define RDSEED_RETRIES 100
+%define RDRAND_RETRIES 10
+
 ; Get rdseed from system entropy buffer
 cmi_rdseed:
-    rdseed rax              ; Request a 64-bit true random value in RAX
-    jnc cmi_rdseed_retry    ; Check carry flag, retry if not set as call failed
+    mov ecx, RDSEED_RETRIES
+.retry:
+    rdseed rax                  ; Request a 64-bit true random value in RAX
+    jc .done                    ; CF=1 -> success, value in RAX
+    pause
+    dec ecx
+    jnz .retry
+    xor eax, eax                ; exhausted -> 0 (invalid-seed sentinel)
+.done:
     ret
-cmi_rdseed_retry:
-    pause                   ; Entropy buffer empty, wait a few cycles for refill
-    jmp cmi_rdseed          ; ... and retry
 
-; Get rdrand (used if rdseed is not available)
 cmi_rdrand:
-    rdrand rax              ; Request a 64-bit true random value in RAX
-    jnc cmi_rdrand          ; Retry immediately if carry flag not set
+    mov ecx, RDRAND_RETRIES
+.retry:
+    rdrand rax
+    jc .done
+    pause
+    dec ecx
+    jnz .retry
+    xor eax, eax
+.done:
     ret

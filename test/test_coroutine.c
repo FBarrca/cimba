@@ -58,8 +58,7 @@ static void test_simple_event(void)
 
     printf("Survived, now back in main coroutine, received %p\n", ret);
 
-    /* Destroy the coroutine to free its memory allocation*/
-    printf("Delete coroutine %p\n", (void *)cp);
+    cmi_coroutine_terminate(cp);
     cmi_coroutine_destroy(cp);
     cmi_test_print_line("-");
 }
@@ -128,14 +127,14 @@ static void test_asymmetric(void)
     printf("Create two coroutines, stack size %" PRIu64 "\n", stksz);
     struct cmi_coroutine *cp1 = cmi_coroutine_create();
     cmb_assert_always(cp1 != NULL);
-    cmb_assert_always(cp1->status == CMI_COROUTINE_CREATED);
+    cmb_assert_always(cp1->status == CMI_COROUTINE_UNINITIALIZED);
     struct cmi_coroutine *cp2 = cmi_coroutine_create();
     cmb_assert_always(cp2 != NULL);
-    cmb_assert_always(cp2->status == CMI_COROUTINE_CREATED);
+    cmb_assert_always(cp2->status == CMI_COROUTINE_UNINITIALIZED);
     cmi_coroutine_initialize(cp2, corofunc_2, NULL, NULL, stksz);
-    cmb_assert_always(cp2->status == CMI_COROUTINE_CREATED);
+    cmb_assert_always(cp2->status == CMI_COROUTINE_INITIALIZED);
     cmi_coroutine_initialize(cp1, corofunc_1, cp2, NULL, stksz);
-    cmb_assert_always(cp1->status == CMI_COROUTINE_CREATED);
+    cmb_assert_always(cp1->status == CMI_COROUTINE_INITIALIZED);
 
     /* Start cp1 and hence the entire circus */
     printf("Start %p\n", (void *)cp1);
@@ -147,14 +146,14 @@ static void test_asymmetric(void)
     printf("Delete coroutine %p\n", (void *)cp1);
     cmb_assert_always(cp1->status == CMI_COROUTINE_FINISHED);
     cmi_coroutine_terminate(cp1);
-    cmb_assert_always(cp1->status == CMI_COROUTINE_CREATED);
+    cmb_assert_always(cp1->status == CMI_COROUTINE_UNINITIALIZED);
     cmb_assert_always(cp1->stack == NULL);
     cmi_coroutine_destroy(cp1);
 
     printf("Delete coroutine %p\n", (void *)cp2);
     cmb_assert_always(cp2->status == CMI_COROUTINE_FINISHED);
     cmi_coroutine_terminate(cp2);
-    cmb_assert_always(cp2->status == CMI_COROUTINE_CREATED);
+    cmb_assert_always(cp2->status == CMI_COROUTINE_UNINITIALIZED);
     cmb_assert_always(cp2->stack == NULL);
     cmi_coroutine_destroy(cp2);
     cmi_test_print_line("-");

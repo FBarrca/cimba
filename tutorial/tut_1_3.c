@@ -11,14 +11,19 @@ struct simulation {
 
 void end_sim(void *subject, void *object)
 {
+    cmb_unused(subject);
+
     struct simulation *sim = object;
     cmb_logger_user(stdout, USERFLAG1, "--- Game Over ---");
     cmb_process_stop(sim->arr, NULL);
     cmb_process_stop(sim->srv, NULL);
 }
 
-void *arrival(struct cmb_process *me, void *ctx)
+void *arrival_proc(struct cmb_process *me, void *ctx)
 {
+    cmb_unused(me);
+    cmb_assert_debug(ctx != NULL);
+
     struct cmb_buffer *bp = ctx;
     while (true) {
         const double rate = 0.75;
@@ -32,8 +37,11 @@ void *arrival(struct cmb_process *me, void *ctx)
     }
 }
 
-void *service(struct cmb_process *me, void *ctx)
+void *service_proc(struct cmb_process *me, void *ctx)
 {
+    cmb_unused(me);
+    cmb_assert_debug(ctx != NULL);
+
     struct cmb_buffer *bp = ctx;
     while (true) {
         const double rate = 1.0;
@@ -53,7 +61,6 @@ int main(void)
     cmb_random_initialize(seed);
 
     cmb_logger_flags_off(CMB_LOGGER_INFO);
-    cmb_logger_flags_off(USERFLAG1);
 
     cmb_event_queue_initialize(0.0);
 
@@ -62,11 +69,11 @@ int main(void)
     cmb_buffer_initialize(sim.que, "Queue", CMB_UNLIMITED);
 
     sim.arr = cmb_process_create();
-    cmb_process_initialize(sim.arr, "Arrival", arrival, sim.que, 0);
+    cmb_process_initialize(sim.arr, "Arrival", arrival_proc, sim.que, 0);
     cmb_process_start(sim.arr);
 
     sim.srv = cmb_process_create();
-    cmb_process_initialize(sim.srv, "Service", service, sim.que, 0);
+    cmb_process_initialize(sim.srv, "Server", service_proc, sim.que, 0);
     cmb_process_start(sim.srv);
 
     cmb_event_schedule(end_sim, NULL, &sim, 10.0, 0);

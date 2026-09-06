@@ -44,6 +44,7 @@
 #include "cmb_resourceguard.h"
 #include "cmb_timeseries.h"
 
+#include "cmi_memregistry.h"
 #include "cmi_resourcebase.h"
 
 /**
@@ -54,15 +55,16 @@
  * consumers wait.
  */
 struct cmb_objectqueue {
-    struct cmi_resourcebase core;           /**< The virtual base class */
-    struct cmb_resourceguard front_guard;   /**< Front waiting room for getters */
-    struct cmb_resourceguard rear_guard;    /**< Rear waiting room for putters */
-    struct queue_tag *queue_head;           /**< The head of the queue, `NULL` if empty */
-    struct queue_tag *queue_end;            /**< The tail of the queue, `NULL` if empty */
-    uint64_t capacity;                      /**< The maximum size, possibly `CMB_UNLIMITED` */
-    uint64_t length;                        /**< The current queue length */
-    bool is_recording;                      /**< Is it recording its history? */
-    struct cmb_timeseries history;          /**< History of queue lengths */
+    struct cmi_resourcebase base;            /**< The virtual base class */
+    struct cmb_resourceguard front_guard;    /**< Front waiting room for getters */
+    struct cmb_resourceguard rear_guard;     /**< Rear waiting room for putters */
+    struct queue_tag *queue_head;            /**< The head of the queue, `NULL` if empty */
+    struct queue_tag *queue_end;             /**< The tail of the queue, `NULL` if empty */
+    uint64_t capacity;                       /**< The maximum size, possibly `CMB_UNLIMITED` */
+    uint64_t length;                         /**< The current queue length */
+    bool is_recording;                       /**< Is it recording its history? */
+    struct cmb_timeseries history;           /**< History of queue lengths */
+    struct cmi_memregistry_item destroy;     /**< Internal use */
 };
 
 /**
@@ -143,7 +145,7 @@ extern int64_t cmb_objectqueue_put(struct cmb_objectqueue *oqp, void *object);
  * @param oqp Pointer to an object queue
  * @return A null-terminated string containing the name of the object queue.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline const char *cmb_objectqueue_name(struct cmb_objectqueue *oqp)
 {
     cmb_assert_debug(oqp != NULL);
@@ -161,7 +163,7 @@ static inline const char *cmb_objectqueue_name(struct cmb_objectqueue *oqp)
  * @param oqp Pointer to an object queue
  * @return The current queue length
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline uint64_t cmb_objectqueue_length(struct cmb_objectqueue *oqp)
 {
     cmb_assert_debug(oqp != NULL);
@@ -177,7 +179,7 @@ static inline uint64_t cmb_objectqueue_length(struct cmb_objectqueue *oqp)
  * @param oqp Pointer to an object queue
  * @return The available space in the queue
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline uint64_t cmb_objectqueue_space(struct cmb_objectqueue *oqp)
 {
     cmb_assert_release(oqp != NULL);
@@ -192,7 +194,7 @@ static inline uint64_t cmb_objectqueue_space(struct cmb_objectqueue *oqp)
  *
  * @memberof cmb_objectqueue
  * @param oqp Pointer to an object queue
- * &param object Pointer to some object, possibly NULL
+ * @param object Pointer to some object, possibly NULL
  * @return The position of the object in the queue, zero if not found. Will return
  *         the first match (nearest to the front of the queue) if several matches.
  */

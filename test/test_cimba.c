@@ -62,9 +62,10 @@ struct trial {
     /* Parameters */
     double service_cv;
     double utilization;
-    double warmup;
-    double duration;
-    double cooldown;
+    double start_time;
+    double warmup_s;
+    double duration_s;
+    double cooldown_s;
     uint64_t seed;
     /* Outcome */
     double avg_queue_length;
@@ -146,11 +147,10 @@ void *arrival_proc(struct cmb_process *me, void *vctx)
     cmb_logger_user(stdout,
                     USERFLAG1,
                     "Started arrival, queue %s",
-                    cmb_buffer_get_name(bp));
+                    cmb_buffer_name(bp));
     cmb_assert_always(ctx->trl->utilization > 0.0);
     const double mean_interarr = 1.0 / ctx->trl->utilization;
 
-    // ReSharper disable once CppDFAEndlessLoop
     while (true) {
         cmb_logger_user(stdout, USERFLAG1, "Holding");
         const double ht = cmb_random_exponential(mean_interarr);
@@ -179,14 +179,13 @@ void *service_proc(struct cmb_process *me, void *vctx)
     cmb_logger_user(stdout,
                     USERFLAG1,
                     "Started service, queue %s",
-                    cmb_buffer_get_name(bp));
+                    cmb_buffer_name(bp));
 
     const double cv = ctx->trl->service_cv;
     cmb_assert_always(cv > 0.0);
     const double shape = 1.0 / (cv * cv);
     const double scale = cv * cv;
 
-    // ReSharper disable once CppDFAEndlessLoop
     while (true) {
         cmb_logger_user(stdout,
                         USERFLAG1,
@@ -197,12 +196,38 @@ void *service_proc(struct cmb_process *me, void *vctx)
         cmb_assert_always(ht >= 0.0);
         int64_t r = cmb_process_hold(ht);
         cmb_assert_always(r == CMB_PROCESS_SUCCESS);
+
+        /* Test occasional trial failures from process coroutine level */
+        const double pfail = 1e-7;
+        if (cmb_random_bernoulli(pfail)) {
+            /* Pretend that this trial failed for some reason, bail out.  */
+            const uint64_t tid = cimba_thread_id();
+            const uint64_t tix = cimba_trial_index();
+            cmb_logger_error(stdout,
+                             "Trial %" PRIu64 " failed in worker %" PRIu64,
+                             tix, tid);
+            /* Not reached */
+        }
+
         cmb_logger_user(stdout, USERFLAG1, "Getting");
         uint64_t n = 1u;
         r = cmb_buffer_get(bp, &n);
         cmb_assert_always(r == CMB_PROCESS_SUCCESS);
         cmb_assert_always(n == 1u);
    }
+}
+
+/*
+ * Our very own cleanup for abandoned trials
+ */
+void trial_cleanup(void *vctx)
+{
+    cmb_assert_always(vctx != NULL);
+
+    struct context *ctx = (struct context *)vctx;
+    struct simulation *sim = ctx->sim;
+    free(sim);
+    free(ctx);
 }
 
 /*
@@ -213,32 +238,52 @@ void run_mg1_trial(void *vtrl)
     cmb_assert_always(vtrl != NULL);
 
     struct trial *trl = vtrl;
-    cmb_logger_user(stdout, USERFLAG2, "Trial seed: 0x%016" PRIx64, trl->seed);
+
+    /* Start from an empty event queue. The simulation clock will not be
+     * initialized to its correct starting value before this call. Any error
+     * or warning messages may show the wrong timestamp until properly
+     * initialized. We do that first, and we start from non-zero here
+     * because we can. */
+    cmb_assert_always(cmb_process_current() == NULL);
+    cmb_assert_always(cmb_time() == 0.0);
+    cmb_event_queue_initialize(trl->start_time);
+    cmb_assert_always(cmb_time() == trl->start_time);
+
+    /* Any error or warning messages will contain the pseudo-random number seed,
+     * again not initialized before this call. So we do that too. */
+    cmb_random_initialize(trl->seed);
 
     struct context *ctx = malloc(sizeof(*ctx));
+    cimba_trial_cleanup_set(trial_cleanup, ctx);
     cmb_assert_always(ctx != NULL);
     ctx->trl = trl;
-    cmb_random_initialize(trl->seed);
 
     struct simulation *sim = malloc(sizeof(*sim));
     cmb_assert_always(sim != NULL);
     ctx->sim = sim;
 
-    /* Do not disturb, except for significant warnings and errors */
-    cmb_logger_flags_off(CMB_LOGGER_INFO);
-    cmb_logger_flags_off(USERFLAG1);
+    cmb_logger_user(stdout, USERFLAG2, "Started, seed 0x%" PRIx64, trl->seed);
 
-    /* Start from an empty event queue */
-    cmb_event_queue_initialize(0.0);
+    /* Test occasional trial failures from trial function level */
+    const double pfail = 0.05;
+    if (cmb_random_bernoulli(pfail)) {
+        /* Pretend that this trial failed for some reason, bail out.*/
+        const uint64_t tid = cimba_thread_id();
+        const uint64_t tix = cimba_trial_index();
+        cmb_logger_error(stdout,
+                         "Trial %" PRIu64 " failed in worker %" PRIu64,
+                         tix, tid);
+        /* Not reached */
+    }
 
     /* Set the data collection period */
-    double t = trl->warmup;
+    double t = trl->start_time + trl->warmup_s;
     uint64_t ev_hdle = cmb_event_schedule(start_rec_evt, sim, NULL, t, 0);
     cmb_assert_always(ev_hdle != 0u);
-    t += trl->duration;
+    t += trl->duration_s;
     ev_hdle = cmb_event_schedule(stop_rec_evt, sim, NULL, t, 0);
     cmb_assert_always(ev_hdle != 0u);
-    t += trl->cooldown;
+    t += trl->cooldown_s;
     ev_hdle = cmb_event_schedule(end_sim_evt, sim, NULL, t, 0);
     cmb_assert_always(ev_hdle != 0u);
 
@@ -250,20 +295,20 @@ void run_mg1_trial(void *vtrl)
 
     sim->arrival = cmb_process_create();
     cmb_assert_always(sim->arrival != NULL);
-    cmb_assert_always(cmb_process_status(sim->arrival) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim->arrival) == CMB_PROCESS_UNINITIALIZED);
     cmb_process_initialize(sim->arrival, "Arrivals", arrival_proc, ctx, 0);
-    cmb_assert_always(cmb_process_status(sim->arrival) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim->arrival) == CMB_PROCESS_INITIALIZED);
     /* Non-blocking, just schedules the start event to run when we yield from here */
     cmb_process_start(sim->arrival);
-    cmb_assert_always(cmb_process_status(sim->arrival) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim->arrival) == CMB_PROCESS_INITIALIZED);
 
     sim->service = cmb_process_create();
     cmb_assert_always(sim->service != NULL);
-    cmb_assert_always(cmb_process_status(sim->service) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim->service) == CMB_PROCESS_UNINITIALIZED);
     cmb_process_initialize(sim->service, "Service", service_proc, ctx, 0);
-    cmb_assert_always(cmb_process_status(sim->service) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim->service) == CMB_PROCESS_INITIALIZED);
     cmb_process_start(sim->service);
-    cmb_assert_always(cmb_process_status(sim->service) == CMB_PROCESS_CREATED);
+    cmb_assert_always(cmb_process_status(sim->service) == CMB_PROCESS_INITIALIZED);
 
     /* Execute the trial */
     cmb_event_queue_execute();
@@ -275,20 +320,24 @@ void run_mg1_trial(void *vtrl)
     cmb_wtdsummary_initialize(&ws);
     cmb_timeseries_summarize(tsp, &ws);
     trl->avg_queue_length = cmb_wtdsummary_mean(&ws);
+    cmb_wtdsummary_terminate(&ws);
 
     /* Clean up */
 
+    cmb_logger_user(stdout, USERFLAG2, "Finished");
     cmb_assert_always(cmb_process_status(sim->arrival) == CMB_PROCESS_FINISHED);
     cmb_process_terminate(sim->arrival);
     cmb_process_destroy(sim->arrival);
     cmb_assert_always(cmb_process_status(sim->service) == CMB_PROCESS_FINISHED);
     cmb_process_terminate(sim->service);
     cmb_process_destroy(sim->service);
+    cmb_buffer_terminate(sim->queue);
     cmb_buffer_destroy(sim->queue);
     free(sim);
     free(ctx);
 
     cmb_event_queue_terminate();
+    cmb_random_terminate();
 }
 
 /* Declare for later use, do not want to digress with that here */
@@ -301,13 +350,18 @@ struct thread_context {
     uint64_t tid;
 };
 
-void *thread_init_func(void *usrarg, const uint64_t tid)
+void *thread_init_func(const uint64_t tid, void *usrarg)
 {
+    /* Create a context object for the Cimba worker thread */
     struct thread_context *ctx = malloc(sizeof *ctx);
     cmb_assert_always(ctx != NULL);
     ctx->thread_id = pthread_self();
     ctx->usrarg = usrarg;
     ctx->tid = tid;
+
+    /* Use the thread hook mechanism to set logger flags */
+    const uint32_t logflagsoff = *((uint32_t *)usrarg);
+    cmb_logger_flags_off(logflagsoff);
 
     return ctx;
 }
@@ -315,6 +369,8 @@ void *thread_init_func(void *usrarg, const uint64_t tid)
 void thread_exit_func(void *vctx)
 {
     cmb_assert_always(vctx != NULL);
+
+    /* Delete the context object */
     struct thread_context *ctx = vctx;
     free(ctx);
 }
@@ -326,14 +382,16 @@ int main(const int argc, char **argv)
 {
     bool plot_graphics = false;
     bool timing_enabled = false;
+    bool validate = false;
     uint64_t seed = cmb_random_hwseed();
     double dur = 1.0e6;
-    double wup = 1.0e-3;
+    double wup = 1.0e3;
+    uint32_t nthr = 0u;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:gs:tw:")) != -1) {
+    while ((opt = getopt(argc, argv, "d:gr:s:tw:v")) != -1) {
         switch (opt) {
-            case 'd':
+            case 'd': {
                 errno = 0;
                 dur = strtod(optarg, NULL);
                 if (errno != 0 || dur <= 0.0) {
@@ -341,10 +399,22 @@ int main(const int argc, char **argv)
                     abort();
                 }
                 break;
-            case 'g':
+            }
+            case 'g': {
                 plot_graphics = true;
                 break;
-            case 's':
+            }
+            case 'r': {
+                errno = 0;
+                nthr = (uint32_t)strtoul(optarg, NULL, 0);
+                if (errno != 0) {
+                    fprintf(stderr, "Invalid argument %s\n", optarg);
+                    abort();
+                }
+                (void)cimba_threads_use(nthr);
+                break;
+            }
+            case 's': {
                 errno = 0;
                 seed = (uint64_t)strtoull(optarg, NULL, 0);
                 if (errno != 0 || seed == 0u) {
@@ -352,22 +422,30 @@ int main(const int argc, char **argv)
                     abort();
                 }
                 break;
-            case 't':
+            }
+            case 't': {
                 timing_enabled = true;
                 break;
-            case 'w':
+            }
+            case 'v': {
+                validate = true;
+                break;
+            }
+            case 'w': {
                 wup = strtod(optarg, NULL);
                 break;
-            default:
-                fprintf(stderr, "Usage: %s [-g][-s <seed>]\n", argv[0]);
+            }
+            default: {
+                fprintf(stderr, "Usage: %s [-d <duration>][-g][-r <runner_threads>][-s <seed>][-t][-v][-w <warmup_period>]\n", argv[0]);
+
                 return EXIT_FAILURE;
+            }
         }
     }
 
     cmi_test_print_line("*");
     printf("*************************   Testing trial execution   **************************\n");
     cmi_test_print_line("*");
-    printf("Cimba version %s\n", cimba_version());
     printf("Using seed: 0x%" PRIx64 "\n", seed);
     struct timespec start_time;
     if (timing_enabled) {
@@ -390,39 +468,73 @@ int main(const int argc, char **argv)
             for (unsigned ui_rep = 0u; ui_rep < nreps; ui_rep++) {
                 experiment[ui_exp].service_cv = cvs[ui_cv];
                 experiment[ui_exp].utilization = rhos[ui_rho];
-                experiment[ui_exp].warmup = wup;
-                experiment[ui_exp].duration = dur;
-                experiment[ui_exp].cooldown = 1.0;
+                experiment[ui_exp].start_time = 1.0e6;
+                experiment[ui_exp].warmup_s = wup;
+                experiment[ui_exp].duration_s = dur;
+                experiment[ui_exp].cooldown_s = 1.0;
                 experiment[ui_exp].seed = cmb_random_fmix64(seed, ui_exp);
-                experiment[ui_exp].avg_queue_length = 0.0;
+                /* Sentinel initial value to catch any failed trials */
+                experiment[ui_exp].avg_queue_length = -1.0;
                 ui_exp++;
             }
         }
     }
 
+    /* Stash a copy for possible later use */
+    struct trial *experiment_single = calloc(ntrials, sizeof(*experiment_single));
+    cmb_assert_always(sizeof(*experiment) == sizeof(*experiment_single));
+    cmi_memcpy(experiment_single, experiment, ntrials * sizeof(*experiment));
+
     printf("Baiting thread hooks\n");
-    cimba_set_thread_hooks(thread_init_func, NULL, thread_exit_func);
+    uint32_t logflagsoff = CMB_LOGGER_INFO | USERFLAG1;
+    cimba_thread_hooks_set(thread_init_func, &logflagsoff, thread_exit_func);
 
     printf("Running experiment\n");
     cmi_test_print_line("-");
-    cimba_run_experiment(experiment,
-                         ntrials,
-                         sizeof(*experiment),
-                         run_mg1_trial);
-
+    const uint64_t nfail = cimba_run(experiment,
+                                     ntrials,
+                                     sizeof(*experiment),
+                                     run_mg1_trial);
     cmi_test_print_line("-");
+
+    if ((validate == true) && (cimba_threads_num() != 1u)) {
+        /* We were running multithreaded, check that we get the exact same outcome single-threaded */
+        printf("Validating experiment ...");
+        fflush(stdout);
+        cimba_threads_use(1);
+        /* Turn off all logging, including error messages. cimba_run() has joined
+         * all threads that read the previous value, will soon start new worker
+         * threads, tell them to turn off logging by storing a new value here. */
+        logflagsoff = 0xFFFFFFFF;
+        const uint64_t rs = cimba_run(experiment_single, ntrials, sizeof(*experiment_single), run_mg1_trial);
+        cmb_assert_always(rs == nfail);
+        for (uint64_t i = 0; i < ntrials; i++) {
+            /* Bitwise comparison of the per-trial outcome, independent of execution sequence */
+            cmb_assert_always(memcmp(&experiment[i], &experiment_single[i], sizeof(*experiment)) == 0);
+        }
+
+        cimba_threads_use(nthr);
+        printf("done\n");
+    }
+
+    free(experiment_single);
+
+    printf("Experiment finished, %" PRIu64 " failed trials\n", nfail);
     if (plot_graphics) {
-        printf("Finished experiment, writing results to file\n");
+        printf("Writing results to file\n");
         ui_exp = 0u;
         FILE *datafp = fopen("test_cimba.dat", "w");
         fprintf(datafp, "# CV utilization avg_queue_length\n");
         for (unsigned ui_cv = 0u; ui_cv < ncvs; ui_cv++) {
             for (unsigned ui_rho = 0u; ui_rho < nrhos; ui_rho++) {
                 for (unsigned ui_rep = 0u; ui_rep < nreps; ui_rep++) {
-                    fprintf(datafp, "%f %f %f\n",
-                       experiment[ui_exp].service_cv,
-                       experiment[ui_exp].utilization,
-                       experiment[ui_exp].avg_queue_length);
+                    if (experiment[ui_exp].avg_queue_length != -1.0) {
+                        /* Trial did not fail, valid result */
+                        fprintf(datafp, "%f %f %f\n",
+                           experiment[ui_exp].service_cv,
+                           experiment[ui_exp].utilization,
+                           experiment[ui_exp].avg_queue_length);
+                    }
                     ui_exp++;
                 }
                 fprintf(datafp, "\n");
@@ -433,7 +545,7 @@ int main(const int argc, char **argv)
         fclose(datafp);
     }
     else {
-        printf("Finished experiment, results:\n");
+        printf("Results:\n");
         ui_exp = 0u;
         printf("cv: \trho:\tn_avg:\n");
         for (unsigned ui_cv = 0u; ui_cv < ncvs; ui_cv++) {
@@ -441,12 +553,22 @@ int main(const int argc, char **argv)
             for (unsigned ui_rho = 0u; ui_rho < nrhos; ui_rho++) {
                 const double rho = experiment[ui_exp].utilization;
                 double sum = 0.0;
+                unsigned nval = 0u;
                 for (unsigned ui_rep = 0u; ui_rep < nreps; ui_rep++) {
-                    sum += experiment[ui_exp].avg_queue_length;
+                    if (experiment[ui_exp].avg_queue_length != -1.0) {
+                        /* Trial did not fail, valid result */
+                        nval++;
+                        sum += experiment[ui_exp].avg_queue_length;
+                    }
                     ui_exp++;
                 }
-                const double avg = sum / (double)nreps;
-                printf("%5.3f\t%5.3f\t%5.3f\n", cv, rho, avg);
+                if (nval > 0u) {
+                    const double avg = sum / (double)nval;
+                    printf("%5.3f\t%5.3f\t%5.3f\n", cv, rho, avg);
+                }
+                else {
+                    printf("%5.3f\t%5.3f\t-\n", cv, rho);
+                }
             }
         }
     }
@@ -464,7 +586,9 @@ int main(const int argc, char **argv)
     if (plot_graphics) {
         /* Pop up the Gnuplot graphics window before exiting */
         write_gnuplot_commands(ncvs, cvs);
-        (void)system("gnuplot -persistent test_cimba.gp");
+        if (system("gnuplot -persistent test_cimba.gp") != 0) {
+            cmb_logger_warning(stderr, "gnuplot launch failed");
+        }
     }
 
     cmi_test_print_line("*");

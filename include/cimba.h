@@ -30,7 +30,7 @@
 #define CIMBA_VERSION_MAJOR 3
 #define CIMBA_VERSION_MINOR 0
 #define CIMBA_VERSION_PATCH 0
-#define CIMBA_VERSION_PRE_RELEASE beta
+#define CIMBA_VERSION_PRE_RELEASE RC2
 
 #define CMI_STRINGIFY(x) #x
 
@@ -117,6 +117,35 @@ typedef void (cimba_trial_func)(void *trial_struct);
  * need to determine the appropriate closing time and schedule an event for that
  * inside your simulation. See `test/test_cimba.c` for an example.
  *
+ * Your trial function is also responsible for managing the seeds used by any
+ * pseudo-random number generators. The generators should be initialized with a
+ * seed at the start of each trial. If you just want independent trials with no
+ * need for reproducibility, call `cmb_random_hwseed()` to get one based on
+ * hardware entropy. It will provide each trial with a unique, truly random seed.
+ *
+ * If you need both randomness and reproducibility, call `cmb_random_hwseed()`
+ * once in your main program to get a master seed, use `cmb_random_splitmix64()`
+ * with that master seed and a running trial counter to get a unique and
+ * reproducible seed for each trial, store this trial seed in your trial struct,
+ * and then let the trial function use this pre-calculated and stored seed to
+ * initialize the PRNG's for that trial.
+ *
+ * The recommended seed generation approach is along these lines:
+ *
+ *     uint64_t master_seed = cmb_random_hwseed();
+ *     struct trial *experiment = calloc(num_trials, sizeof(*experiment));
+ *     for (unsigned trl_idx = 0u; trl_idx < num_trials; trl_idx++) {
+ *          experiment[trl_idx].seed = cmb_random_fmix64(master_seed, trl_idx);
+ *     }
+ *
+ * and then, in your trial function, given the pointer `trl` to one specific
+ * `struct trial` to run in your experiment array:
+ *
+ *     cmb_random_initialize(trl->seed);
+ *
+ * See `test/test_cimba.c` for one example of this, combined with optional
+ * command line arguments for an externally provided master seed.
+ *
  * When `cimba_run_experiment()` returns, the results fields of the trial
  * structs that constitute your experiment array will be filled in.
  *
@@ -139,25 +168,37 @@ typedef void (cimba_trial_func)(void *trial_struct);
  *                        the first member of each trial struct will be assumed
  *                        to be a pointer to the trial function to be executed
  *                        for that particular trial.
+ * @return Number of failed trials terminated by cmb_logger_error, if any.
+ *         Return value zero indicates success, no trials failed.
  */
-extern void cimba_run_experiment(void *your_experiment_array,
-                                 uint64_t num_trials,
-                                 size_t trial_struct_size,
-                                 cimba_trial_func *your_trial_func);
+extern uint64_t cimba_run(void *your_experiment_array,
+                          uint64_t num_trials,
+                          size_t trial_struct_size,
+                          cimba_trial_func *your_trial_func);
+
+/** @cond Deprecated long form cimba_run_experiment **/
+CMB_MAYBE_UNUSED
+static inline uint64_t cimba_run_experiment(void *your_experiment_array,
+                          uint64_t num_trials,
+                          size_t trial_struct_size,
+                          cimba_trial_func *your_trial_func)
+{
+    return cimba_run(your_experiment_array, num_trials, trial_struct_size, your_trial_func);
+}
+/** @endcond **/
 
 /**
 * @brief Defines a prototype for an optional user-provided function to execute
-* when initializing a phtread. The first argument is whatever the user code wants
-* it to be, the second argument is the thread id assigned by cimba_run_experiment,
-* an unsigned 64-bit integer in the range from 0 to the number of logical cores
-* on the CPU minus one.
+* when initializing a pthread. The first argument is the thread id assigned by
+* cimba_run_experiment, an unsigned 64-bit integer. The second argument is
+* whatever the user code wants it to be, user defined.
 */
-typedef void *(cimba_thread_init_func)(void *usrarg, uint64_t tid);
+typedef void *(cimba_thread_init_func)(uint64_t tid, void *usrarg);
 
 /**
 * @brief Defines a prototype for an optional user-provided function to execute
-* when terminating a phtread. The argument is a thread context created by a
-* previous thread init function. THis context can also be obtained in user code
+* when terminating a pthread. The argument is a thread context created by a
+* previous thread init function. This context can also be obtained in user code
 * by calling cimba_thread_context()
 */
 typedef void (cimba_thread_exit_func)(void *thrctx);
@@ -181,7 +222,7 @@ typedef void (cimba_thread_exit_func)(void *thrctx);
  * @param usrarg An argument to be passed to the initfunc
  * @param exitfunc A function to be called before exiting a pthread
  */
-extern void cimba_set_thread_hooks(cimba_thread_init_func *initfunc,
+extern void cimba_thread_hooks_set(cimba_thread_init_func *initfunc,
                                    void *usrarg,
                                    cimba_thread_exit_func *exitfunc);
 
@@ -194,5 +235,86 @@ extern void cimba_set_thread_hooks(cimba_thread_init_func *initfunc,
 */
 extern void *cimba_thread_context(void);
 
+/**
+* @brief Get the worker thread id for currently executing code.
+*
+* @return Cimba worker thread index, zero if running outside threads.
+*/
+extern uint64_t cimba_thread_id(void);
+
+/**
+* @brief Get the number of worker threads
+*
+* @return Number of worker threads (running or otherwise), >= 1.
+*/
+extern uint32_t cimba_threads_num(void);
+
+/**
+* @brief Set the maximal number of worker threads to be used by Cimba. Can only
+*        be set before or between Cimba runs.
+
+* @param n_threads The number of threads to use. Zero means default number,
+*                  i.e., equal to the number of CPU cores reported by the
+*                  operating system. Returns the actual number used, same value
+*                  as cimba_threads_num().
+*
+* @return Number of worker threads to be used on the next run, >= 1
+*/
+extern uint32_t cimba_threads_use(uint32_t n_threads);
+
+/**
+* @brief Get the total number of trials in this experiment
+*
+* @return Number of trials (finished, running, or upcoming)
+*/
+extern uint64_t cimba_trials_total(void);
+
+/**
+* @brief Get the number of trials that have not yet been started
+*
+* @return Number of remaining trials
+*/
+extern uint64_t cimba_trials_remaining(void);
+
+/**
+* @brief Get the trial index for the currently executing trial
+*
+* @return Cimba trial index, zero if called outside a trial
+*/
+extern uint64_t cimba_trial_index(void);
+
+/**
+* @brief Defines a prototype for an optional user-provided function to execute
+*        when abandoning a trial, typically to free any memory that was
+*        allocated directly by the trial user code. Cimba cmb_ objects (e.g.,
+*        cmb_process, cmb_resource, ...) will be freed automatically.
+*/
+typedef void (cimba_trial_cleanup_func)(void *arg);
+
+/**
+ * @brief Set the user-defined trial cleanup function. It will only be called
+ *        when abandoning a trial after calling cmb_logger_error inside a multi-
+ *        threaded simulation run. It is thread local, needs to be set in each
+ *        user-provided trial function.
+ *
+ * @param clufunc A function to be called when exiting a trial, possibly NULL to
+ *                clear the cleanup function callback.
+ * @param usrarg An argument to be passed to the clufunc, possibly NULL.
+ */
+extern void cimba_trial_cleanup_set(cimba_trial_cleanup_func *clufunc,
+                                    void *usrarg);
+
+/**
+* @brief Abandon the current trial. Will call `exit(EXIT_FAILURE)` if running
+*        single-threaded, otherwise jump out of the trial, execute the trial
+*        cleanup callback (if set), and then run registered destructors on all
+*        `cmb_` namespace objects in the trial. Execution will then continue
+*        with the next trial in the experiment array. Any objects allocated
+*        directly from the user code, e.g., with `malloc()`, must be freed from
+*        there as well. Cimba only recovers objects created and/or initialized
+*        with the `cmb_*_create()` and `cmb_*_initialize()` functions.
+*/
+CMB_NORETURN
+extern void cimba_trial_abandon(void);
 
 #endif // CIMBA_CIMBA_H

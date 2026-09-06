@@ -21,19 +21,35 @@
 #define _GNU_SOURCE // NOLINT(bugprone-reserved-identifier)
 #include <pthread.h>
 
-#include <inttypes.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <xmmintrin.h>
 
 #include "cmb_assert.h"
-
 #include "cmi_coroutine.h"
 #include "cmi_memutils.h"
+#include "cmi_sanitizer.h"
 
 /* Assembly function, see src/arc/cmi_coroutine_context_*.asm */
 extern void cmi_coroutine_trampoline(void);
+
+/* First-entry hook, defined in cmi_coroutine.c */
+extern void *cmi_coroutine_launch(struct cmi_coroutine *cp, void *arg);
+
+/*
+ * Intrusive singly linked list of recycled stacks. Note that stacks are only
+ * recycled within the current thread (thread local to avoid race conditions or
+ * potentially serializing synchronizations) and that stacks are never freed
+ * until thread exit (remains at high-water mark, to keep the logic simple).
+ */
+struct stack_tag {
+    size_t size;                /* Size of stacks in this list */
+    unsigned char *head;        /* The intrusive list */
+    struct stack_tag *next;     /* Next list, a different size stack */
+};
+
+CMB_THREAD_LOCAL static struct stack_tag *stack_list = NULL;
 
 /*
  * Linux-specific code to allocate and initialize stack for a new coroutine,
@@ -90,11 +106,11 @@ bool cmi_coroutine_stack_valid(const struct cmi_coroutine *cp)
             cmb_assert_debug((uintptr_t *)cp->stack_pointer > (uintptr_t *)cp->stack_limit);
             cmb_assert_debug((uintptr_t *)cp->stack_pointer < (uintptr_t *)cp->stack_base);
             #ifndef NMXCSR
-                /* Total 9 slots pushed: Trampoline, Flags, MXCSR, RBP, RBX, R12, R13, R14, R15 */
-                cmb_assert_debug((((uintptr_t)cp->stack_pointer + 8u) % 16u) == 0u);
+                /* Even number of slots pushed: Trampoline, MXCSR, RBP, RBX, R12, R13, R14, R15 */
+                cmb_assert_debug(((uintptr_t)cp->stack_pointer % 16u) == 0u);
             #else
-               /* Total 8 slots pushed: MXCSR is gone. */
-               cmb_assert_debug(((uintptr_t)cp->stack_pointer % 16u) == 0u);
+                /* Odd number of slots pushed: MXCSR is gone. */
+                cmb_assert_debug((((uintptr_t)cp->stack_pointer + 8u) % 16u) == 0u);
             #endif
         }
     }
@@ -104,17 +120,49 @@ bool cmi_coroutine_stack_valid(const struct cmi_coroutine *cp)
         cmb_assert_debug((uintptr_t *)cp->stack_pointer > (uintptr_t *)cp->stack_limit);
         cmb_assert_debug((uintptr_t *)cp->stack_pointer < (uintptr_t *)cp->stack_base);
         #ifndef NMXCSR
-            /* Total 9 slots pushed: Trampoline, Flags, MXCSR, RBP, RBX, R12, R13, R14, R15 */
-            cmb_assert_debug((((uintptr_t)cp->stack_pointer + 8u) % 16u) == 0u);
-        #else
-            /* Total 8 slots pushed: MXCSR is gone. */
+            /* Even number of slots pushed: Trampoline, MXCSR, RBP, RBX, R12, R13, R14, R15 */
             cmb_assert_debug(((uintptr_t)cp->stack_pointer % 16u) == 0u);
+         #else
+            /* Odd number of slots pushed: MXCSR is gone. */
+            cmb_assert_debug((((uintptr_t)cp->stack_pointer + 8u) % 16u) == 0u);
         #endif
     }
 
     return true;
 }
 
+/* Register sanity check, Linux/x86-64-specific: Just check MXCSR */
+bool cmi_coroutine_registers_valid(const struct cmi_coroutine *cp)
+{
+    cmb_unused(cp);
+
+    #ifdef NMXCSR
+        /* MXCSR register is not stored in this version of Cimba,
+         * assuming that no coroutine changes it. Verify that this holds.    */
+        static CMB_THREAD_LOCAL uint64_t mxcsr_cached = 0u;
+
+        /* We only care about the status bits here */
+        const uint64_t mxcsr_now = _mm_getcsr() & ~0x3Fu;
+        if (mxcsr_cached != 0u) {
+            const bool match = (mxcsr_now == mxcsr_cached);
+            mxcsr_cached = mxcsr_now;
+
+            return match;
+        }
+        else {
+            mxcsr_cached = mxcsr_now;
+
+            return true;
+        }
+
+
+    #else
+        /* Nothing to do */
+        return true;
+    #endif
+}
+
+/* Initialize a new stack with necessary stack frame */
 void cmi_coroutine_context_init(struct cmi_coroutine *cp)
 {
     cmb_assert_release(cp != NULL);
@@ -136,9 +184,11 @@ void cmi_coroutine_context_init(struct cmi_coroutine *cp)
     stkptr -= 8u;
     *(uint64_t *)stkptr = (uintptr_t)cmi_coroutine_trampoline;
 
+#if 0
     /* Clear the flag register, enable interrupts */
     stkptr -= 8u;
     *(uint64_t *)stkptr = 0x0202ull;
+#endif
 
     #ifndef NMXCSR
         /* Default MXCSR value */
@@ -155,9 +205,9 @@ void cmi_coroutine_context_init(struct cmi_coroutine *cp)
     stkptr -= 8u;
     *(uint64_t *)stkptr = 0x0ull;
 
-    /* Place address of coroutine function in R12 */
+    /* Place address of coroutine launch function in R12 */
     stkptr -= 8u;
-    *(uintptr_t *)stkptr = (uintptr_t)cp->cr_function;
+    *(uintptr_t *)stkptr = (uintptr_t)cmi_coroutine_launch;
 
     /* Place address of coroutine struct in R13 */
     stkptr -= 8u;
@@ -183,33 +233,115 @@ void cmi_coroutine_context_init(struct cmi_coroutine *cp)
     cmb_assert_debug(cmi_coroutine_stack_valid(cp));
 }
 
-/* Allocate memory suitable for a stack, including one extra guard page */
-unsigned char *cmi_coroutine_stack_alloc(const size_t size, unsigned char **base_p, unsigned char **limit_p)
+/*
+ * Allocate memory suitable for a stack, including one extra guard page.
+ * The mprotect call is badly serializing for multithreaded applications,
+ * hence managing a pool of recycled stacks of various sizes, assuming that
+ * the application will only use a few different stack sizes. (Most likely, just
+ * one size, all stacks the same size.)
+ */
+unsigned char *cmi_coroutine_stack_alloc(const size_t size_req, unsigned char **base_p, unsigned char **limit_p)
 {
+    cmb_assert_debug(size_req > 0u);
+    cmb_assert_debug((base_p != NULL) && (limit_p != NULL));
+
     const size_t pagesz = cmi_pagesize();
-    unsigned char *raw = cmi_aligned_alloc(pagesz, size + pagesz);
-    cmb_assert_always(raw != NULL);
+    cmb_assert_debug(size_req <= SIZE_MAX - pagesz);
+    const size_t size_rnd = (size_req + pagesz - 1u) & ~(pagesz - 1u);
 
-    const int r = mprotect(raw, pagesz, PROT_NONE);
-    cmb_assert_always(r == 0);
+    /* Do we have one lying around? */
+    unsigned char *stack_raw = NULL;
+    struct stack_tag *st = stack_list;
+    while (st != NULL) {
+        if (st->size == size_rnd) {
+            if (st->head != NULL) {
+                stack_raw = st->head;
+                cmi_asan_unpoison(stack_raw + pagesz, size_rnd);
+                unsigned char **nextloc = (unsigned char **)(stack_raw + pagesz);
+                st->head = *nextloc;
+            }
+            break;
+        }
+        st = st->next;
+    }
 
-    /* Stack grows downwards, base is at the top */
-    *base_p = raw + size + pagesz;
-    *limit_p = raw + pagesz;
+    if (stack_raw == NULL) {
+        /* None lying around, create one */
+        stack_raw = cmi_aligned_alloc(pagesz, size_rnd + pagesz);
+        cmb_assert_always(stack_raw != NULL);
+        /* Protect the guard page */
+        const int r = mprotect(stack_raw, pagesz, PROT_NONE);
+        cmb_assert_always(r == 0);
+    }
 
-    return raw;
+    /* Stack grows downwards, the stack base is at the top */
+    *base_p = stack_raw + pagesz + size_rnd;
+    /* The usable stack space ends here, growing beyond will trigger segfault */
+    *limit_p = stack_raw + pagesz;
+    cmb_assert_debug(((uintptr_t)*base_p - (uintptr_t)*limit_p) == size_rnd);
+    cmb_assert_debug(!cmi_asan_region_poisoned(stack_raw + pagesz, size_rnd));
+
+    return stack_raw;
 }
 
-/* Free memory previously allocated for a stack */
-void cmi_coroutine_stack_free(unsigned char *stack)
+/* Free memory previously allocated for a stack, pushing it back on pool */
+void cmi_coroutine_stack_free(unsigned char *stack_raw, size_t size_req)
 {
-    cmb_assert_release(stack != NULL);
+    cmb_assert_release(stack_raw != NULL);
 
-    /* Unprotect guard page to avoid complaints */
     const size_t pagesz = cmi_pagesize();
-    mprotect(stack, pagesz, PROT_READ | PROT_WRITE | PROT_EXEC);
+    cmb_assert_debug(size_req <= SIZE_MAX - pagesz);
+    const size_t size_rnd = (size_req + pagesz - 1u) & ~(pagesz - 1u);
+    /* The pool will keep this block instead of freeing it, so we clear ASan
+     * poison for the usable region first, the guard page stays PROT_NONE. */
+    cmi_asan_unpoison(stack_raw + pagesz, size_rnd);
 
-    cmi_aligned_free(stack);
+    struct stack_tag *st = stack_list;
+    while (st != NULL) {
+        if (st->size == size_rnd) {
+            /* Found its slot, push it. */
+            unsigned char **nextloc = (unsigned char **)(stack_raw + pagesz);
+            *nextloc = st->head;
+            st->head = stack_raw;
+            return;
+        }
+        else {
+            st = st->next;
+        }
+    }
+
+    /* Made it here, so first stack this size to be recycled */
+    st = cmi_malloc(sizeof(*st));
+    *(unsigned char **)(stack_raw + pagesz) = NULL;
+    st->size = size_rnd;
+    st->head = stack_raw;
+    st->next = stack_list;
+    stack_list = st;
+}
+
+void cmi_coroutine_stack_cleanup(void)
+{
+    const size_t pagesz = cmi_pagesize();
+    struct stack_tag *st = stack_list;
+    while (st != NULL) {
+        while (st->head != NULL) {
+            unsigned char *raw = st->head;
+            unsigned char *next = *(unsigned char **)(raw + pagesz);
+
+            /* Unprotect guard page to avoid complaints */
+            const int r = mprotect(raw, pagesz, PROT_READ | PROT_WRITE);
+            cmb_assert_always(r == 0);
+            cmi_aligned_free(raw);
+
+            st->head = next;
+        }
+
+        struct stack_tag *next = st->next;
+        cmi_free(st);
+        st = next;
+    }
+
+    stack_list = NULL;
 }
 
 /*
@@ -222,14 +354,14 @@ unsigned char *cmi_coroutine_stackbase(void)
     int r = pthread_getattr_np(pthread_self(), &attrs);
     cmb_assert_release(r == 0);
 
-    void *stack_end;
+    void *stack_lowend;
     size_t stack_size;
-    r = pthread_attr_getstack(&attrs, &stack_end, &stack_size);
+    r = pthread_attr_getstack(&attrs, &stack_lowend, &stack_size);
     cmb_assert_release(r == 0);
 
     pthread_attr_destroy(&attrs);
 
-    return (unsigned char *)stack_end + stack_size;
+    return (unsigned char *)stack_lowend + stack_size;
 }
 
 unsigned char *cmi_coroutine_stacklimit(void)
@@ -237,20 +369,32 @@ unsigned char *cmi_coroutine_stacklimit(void)
     pthread_attr_t attrs;
     pthread_attr_init(&attrs);
     int r = pthread_getattr_np(pthread_self(), &attrs);
-    cmb_assert_debug(r == 0);
+    cmb_assert_release(r == 0);
 
-    void *stack_end;
+    void *stack_lowend;
     size_t stack_size;
-    r = pthread_attr_getstack(&attrs, &stack_end, &stack_size);
-    cmb_assert_debug(r == 0);
+    r = pthread_attr_getstack(&attrs, &stack_lowend, &stack_size);
+    cmb_assert_release(r == 0);
 
     pthread_attr_destroy(&attrs);
 
-    return stack_end;
+    return stack_lowend;
 }
 
 unsigned char *cmi_coroutine_stackraw(void)
 {
     /* Not relevant for Linux */
     return NULL;
+}
+
+/*
+ * cmi_coroutine_os_adopt_stack - Make the OS treat cp's stack as the current
+ * one. On Windows this rewrites the TEB stack fields the context switch swaps,
+ * needed after a longjmp bypasses the switch. Linux keeps no such per-thread
+ * stack bounds that the kernel validates against, so this is a no-op here; the
+ * longjmp already left RSP on a valid stack.
+ */
+void cmi_coroutine_os_adopt_stack(const struct cmi_coroutine *cp)
+{
+    cmb_unused(cp);
 }

@@ -18,6 +18,7 @@
  */
 
 #include <float.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -30,14 +31,23 @@
 struct cmb_dataset *cmb_dataset_create(void)
 {
     struct cmb_dataset *dsp = cmi_malloc(sizeof *dsp);
-    cmb_dataset_initialize(dsp);
+    cmi_memset(dsp, 0, sizeof *dsp);
+    dsp->cookie = CMI_UNINITIALIZED;
 
+    /* Add teardown function to the memregistry in case we need to bail out */
+    cmi_dlist_initialize(&(dsp->destroy.node));
+    dsp->destroy.teardown = (cmi_teardown_func *)cmb_dataset_destroy;
+    dsp->destroy.object = dsp;
+    cmi_memregistry_add(&(dsp->destroy));
+
+    cmb_assert_debug(dsp->cookie == CMI_UNINITIALIZED);
     return dsp;
 }
 
 void cmb_dataset_initialize(struct cmb_dataset *dsp)
 {
     cmb_assert_release(dsp != NULL);
+    /* Might get raw memory with random content, cannot assert _UNINITIALIZED */
 
     dsp->cookie = CMI_INITIALIZED;
     dsp->cursize = 0u;
@@ -45,34 +55,61 @@ void cmb_dataset_initialize(struct cmb_dataset *dsp)
     dsp->min = DBL_MAX;
     dsp->max = -DBL_MAX;
     dsp->xa = NULL;
+
+    /* Add teardown function to the memregistry in case we need to bail out */
+    cmi_dlist_initialize(&(dsp->terminate.node));
+    dsp->terminate.teardown = (cmi_teardown_func *)cmb_dataset_terminate;
+    dsp->terminate.object = dsp;
+    cmi_memregistry_add(&(dsp->terminate));
+
+    cmb_assert_debug(dsp->cookie == CMI_INITIALIZED);
 }
 
 void cmb_dataset_reset(struct cmb_dataset *dsp)
 {
     cmb_assert_release(dsp != NULL);
+    cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
 
     cmb_dataset_terminate(dsp);
     cmb_dataset_initialize(dsp);
+
+    cmb_assert_debug(dsp->cookie == CMI_INITIALIZED);
 }
 
 void cmb_dataset_terminate(struct cmb_dataset *dsp)
 {
     cmb_assert_release(dsp != NULL);
+    cmb_assert_release((dsp->cookie == CMI_INITIALIZED)
+                    || cmi_memregistry_is_demolishing);
 
-    dsp->cookie = CMI_UNINITIALIZED;
-    if (dsp->cursize > 0u) {
-        cmb_assert_debug(dsp->xa != NULL);
-        cmi_free(dsp->xa);
-        dsp->xa = NULL;
-        dsp->cursize = 0u;
+    if (dsp->cookie == CMI_INITIALIZED) {
+        dsp->cookie = CMI_UNINITIALIZED;
+        if (dsp->cursize > 0u) {
+            cmb_assert_debug(dsp->xa != NULL);
+            cmi_free(dsp->xa);
+            dsp->xa = NULL;
+            dsp->cursize = 0u;
+            dsp->count = 0u;
+        }
     }
+
+    if (!cmi_memregistry_is_demolishing) {
+       cmi_memregistry_remove(&(dsp->terminate));
+    }
+
+    cmb_assert_debug(dsp->cookie == CMI_UNINITIALIZED);
 }
 
 void cmb_dataset_destroy(struct cmb_dataset *dsp)
 {
     cmb_assert_release(dsp != NULL);
+    /* Call cmb_dataset_terminate first, please */
+    cmb_assert_debug(dsp->cookie == CMI_UNINITIALIZED);
 
-    cmb_dataset_terminate(dsp);
+    if (!cmi_memregistry_is_demolishing) {
+        cmi_memregistry_remove(&(dsp->destroy));
+    }
+
     cmi_free(dsp);
 }
 
@@ -234,7 +271,11 @@ void cmb_dataset_sort(const struct cmb_dataset *dsp)
     cmb_assert_release(dsp != NULL);
     cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
 
-    if (dsp->xa != NULL) {
+    if (dsp->count == 0u) {
+        cmb_logger_warning(stdout, "No data to sort");
+    }
+    else {
+        cmb_assert_debug(dsp->xa != NULL);
         const uint64_t un = dsp->count;
         double *arr = dsp->xa;
         cmb_assert_debug(INT64_MAX >= UINT64_MAX / 2);
@@ -258,17 +299,23 @@ uint64_t cmb_dataset_copy(struct cmb_dataset *tgt,
     cmb_assert_release(src != NULL);
     cmb_assert_release(src->cookie == CMI_INITIALIZED);
     cmb_assert_release(tgt != NULL);
+    cmb_assert_release(tgt != src);
 
-    tgt->cookie = CMI_INITIALIZED;
+    if (tgt->xa != NULL) {
+        cmb_assert_release(tgt->cookie == CMI_INITIALIZED);
+        cmi_free(tgt->xa);
+        tgt->xa = NULL;
+    }
+
+    if (tgt->cookie != CMI_INITIALIZED) {
+        /* Will also add it to the memregistry */
+        cmb_dataset_initialize(tgt);
+    }
+
     tgt->count = src->count;
     tgt->cursize = src->cursize;
     tgt->min = src->min;
     tgt->max = src->max;
-
-    if (tgt->xa != NULL) {
-        cmi_free(tgt->xa);
-        tgt->xa = NULL;
-    }
 
     if (src->xa != NULL) {
         tgt->xa = cmi_calloc(tgt->cursize, sizeof *(tgt->xa));
@@ -278,26 +325,101 @@ uint64_t cmb_dataset_copy(struct cmb_dataset *tgt,
     return tgt->count;
 }
 
-/* Overwrites any existing content of data summary */
-uint64_t cmb_dataset_summarize(const struct cmb_dataset *dsp,
-                               struct cmb_datasummary *dsump)
+/*
+ * cmb_dataset_merge - Merge the samples of `s1` and `s2` into `tgt`, keeping
+ * s1's samples first and s2's after them.
+ *
+ * The target is allowed to alias either source, or both. Rather than special
+ * casing that, the result is built in a local dataset and swapped into `tgt`
+ * at the end: both sources are fully read before anything belonging to `tgt`
+ * is released, so every aliasing combination takes the identical path. It also
+ * keeps `cmi_memcpy`'s `restrict` contract, which an in-place append could not
+ * do for the tgt == s1 == s2 case.
+ */
+uint64_t cmb_dataset_merge(struct cmb_dataset *tgt,
+                           const struct cmb_dataset *s1,
+                           const struct cmb_dataset *s2)
 {
-    cmb_assert_release(dsp != NULL);
-    cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
-    cmb_assert_release(dsump != NULL);
+    cmb_assert_release(tgt != NULL);
+    cmb_assert_release(s1 != NULL);
+    cmb_assert_release(s1->cookie == CMI_INITIALIZED);
+    cmb_assert_release(s2 != NULL);
+    cmb_assert_release(s2->cookie == CMI_INITIALIZED);
+    cmb_assert_release(s1->count <= (UINT64_MAX - s2->count));
 
-    cmb_datasummary_initialize(dsump);
+    const uint64_t total = s1->count + s2->count;
+    cmb_assert_release(total < (UINT64_MAX - CMI_DATASET_INIT_SZ));
+    const uint64_t mult = total / CMI_DATASET_INIT_SZ;
+    const uint64_t newsize = (mult + 1u) * CMI_DATASET_INIT_SZ;
 
-    for (uint64_t ui = 0; ui < dsp->count; ui++) {
-        cmb_datasummary_add(dsump, dsp->xa[ui]);
+    struct cmb_dataset merged = { 0 };
+    cmb_dataset_initialize(&merged);
+
+    if (total > 0u) {
+        merged.cursize = newsize;
+        merged.xa = cmi_malloc((size_t)(merged.cursize * sizeof *(merged.xa)));
+
+        if (s1->count > 0u) {
+            cmb_assert_debug(s1->xa != NULL);
+            cmi_memcpy(merged.xa, s1->xa,
+                       (size_t)(s1->count * sizeof *(merged.xa)));
+        }
+        if (s2->count > 0u) {
+            cmb_assert_debug(s2->xa != NULL);
+            cmi_memcpy(&(merged.xa[s1->count]), s2->xa,
+                       (size_t)(s2->count * sizeof *(merged.xa)));
+        }
+        merged.count = total;
+
+        /* An empty dataset carries min = DBL_MAX and max = -DBL_MAX, which are
+         * the identities for these reductions, so empty sources need no case. */
+        merged.min = (s1->min < s2->min) ? s1->min : s2->min;
+        merged.max = (s1->max > s2->max) ? s1->max : s2->max;
     }
 
-    return dsump->count;
+    /* Safe only now: both sources have been read out. */
+    if (tgt->xa != NULL) {
+        cmb_assert_release(tgt->cookie == CMI_INITIALIZED);
+        cmi_free(tgt->xa);
+        tgt->xa = NULL;
+    }
+
+    cmb_dataset_copy(tgt, &merged);
+    cmb_dataset_terminate(&merged);
+
+    return tgt->count;
+}
+
+/* Overwrites any existing content of data summary */
+uint64_t cmb_dataset_summarize(const struct cmb_dataset *dsrc,
+                               struct cmb_datasummary *dstgt)
+{
+    cmb_assert_release(dsrc != NULL);
+    cmb_assert_release(dsrc->cookie == CMI_INITIALIZED);
+    cmb_assert_release(dstgt != NULL);
+
+    if (dstgt->cookie == CMI_INITIALIZED) {
+        cmb_datasummary_terminate(dstgt);
+    }
+    cmb_datasummary_initialize(dstgt);
+
+    const uint64_t un = dsrc->count;
+    if (un == 0u) {
+        cmb_logger_warning(stdout, "Cannot summarize empty data set.");
+    }
+    else {
+        for (uint64_t ui = 0; ui < un; ui++) {
+            cmb_datasummary_add(dstgt, dsrc->xa[ui]);
+        }
+     }
+
+    return dstgt->count;
 }
 
 /* Assumes that v is already sorted */
-static double data_array_median(const unsigned n, const double v[n])
+static double data_array_median(const uint64_t n, const double v[n])
 {
+    cmb_assert_release(n > 0u);
     cmb_assert_debug(cmi_dataset_is_sorted(n, v));
 
     double r;
@@ -317,15 +439,17 @@ double cmb_dataset_median(const struct cmb_dataset *dsp)
     cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
 
     double r = 0.0;
-    if (dsp->xa != NULL) {
-        struct cmb_dataset dup = { 0 };
-        cmb_dataset_copy(&dup, dsp);
-        cmb_dataset_sort(&dup);
-        r = data_array_median(dup.count, dup.xa);
-        cmb_dataset_reset(&dup);
+    if (dsp->count == 0u) {
+        cmb_logger_warning(stdout, "Cannot take median of empty data set.");
     }
     else {
-        cmb_logger_warning(stderr, "Cannot take median without any data.");
+        cmb_assert_debug(dsp->xa != NULL);
+        struct cmb_dataset dtmp = { 0 };
+        cmb_dataset_initialize(&dtmp);
+        cmb_dataset_copy(&dtmp, dsp);
+        cmb_dataset_sort(&dtmp);
+        r = data_array_median(dtmp.count, dtmp.xa);
+        cmb_dataset_terminate(&dtmp);
     }
 
     return r;
@@ -342,38 +466,44 @@ void cmb_dataset_fivenum_print(const struct cmb_dataset *dsp,
     cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
     cmb_assert_release(fp != NULL);
 
-    if (dsp->xa != NULL) {
-        struct cmb_dataset dsc = { 0 };
-        cmb_dataset_copy(&dsc, dsp);
-        cmb_dataset_sort(&dsc);
+    if (dsp->count == 0u) {
+        cmb_logger_warning(fp, "No data to display in five-number summary");
+    }
+    else if (dsp->count < 4u) {
+        cmb_logger_warning(fp, "Not enough data for five-number summary, only have %" PRIu64,
+            dsp->count);
+    }
+    else {
+        cmb_assert_debug(dsp->xa != NULL);
+        struct cmb_dataset dtmp = { 0 };
+        cmb_dataset_initialize(&dtmp);
+        cmb_dataset_copy(&dtmp, dsp);
+        cmb_dataset_sort(&dtmp);
 
-        const double min = dsc.min;
-        const double max = dsc.max;
-        const double med = data_array_median(dsc.count, dsc.xa);
+        const double min = dtmp.min;
+        const double max = dtmp.max;
+        const double med = data_array_median(dtmp.count, dtmp.xa);
 
-        const unsigned lhsz = dsc.count / 2;
-        const double q1 = data_array_median(lhsz, dsc.xa);
+        const uint64_t lhsz = dtmp.count / 2;
+        const double q1 = data_array_median(lhsz, dtmp.xa);
         double q3;
-        const unsigned uhsz = dsc.count - lhsz;
-        if ((dsc.count % 2) == 0) {
+        const uint64_t uhsz = dtmp.count - lhsz;
+        if ((dtmp.count % 2) == 0) {
             /* Even number of entries */
-            q3 = data_array_median(uhsz, &(dsc.xa[lhsz]));
+            q3 = data_array_median(uhsz, &(dtmp.xa[lhsz]));
         } else {
             /* Odd number of entries, exclude the median entry */
-            q3 = data_array_median(uhsz - 1, &(dsc.xa[lhsz + 1]));
+            q3 = data_array_median(uhsz - 1, &(dtmp.xa[lhsz + 1]));
         }
 
         const int r = fprintf(fp, "%s%#8.4g%s%#8.4g%s%#8.4g%s%#8.4g%s%#8.4g\n",
                 ((lead_ins) ? "Min " : ""), min,
-                ((lead_ins) ? "  First " : "\t"), q1,
+                ((lead_ins) ? "  First_Q " : "\t"), q1,
                 ((lead_ins) ? "  Median " : "\t"), med,
-                ((lead_ins) ? "  Third " : "\t"), q3,
+                ((lead_ins) ? "  Third_Q " : "\t"), q3,
                 ((lead_ins) ? "  Max " : "\t"), max);
         cmb_assert_release(r > 0);
-        cmb_dataset_reset(&dsc);
-    }
-    else {
-        cmb_logger_warning(fp, "No data to display in five-number summary");
+        cmb_dataset_terminate(&dtmp);
     }
 }
 
@@ -383,13 +513,14 @@ void cmb_dataset_print(const struct cmb_dataset *dsp, FILE *fp)
     cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
     cmb_assert_release(fp != NULL);
 
-    if (dsp->xa != NULL) {
-        for (uint64_t l = 0; l < dsp->count; l++) {
-            fprintf(fp, "%g\n", dsp->xa[l]);
-        }
+    if (dsp->count == 0u) {
+        cmb_logger_warning(fp, "No data to print");
     }
     else {
-        cmb_logger_warning(fp, "No data to print");
+        cmb_assert_debug(dsp->xa != NULL);
+        for (uint64_t l = 0u; l < dsp->count; l++) {
+            fprintf(fp, "%g\n", dsp->xa[l]);
+        }
     }
 }
 
@@ -458,6 +589,7 @@ struct cmi_dataset_histogram *cmi_dataset_histogram_create(const unsigned num_bi
     const double range = high_lim - low_lim;
 
     struct cmi_dataset_histogram *hp = cmi_malloc(sizeof(*hp));
+    /* Allow for overflow bins on either end */
     hp->num_bins = num_bins + 2u;
     hp->binsize = range / (double)(num_bins);
     hp->low_lim = low_lim;
@@ -502,6 +634,78 @@ void cmi_dataset_histogram_fill(struct cmi_dataset_histogram *hp,
     }
 }
 
+/*
+ * histogram_nice_unit - Largest of 1, 2 or 5 times a power of ten that does
+ * not exceed v. Used to snap the label base to a round number.
+ */
+static double histogram_nice_unit(const double v)
+{
+    cmb_assert_debug(v > 0.0);
+
+    const double k = floor(log10(v));
+    const double mantissa = v / pow(10.0, k);
+
+    double c = 1.0;
+    if (mantissa >= 5.0) {
+        c = 5.0;
+    }
+    else if (mantissa >= 2.0) {
+        c = 2.0;
+    }
+
+    return c * pow(10.0, k);
+}
+
+/* histogram_nice_width - Smallest of 1, 2 or 5 times a power of ten that is
+ * at least v. Gives round bucket edges at any magnitude. */
+static double histogram_nice_width(const double v)
+{
+    cmb_assert_debug(v > 0.0);
+
+    const double p = pow(10.0, floor(log10(v)));
+    const double m = v / p;
+
+    double c = 10.0;
+    if (m <= 1.0) {
+        c = 1.0;
+    }
+    else if (m <= 2.0) {
+        c = 2.0;
+    }
+    else if (m <= 5.0) {
+        c = 5.0;
+    }
+
+    return c * p;
+}
+
+/* Autoscale to dataset range */
+void cmi_dataset_histogram_autoscale(const struct cmb_dataset *dsp,
+                                     unsigned int *num_bins,
+                                     double *low_lim, double *high_lim)
+{
+    double w = 0.0;
+    double nb = (double)(*num_bins);
+    const double rng = dsp->max - dsp->min;
+    if (rng <= 0.0) {
+        /* All values identical; any positive width will do */
+        w = 1.0;
+    }
+    else {
+        const double raw = rng / nb;
+        w = (raw >= 1.0) ? ceil(raw) : histogram_nice_width(raw);
+    }
+
+    const double ll = floor(dsp->min / w) * w;
+    const double ncand = ceil((dsp->max - ll) / w) + 1.0;
+    nb = (unsigned)(fmin(nb, ncand));
+    const double hl = ll + nb * w;
+
+    *num_bins = (unsigned int)nb;
+    *low_lim = ll;
+    *high_lim = hl;
+}
+
 void cmi_dataset_histogram_print(const struct cmi_dataset_histogram *hp,
                                  FILE *fp)
 {
@@ -515,22 +719,44 @@ void cmi_dataset_histogram_print(const struct cmi_dataset_histogram *hp,
     const uint16_t max_stars = 50u;
     const double scale = hp->binmax / (double)max_stars;
 
-    /* Print the histogram */
+    const double edge_mag = fmax(fabs(hp->low_lim), fabs(hp->high_lim));
+    const bool use_offset = (hp->binsize < (edge_mag * 1.0e-3));
+
+    double base = 0.0;
+    if (use_offset) {
+        const double span = (double)(hp->num_bins - 2u) * hp->binsize;
+        const double unit = histogram_nice_unit(span / 10.0);
+        base = floor(hp->low_lim / unit) * unit;
+    }
+
+    const double origin = hp->low_lim - base;
     data_print_line(fp, symbol_thin, line_length);
-    int r = fprintf(fp, "( -Infinity, %#10.4g)   |", hp->low_lim);
+
+    int r;
+    if (use_offset) {
+        r = fprintf(fp, "Bucket edges shown as offsets from base %.15g, bucket width %#.4g\n",
+                    base, hp->binsize);
+        cmb_assert_release(r > 0);
+        data_print_line(fp, symbol_thin, line_length);
+    }
+
+    r = fprintf(fp, "( -Infinity, %#10.4g)   |", origin);
     cmb_assert_release(r > 0);
     data_print_blocks(fp, scale, hp->hbins[0u]);
+
     for (unsigned ui = 1u; ui < hp->num_bins - 1u; ui++) {
         r = fprintf(fp, "[%#10.4g, %#10.4g)   |",
-                hp->low_lim + (ui - 1u) * hp->binsize,
-                hp->low_lim + ui * hp->binsize);
+                    origin + (double)(ui - 1u) * hp->binsize,
+                    origin + (double)ui * hp->binsize);
         cmb_assert_release(r > 0);
         data_print_blocks(fp, scale, hp->hbins[ui]);
     }
 
-    r = fprintf(fp, "[%#10.4g,  Infinity )   |", hp->high_lim);
+    r = fprintf(fp, "[%#10.4g,   Infinity)   |",
+                origin + (double)(hp->num_bins - 2u) * hp->binsize);
     cmb_assert_release(r > 0);
     data_print_blocks(fp, scale, hp->hbins[hp->num_bins - 1u]);
+
     data_print_line(fp, symbol_thin, line_length);
 }
 
@@ -544,7 +770,7 @@ void cmi_dataset_histogram_destroy(struct cmi_dataset_histogram *hp)
 /* The external callable function to print a histogram */
 void cmb_dataset_histogram_print(const struct cmb_dataset *dsp,
                                  FILE *fp,
-                                 unsigned num_bins,
+                                 unsigned int num_bins,
                                  double low_lim,
                                  double high_lim)
 {
@@ -561,14 +787,7 @@ void cmb_dataset_histogram_print(const struct cmb_dataset *dsp,
     }
 
     if (low_lim == high_lim) {
-        /* Autoscale to dataset range */
-        low_lim = dsp->min;
-        high_lim = dsp->max;
-    }
-
-    const unsigned datarange = (unsigned)ceil(high_lim - low_lim);
-    if (datarange < num_bins) {
-        num_bins = (datarange > 0u) ? datarange : 1u;
+        cmi_dataset_histogram_autoscale(dsp, &num_bins, &low_lim, &high_lim);
     }
 
     struct cmi_dataset_histogram *hp = NULL;
@@ -583,20 +802,33 @@ void cmb_dataset_histogram_print(const struct cmb_dataset *dsp,
  * Calculate the first n autocorrelation coefficients.
  */
 void cmb_dataset_ACF(const struct cmb_dataset *dsp,
-                     const unsigned n,
+                     const unsigned int n,
                      double acf[])
 {
     cmb_assert_release(dsp != NULL);
     cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
-    cmb_assert_release(dsp->xa != NULL);
-    cmb_assert_release(dsp->count > 1);
-    cmb_assert_release((n > 0u) && (n < dsp->count));
+    cmb_assert_release(n > 0u);
+    cmb_assert_release(acf != NULL);
+
+    if (dsp->count == 0u) {
+        cmb_logger_warning(stdout, "No data for calculating ACF");
+        return;
+    }
+    else if (dsp->count == 1u) {
+        cmb_logger_warning(stdout, "Cannot calculate ACF of a single point");
+        return;
+    }
+    else if (dsp->count < n + 1) {
+        cmb_logger_warning(stdout, "Cannot calculate %u ACFs from %" PRIu64 " data points",
+                            n, dsp->count);
+        return;
+    }
 
     /* Calculate mean and variance in a single pass,
-     * similar to cmb_datasummary() above
-     */
+     * similar to cmb_datasummary() above.  */
     double m1 = 0.0;
     double m2 = 0.0;
+    cmb_assert_debug(dsp->xa != NULL);
     for (uint64_t ui = 0; ui < dsp->count; ui++) {
         const double d = dsp->xa[ui] - m1;
         const double d_n = d / ((double)(ui + 1u));
@@ -609,7 +841,7 @@ void cmb_dataset_ACF(const struct cmb_dataset *dsp,
     const double min_acf_variance = 1e-9;
     if (var < min_acf_variance) {
         /* Would be numerically unstable to divide by that */
-        cmb_logger_warning(stderr,
+        cmb_logger_warning(stdout,
                 "Dataset nearly constant (variance %g), ACFs rounded to zero",
                  var);
         for (unsigned ui = 1; ui <= n; ui++) {
@@ -623,8 +855,7 @@ void cmb_dataset_ACF(const struct cmb_dataset *dsp,
             for (uint64_t ui = 0; ui < ustop; ui++) {
                 dk += (dsp->xa[ui] - m1) * (dsp->xa[ui + ulag] - m1);
             }
-            const double acov = dk / ((double)(ustop));
-            acf[ulag] = acov / var;
+            acf[ulag] = dk / m2;
             cmb_assert_debug((acf[ulag] >= -1.0) && (acf[ulag] <= 1.0));
         }
     }
@@ -635,17 +866,32 @@ void cmb_dataset_ACF(const struct cmb_dataset *dsp,
  * Durbin-Levinson algorithm, optionally using previously calculated ACFs
  * to avoid repeating a computationally expensive step if already done once.
  */
+static const double pacf_min_variance = 1.0e-12;
+static const double pacf_tolerance = 1.0e-9;
+
 void cmb_dataset_PACF(const struct cmb_dataset *dsp,
-                      const unsigned n,
+                      const unsigned int n,
                       double pacf[],
                       double acf[])
 {
     cmb_assert_release(dsp != NULL);
     cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
-    cmb_assert_release(dsp->xa != NULL);
-    cmb_assert_release(dsp->count > 1u);
-    cmb_assert_release((n > 0u) && (n < dsp->count - 1u));
+    cmb_assert_release(n > 0u);
     cmb_assert_release(pacf != NULL);
+
+    if (dsp->count == 0u) {
+        cmb_logger_warning(stdout, "No data for calculating PACF");
+        return;
+    }
+    else if (dsp->count == 1u) {
+        cmb_logger_warning(stdout, "Cannot calculate PACF of a single point");
+        return;
+    }
+    else if (dsp->count < n + 1) {
+        cmb_logger_warning(stdout, "Cannot calculate %u PACFs from %" PRIu64 " data points",
+                            n, dsp->count);
+        return;
+    }
 
     bool free_acf = false;
     if (acf == NULL) {
@@ -655,43 +901,47 @@ void cmb_dataset_PACF(const struct cmb_dataset *dsp,
     }
 
     /* Create an intermediary un * un matrix */
-    double **phi = cmi_malloc((n + 1u) * sizeof(double *));
-    phi[0] = cmi_calloc((n + 1) * (n + 1), sizeof(double));
+    double **phi = cmi_malloc(((size_t)n + 1u) * sizeof(double *));
+    phi[0] = cmi_calloc(((size_t)n + 1u) * ((size_t)n + 1u), sizeof(double));
     for (unsigned ui = 1u; ui <= n; ui++) {
-        phi[ui] = phi[0] + ui * n;
+        phi[ui] = phi[0] + ui * (n + 1u);
     }
 
-    /* Per definition */
     pacf[0] = 1.0;
     pacf[1] = acf[1];
     phi[1][1] = pacf[1];
+    double v = 1.0 - acf[1] * acf[1];
 
-    /* Calculate phi[k][j], the j-th coefficient for a k-th order
-     * autoregression model
-     */
     for (unsigned uk = 2u; uk <= n; ++uk) {
+        if (v <= pacf_min_variance) {
+            cmb_logger_warning(stdout,
+                "Prediction variance exhausted at lag %u, "
+                "remaining coefficients set to zero", uk - 1u);
+            for (unsigned uj = uk; uj <= n; ++uj) {
+                pacf[uj] = 0.0;
+            }
+            break;
+        }
+
         double numsum = 0.0;
         for (unsigned uj = 1u; uj < uk; ++uj) {
-            numsum += phi[uk - 1][uj] * acf[uk - uj];
+            numsum += phi[uk - 1u][uj] * acf[uk - uj];
         }
 
-        double densum = 0.0;
+        double p = (acf[uk] - numsum) / v;
+
+        cmb_assert_debug((p >= -1.0 - pacf_tolerance)
+                         && (p <= 1.0 + pacf_tolerance));
+        p = fmin(1.0, fmax(-1.0, p));
+
+        phi[uk][uk] = p;
+        pacf[uk] = p;
+
         for (unsigned uj = 1u; uj < uk; ++uj) {
-            densum += phi[uk - 1][uj] * acf[uj];
+            phi[uk][uj] = phi[uk - 1u][uj] - p * phi[uk - 1u][uk - uj];
         }
 
-        /* The k-th PACF coefficient is the k-th autoregression
-         * coefficient phi[k][k]
-         */
-        phi[uk][uk] = (acf[uk] - numsum) / (1.0 - densum);
-        pacf[uk] = phi[uk][uk];
-        cmb_assert_debug((pacf[uk] >= -1.0) && (pacf[uk] <= 1.0));
-
-        /* Update everything else for the next iteration */
-        for (unsigned uj = 1u; uj < uk; ++uj) {
-            phi[uk][uj] = phi[uk - 1u][uj]
-                          - phi[uk][uk] * phi[uk - 1u][uk - uj];
-        }
+        v *= (1.0 - p * p);
     }
 
     cmi_free(phi[0]);
@@ -705,7 +955,7 @@ static void data_bar_print(FILE *fp,
                            const double acfval,
                            const uint16_t max_bar_width)
 {
-    cmb_assert_release((acfval >= -1.0) && (acfval <= 1.0));
+    cmb_assert_debug((acfval >= -1.0) && (acfval <= 1.0));
 
     const double bar_width = (double)max_bar_width * fabs(acfval);
     const uint16_t num_filled = (uint16_t)floor(bar_width);
@@ -722,35 +972,35 @@ static void data_bar_print(FILE *fp,
 
         if (rem > min_rem_plus) {
             const int r = fputc(symbol_half, fp);
-            cmb_assert_release(r == symbol_half);
+            cmb_assert_debug(r == symbol_half);
         }
         else if (rem > 0.0) {
             const int r = fputc(symbol_thin, fp);
-            cmb_assert_release(r == symbol_thin);
+            cmb_assert_debug(r == symbol_thin);
         }
         else {
             const int r = fputc(symbol_empty, fp);
-            cmb_assert_release(r == symbol_empty);
+            cmb_assert_debug(r == symbol_empty);
         }
 
         data_print_chars(fp, symbol_full, num_filled);
-        const int r = fputc(symbol_bar, fp);;
-        cmb_assert_release(r == symbol_bar);
+        const int r = fputc(symbol_bar, fp);
+        cmb_assert_debug(r == symbol_bar);
     }
     else {
         const uint16_t num_spaces = max_bar_width;
         data_print_chars(fp, symbol_empty, num_spaces);
-        int r = fputc(symbol_bar, fp);;
-        cmb_assert_release(r == symbol_bar);
+        int r = fputc(symbol_bar, fp);
+        cmb_assert_debug(r == symbol_bar);
         data_print_chars(fp, symbol_full, num_filled);
 
         if (rem > min_rem_plus) {
             r = fputc(symbol_half, fp);
-            cmb_assert_release(r == symbol_half);
+            cmb_assert_debug(r == symbol_half);
         }
         else if (rem > 0.0) {
-            r = fputc(symbol_thin, fp);;
-            cmb_assert_release(r == symbol_thin);
+            r = fputc(symbol_thin, fp);
+            cmb_assert_debug(r == symbol_thin);
         }
     }
 }
@@ -762,9 +1012,22 @@ void cmb_dataset_correlogram_print(const struct cmb_dataset *dsp,
 {
     cmb_assert_release(dsp != NULL);
     cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
-    cmb_assert_release(dsp->xa != NULL);
-    cmb_assert_release(dsp->count > 1u);
-    cmb_assert_release((n > 0u) && (n <= dsp->count));
+    cmb_assert_release(fp != NULL);
+    cmb_assert_release(n > 0u);
+
+    if (dsp->count == 0u) {
+        cmb_logger_warning(fp, "No data for correlogram");
+        return;
+    }
+    else if (dsp->count == 1u) {
+        cmb_logger_warning(fp, "Cannot plot correlogram of a single point");
+        return;
+    }
+    else if (dsp->count < n + 1) {
+        cmb_logger_warning(fp, "Cannot plot %u ACFs from %" PRIu64 " data points",
+                            n, dsp->count);
+        return;
+    }
 
     bool free_acf = false;
     if (acf == NULL) {

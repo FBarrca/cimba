@@ -1,10 +1,13 @@
 # main meson.build
 
-project('cimba', 'c',
+project('cimba', ['c'],
         version : '3.0.0',
+        meson_version : '>= 0.64',
         default_options : [
             'warning_level=3',
-            'buildtype=release'
+            'buildtype=release',
+            'c_std=c2x',
+            'cuda_std=c++17',
         ]
 )
 
@@ -19,7 +22,6 @@ cc = meson.get_compiler('c')
 common_flags = [
     '-Wno-pedantic',
     '-fno-semantic-interposition',
-    '-DNMXCSR',
 ]
 
 if host_machine.system() == 'linux'
@@ -47,20 +49,26 @@ buildtype_flags = {
     'plain'   : [],
 }
 
-# No-holds-barred optimized build: meson setup --buildtype=release -Dbenchopt=true
+# No-holds-barred optimized build: meson setup --buildtype=release -Dbenchopt=use
 benchopt_flags = [
     '-O3',
     '-DNDEBUG',
     '-DNLOGINFO',
     '-DNASSERT',
+    '-DNMXCSR',
     '-fprofile-use',
     '-fprofile-correction',
 ]
 
+# Need to generate profile before using it
 benchopt_gen_flags = [
     '-O3',
+    '-DNDEBUG',
+    '-DNLOGINFO',
+    '-DNASSERT',
+    '-DNMXCSR',
     '-fprofile-generate',
-    '-fno-omit-framepointer',
+    '-fno-omit-frame-pointer',
 ]
 
 buildtype = get_option('buildtype')
@@ -76,6 +84,10 @@ if host_machine.system() == 'linux'
     # The initial-exec model is faster than the default global-dynamic for TLS
     # access  and is safe as long as the library is loaded at program startup
     # (i.e. linked directly, not via dlopen at runtime).
+    # The NASM objects carry no GNU CET property notes, so linking Cimba on
+    # Linux clears IBT/SHSTK and runs the host process without Intel CET.
+    # Intentional, as the hand-rolled context switch isn't CET-safe, and mirrors
+    # -fcf-protection=none on Windows here.
     desired_flags += ['-ftls-model=initial-exec',
                       '-flto=auto',
                       '-fuse-linker-plugin'
@@ -118,6 +130,14 @@ subdir('include')
 subdir('codegen')
 subdir('src')
 if get_option('enable_extras')
+    cuda_dep = disabler()
+    if get_option('enable_cuda_tutorials')
+        add_languages('cuda', required : false)
+        cuda_dep = dependency('cuda', required : false, modules : ['cudart'])
+        if cuda_dep.found()
+            add_project_arguments(['-arch=sm_86', '-ccbin=/usr/bin/g++'], language : 'cuda')
+        endif
+    endif
     subdir('test')
     subdir('tutorial')
     subdir('benchmark')

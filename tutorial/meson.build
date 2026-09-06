@@ -6,7 +6,7 @@ tut_hello = executable('hello',
                          link_with : cimba_lib,
                          dependencies : [project_deps],
                          install : false,
-                         native : true
+                         native : false
 )
 
 tut_1_1 = executable('tut_1_1',
@@ -15,7 +15,7 @@ tut_1_1 = executable('tut_1_1',
                        link_with : cimba_lib,
                        dependencies : [project_deps],
                        install : false,
-                       native : true
+                       native : false
 )
 
 tut_1_2 = executable('tut_1_2',
@@ -24,7 +24,7 @@ tut_1_2 = executable('tut_1_2',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_1_3 = executable('tut_1_3',
@@ -33,7 +33,7 @@ tut_1_3 = executable('tut_1_3',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_1_4 = executable('tut_1_4',
@@ -42,7 +42,7 @@ tut_1_4 = executable('tut_1_4',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_1_5 = executable('tut_1_5',
@@ -51,7 +51,7 @@ tut_1_5 = executable('tut_1_5',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_1_6 = executable('tut_1_6',
@@ -60,7 +60,7 @@ tut_1_6 = executable('tut_1_6',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_1_7 = executable('tut_1_7',
@@ -69,7 +69,7 @@ tut_1_7 = executable('tut_1_7',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_2_1 = executable('tut_2_1',
@@ -78,7 +78,7 @@ tut_2_1 = executable('tut_2_1',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_3_1 = executable('tut_3_1',
@@ -87,7 +87,7 @@ tut_3_1 = executable('tut_3_1',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_4_1 = executable('tut_4_1',
@@ -96,7 +96,7 @@ tut_4_1 = executable('tut_4_1',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
 )
 
 tut_4_2 = executable('tut_4_2',
@@ -105,11 +105,21 @@ tut_4_2 = executable('tut_4_2',
                      link_with : cimba_lib,
                      dependencies : [project_deps],
                      install : false,
-                     native : true
+                     native : false
+)
+
+tut_4_3 = executable('tut_4_3',
+                     files('tut_4_3.c'),
+                     include_directories : [inc_api, inc_int],
+                     link_with : cimba_lib,
+                     dependencies : [project_deps],
+                     install : false,
+                     native : false
 )
 
 # Try to find HDF5, but don't fail if it's missing
 hdf5_dep = dependency('hdf5', required : false)
+
 if hdf5_dep.found()
     tut_5_1 = executable('tut_5_1',
                          files('tut_5_1.c'),
@@ -118,8 +128,51 @@ if hdf5_dep.found()
                          dependencies : [project_deps, hdf5_dep],
                          link_args : ['-lhdf5'],
                          install : false,
-                         native : true
-    )
+                         native : false)
 else
-    message('Skipping tut_5_1 because HDF5 was not found.')
+    message('Skipping tut_5_1: HDF5 not found.')
+endif
+
+if get_option('enable_cuda_tutorials') and get_option('benchopt') == 'none' \
+    and hdf5_dep.found() and cuda_dep.found()
+    cuda_inc = include_directories('/opt/cuda/include', is_system : true)
+
+    executable('tut_5_2',
+               sources : ['tut_5_2.c', 'tut_5_2.cu'],
+               include_directories : [inc_api, inc_int, cuda_inc],
+               link_with : cimba_lib,
+               dependencies : [project_deps, hdf5_dep, cuda_dep],
+               c_args : ['-fno-lto'],
+               cuda_args : ['-gencode=arch=compute_86,code=sm_86',
+                            '-gencode=arch=compute_86,code=compute_86'],
+               link_args : ['-lhdf5', '-lcudart', '-lcurand'],
+               install : false,
+               native : false)
+else
+    if not hdf5_dep.found()
+        message('Skipping tut_5_2: HDF5 not found.')
+    endif
+    if not cuda_dep.found()
+        message('Skipping tut_5_2: CUDA not found.')
+    endif
+endif
+
+
+if get_option('enable_cuda_tutorials') and get_option('benchopt') == 'none' \
+    and cuda_dep.found()
+    cuda_inc = include_directories('/opt/cuda/include', is_system : true)
+
+    executable('tut_5_3',
+               sources : ['tut_5_3.c', 'tut_5_3.cu'],
+               include_directories : [inc_api, inc_int, cuda_inc],
+               link_with : cimba_lib,
+               dependencies : [project_deps, hdf5_dep, cuda_dep],
+               c_args : ['-fno-lto'],
+               cuda_args : ['-gencode=arch=compute_86,code=sm_86',
+                            '-gencode=arch=compute_86,code=compute_86'],
+               link_args : ['-lhdf5', '-lcudart', '-lcurand'],
+               install : false,
+               native : false)
+else
+    message('Skipping tut_5_3: CUDA not found.')
 endif

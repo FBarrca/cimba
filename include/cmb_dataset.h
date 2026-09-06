@@ -30,6 +30,8 @@
 #include "cmb_assert.h"
 #include "cmb_datasummary.h"
 
+#include "cmi_memregistry.h"
+
 /** @cond */
 /* May not always get defined from math.h, but we need it here */
 #ifndef M_PI
@@ -48,13 +50,12 @@ struct cmb_dataset {
     double min;         /**< Smallest sample, initially `DBL_MAX` */
     double max;         /**< Largest sample, initially `-DBL_MAX` */
     double *xa;         /**< Pointer to the actual data array, initially `NULL` */
+    struct cmi_memregistry_item terminate;   /**< Internal use */
+    struct cmi_memregistry_item destroy;     /**< Internal use */
 };
 
 /**
  * @brief Allocate memory for a dataset.
- *
- * Remember to call a matching `cmb_dataset_destroy` when done to avoid memory
- * leakage.
  *
  * @memberof cmb_dataset
  * @return A freshly allocated dataset object.
@@ -99,6 +100,11 @@ extern uint64_t cmb_dataset_copy(struct cmb_dataset *tgt,
 /**
  * @brief  Merge datasets `s1` and `s2` into dataset `tgt`.
  *         The target may or may not be one of the two sources, but not `NULL`.
+ *         Merging a dataset with itself will double up all dataset entries.
+ *         Dataset sorting is not preserved. If needed, that needs to be done
+ *         separately on the target after the merge.
+ *         If the target previously was terminated it will be re-initialized
+ *         as an effect of this call.
  *
  * @memberof cmb_dataset
  * @param tgt Pointer to the target dataset object.
@@ -145,12 +151,13 @@ extern uint64_t cmb_dataset_add(struct cmb_dataset *dsp, double x);
  * @brief  Calculate summary statistics of the data series
  *
  * @memberof cmb_dataset
- * @param dsp Pointer to a dataset object.
- * @param dsump Pointer to a data summary object to store the results.
+ * @param dsrc  Pointer to a dataset object.
+ * @param dstgt Pointer to a data summary object to store the results. Any
+ *              content will be overwritten.
  * @return The number of data values included in the summary.
  */
-extern uint64_t cmb_dataset_summarize(const struct cmb_dataset *dsp,
-                                      struct cmb_datasummary *dsump);
+extern uint64_t cmb_dataset_summarize(const struct cmb_dataset *dsrc,
+                                      struct cmb_datasummary *dstgt);
 
 /**
  * @brief Count the number of data values.
@@ -159,7 +166,7 @@ extern uint64_t cmb_dataset_summarize(const struct cmb_dataset *dsp,
  * @param dsp Pointer to a dataset object.
  * @return The number of data values in the data set.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline uint64_t cmb_dataset_count(const struct cmb_dataset *dsp)
 {
     cmb_assert_release(dsp != NULL);
@@ -174,7 +181,7 @@ static inline uint64_t cmb_dataset_count(const struct cmb_dataset *dsp)
  * @param dsp Pointer to a dataset object.
  * @return The minimum data value in the data set, `DBL_MAX` if no data yet.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_dataset_min(const struct cmb_dataset *dsp)
 {
     cmb_assert_release(dsp != NULL);
@@ -189,7 +196,7 @@ static inline double cmb_dataset_min(const struct cmb_dataset *dsp)
  * @param dsp Pointer to a dataset object.
  * @return The maximum data value in the data set, `-DBL_MAX` if no data yet.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_dataset_max(const struct cmb_dataset *dsp)
 {
     cmb_assert_release(dsp != NULL);

@@ -38,6 +38,8 @@
 #include "cmb_dataset.h"
 #include "cmb_wtdsummary.h"
 
+#include "cmi_memregistry.h"
+
 /**
  * @brief A time series with a conveniently resizing sample array. The parent
  *        class `cmb_dataset` provides the `xa` array.
@@ -50,9 +52,6 @@ struct cmb_timeseries {
 
 /**
  * @brief Allocate memory for a time series.
- *
- * Remember to call a matching `cmb_timeseries_destroy` when done to avoid
- * memory leakage.
  *
  * @memberof cmb_timeseries
  * @return A freshly allocated time series object.
@@ -160,15 +159,18 @@ extern void cmb_timeseries_sort_x(struct cmb_timeseries *tsp);
 extern void cmb_timeseries_sort_t(struct cmb_timeseries *tsp);
 
 /**
- * @brief  Calculate summary statistics of the time series.
+ * @brief  Calculate summary statistics of the time series. The last value in
+ *         the time series is a still open interval, will not be included in the
+ *         summary unless `cmb_timeseries_finalize()` is called to set its end time.
  *
  * @memberof cmb_timeseries
- * @param tsp Pointer to a time series object.
- * @param wsp Pointer to a weighted data summary object.
+ * @param tsrc Pointer to a time series object.
+ * @param wtgt Pointer to a weighted data summary object. Any content will be
+ *             overwritten.
  * @return The number of data points in the summary.
  */
-extern uint64_t cmb_timeseries_summarize(const struct cmb_timeseries *tsp,
-                                         struct cmb_wtdsummary *wsp);
+extern uint64_t cmb_timeseries_summarize(const struct cmb_timeseries *tsrc,
+                                         struct cmb_wtdsummary *wtgt);
 
 /**
  * @brief  Count the number of samples in the time series.
@@ -177,7 +179,7 @@ extern uint64_t cmb_timeseries_summarize(const struct cmb_timeseries *tsp,
  * @param tsp Pointer to a time series object.
  * @return The number of samples in the time series.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline uint64_t cmb_timeseries_count(const struct cmb_timeseries *tsp)
 {
     cmb_assert_release(tsp != NULL);
@@ -192,7 +194,7 @@ static inline uint64_t cmb_timeseries_count(const struct cmb_timeseries *tsp)
  * @param tsp Pointer to a time series object.
  * @return The smallest sample (x) value in the time series.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_timeseries_min(const struct cmb_timeseries *tsp)
 {
     cmb_assert_release(tsp != NULL);
@@ -207,7 +209,7 @@ static inline double cmb_timeseries_min(const struct cmb_timeseries *tsp)
  * @param tsp Pointer to a time series object.
  * @return The largest sample (x) value in the time series.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_timeseries_max(const struct cmb_timeseries *tsp)
 {
     cmb_assert_release(tsp != NULL);
@@ -263,7 +265,7 @@ extern void cmb_timeseries_fivenum_print(const struct cmb_timeseries *tsp,
  */
 extern void cmb_timeseries_histogram_print(const struct cmb_timeseries *tsp,
                                            FILE *fp,
-                                           uint16_t num_bins,
+                                           unsigned int num_bins,
                                            double low_lim,
                                            double high_lim);
 
@@ -286,7 +288,7 @@ extern void cmb_timeseries_print(const struct cmb_timeseries *tsp, FILE *fp);
  * @param n The number of coefficients to calculate.
  * @param acf The array to store the autocorrelation coefficients, size n + 1
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline void cmb_timeseries_ACF(const struct cmb_timeseries *tsp,
                                       const uint16_t n,
                                       double *acf)
@@ -311,7 +313,7 @@ static inline void cmb_timeseries_ACF(const struct cmb_timeseries *tsp,
  * @param pacf The array to store the partial autocorrelation coefficients, size n + 1.
  * @param acf Array of autocorrelation coefficients, if already available, size n + 1.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline void cmb_timeseries_PACF(const struct cmb_timeseries *tsp,
                                        const uint16_t n,
                                        double *pacf,
@@ -339,7 +341,7 @@ static inline void cmb_timeseries_PACF(const struct cmb_timeseries *tsp,
  * @param acf Array of (partial) autocorrelation coefficients, if already
  *            available, size n + 1.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline void cmb_timeseries_correlogram_print(const struct cmb_timeseries *tsp,
                                                     FILE *fp,
                                                     const uint16_t n,

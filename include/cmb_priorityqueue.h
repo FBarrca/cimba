@@ -33,6 +33,7 @@
 #include "cmb_timeseries.h"
 
 #include "cmi_hashheap.h"
+#include "cmi_memregistry.h"
 #include "cmi_resourcebase.h"
 
 /**
@@ -43,13 +44,14 @@
  *        consumers wait. Objects will be retrieved in priority order.
  */
 struct cmb_priorityqueue {
-    struct cmi_resourcebase core;           /**< The virtual base class */
-    struct cmb_resourceguard front_guard;   /**< Front waiting room for getters */
-    struct cmb_resourceguard rear_guard;    /**< Rear waiting room for putters */
-    struct cmi_hashheap queue;              /**< The actual priority queue */
-    uint64_t capacity;                      /**< The maximum size, possibly `CMB_UNLIMITED` */
-    bool is_recording;                      /**< Is it recording its history? */
-    struct cmb_timeseries history;          /**< History of queue lengths */
+    struct cmi_resourcebase base;            /**< The virtual base class */
+    struct cmb_resourceguard front_guard;    /**< Front waiting room for getters */
+    struct cmb_resourceguard rear_guard;     /**< Rear waiting room for putters */
+    struct cmi_hashheap queue;               /**< The actual priority queue */
+    uint64_t capacity;                       /**< The maximum size, possibly `CMB_UNLIMITED` */
+    bool is_recording;                       /**< Is it recording its history? */
+    struct cmb_timeseries history;           /**< History of queue lengths */
+    struct cmi_memregistry_item destroy;     /**< Internal use */
 };
 
 /**
@@ -148,7 +150,7 @@ extern uint64_t cmb_priorityqueue_position(struct cmb_priorityqueue *pqp,
  * @param handle Handle of the object to reprioritize
  * @return true if found, false if not
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline bool cmb_priorityqueue_cancel(struct cmb_priorityqueue *pqp,
                                             const uint64_t handle)
 {
@@ -168,7 +170,7 @@ static inline bool cmb_priorityqueue_cancel(struct cmb_priorityqueue *pqp,
  * @param handle Handle of the object to reprioritize
  * @param priority New priority for the object
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline void cmb_priorityqueue_reprioritize(struct cmb_priorityqueue *pqp,
                                                   const uint64_t handle,
                                                   const int64_t priority)
@@ -186,7 +188,7 @@ static inline void cmb_priorityqueue_reprioritize(struct cmb_priorityqueue *pqp,
  * @param pqp Pointer to an object queue
  * @return A null-terminated string containing the name of the object queue.
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline const char *cmb_priorityqueue_name(struct cmb_priorityqueue *pqp)
 {
     cmb_assert_debug(pqp != NULL);
@@ -204,7 +206,7 @@ static inline const char *cmb_priorityqueue_name(struct cmb_priorityqueue *pqp)
  * @param pqp Pointer to an object queue
  * @return The current queue length
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline uint64_t cmb_priorityqueue_length(struct cmb_priorityqueue *pqp)
 {
     cmb_assert_debug(pqp != NULL);
@@ -220,7 +222,7 @@ static inline uint64_t cmb_priorityqueue_length(struct cmb_priorityqueue *pqp)
  * @param pqp Pointer to an object queue
  * @return The available space in the queue
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline uint64_t cmb_priorityqueue_space(struct cmb_priorityqueue *pqp)
 {
     cmb_assert_release(pqp != NULL);

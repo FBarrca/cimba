@@ -16,18 +16,32 @@
  * limitations under the License.
  */
 
-#include <stdbool.h>
+
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "cmb_assert.h"
 #include "cmi_coroutine.h"
 #include "cmi_config.h"
 #include "cmi_mempool.h"
 #include "cmi_memutils.h"
+#include "cmi_sanitizer.h"
+#include "cmi_thread.h"
 
 /* The main and current coroutine pointers */
-CMB_THREAD_LOCAL struct cmi_coroutine *coroutine_main = NULL;
-CMB_THREAD_LOCAL struct cmi_coroutine *coroutine_current = NULL;
+static CMB_THREAD_LOCAL struct cmi_coroutine *coroutine_main = NULL;
+static CMB_THREAD_LOCAL struct cmi_coroutine *coroutine_current = NULL;
+
+/* Thread local mempool of recycled coroutine objects */
+static CMB_THREAD_LOCAL struct cmi_mempool coroutine_pool
+    = CMI_MEMPOOL_STATIC_INIT(sizeof(struct cmi_coroutine), 16u);
+
+/* Backing storage for the per-thread main coroutine. In TLS so it is
+ * reclaimed when the worker thread exits. */
+static CMB_THREAD_LOCAL struct cmi_coroutine coroutine_main_storage;
+
+/* Registry of active coroutines to ensure that all get freed even on error */
+static CMB_THREAD_LOCAL struct cmi_coroutine *coroutine_registry = NULL;
 
 /* Assembly function supplied by the active architecture port. */
 extern void *cmi_coroutine_context_switch_raw(void **old,
@@ -49,12 +63,13 @@ extern void *cmi_coroutine_context_switch(void **old, void **new, void *ret);
 #endif
 
 /* OS-specific C code, see src/arch/cmi_coroutine_context_*.c */
-extern bool cmi_coroutine_stack_valid(const struct cmi_coroutine *cp);
-extern void cmi_coroutine_context_init(struct cmi_coroutine *cp);
 
-/*
- * System dependent functions in port/x86-64/.../cmi_coroutine_context.c
- */
+/* Stack sanity check for use in asserts */
+extern bool cmi_coroutine_stack_valid(const struct cmi_coroutine *cp);
+/* Register (e.g., MXCSR) sanity check */
+extern bool cmi_coroutine_registers_valid(const struct cmi_coroutine *cp);
+/* Initialize a new stack with necessary stack frame */
+extern void cmi_coroutine_context_init(struct cmi_coroutine *cp);
 /* Get the stack base pointer (top of stack, grows downwards) */
 extern unsigned char *cmi_coroutine_stackbase(void);
 /* Get the stack limit pointer (bottom of stack) */
@@ -62,11 +77,46 @@ extern unsigned char *cmi_coroutine_stacklimit(void);
 /* Get the raw memory address of the stack bottom */
 extern unsigned char *cmi_coroutine_stackraw(void);
 /* Allocate memory suitable for a stack */
-extern unsigned char *cmi_coroutine_stack_alloc(size_t size,
+extern unsigned char *cmi_coroutine_stack_alloc(size_t size_req,
                                                 unsigned char **base,
                                                 unsigned char **limit);
 /* Free memory previously allocated for a stack */
-extern void cmi_coroutine_stack_free(unsigned char *stack);
+extern void cmi_coroutine_stack_free(unsigned char *stack_raw, size_t size);
+/* Clean up any system-specific stack pool allocations */
+extern void cmi_coroutine_stack_cleanup(void);
+
+
+/* Helper functions for maintaining the coroutine registry */
+static void coroutine_registry_add(struct cmi_coroutine *cp)
+{
+    cp->reg_prev = NULL;
+    cp->reg_next = coroutine_registry;
+    if (coroutine_registry != NULL) {
+        coroutine_registry->reg_prev = cp;
+    }
+    else {
+        /* Register the cleanup before exiting program */
+        if (cmi_thread_in_main()) {
+            cmi_call_once(&cmg_atexit_armed, cmi_thread_arm_atexit_cleanup);
+        }
+    }
+
+    coroutine_registry = cp;
+}
+
+static void coroutine_registry_remove(struct cmi_coroutine *cp)
+{
+    if (cp->reg_prev != NULL) {
+        cp->reg_prev->reg_next = cp->reg_next;
+    }
+    else {
+        coroutine_registry = cp->reg_next;
+    }
+
+    if (cp->reg_next != NULL) {
+        cp->reg_next->reg_prev = cp->reg_prev;
+    }
+}
 
 /*
  * create_main - Helper function to set up the dummy main coroutine
@@ -75,8 +125,8 @@ static void create_main(void)
 {
     cmb_assert_debug(coroutine_main == NULL);
 
-    /* Allocate the coroutine struct, no parent or caller */
-    coroutine_main = cmi_malloc(sizeof(*coroutine_main));
+    /* Store the coroutine struct in TLS, no parent or caller */
+    coroutine_main = &coroutine_main_storage;
     coroutine_main->parent = NULL;
     coroutine_main->caller = NULL;
 
@@ -91,6 +141,7 @@ static void create_main(void)
     /* I am running, therefore, I am */
     coroutine_main->status = CMI_COROUTINE_RUNNING;
     coroutine_main->exit_value = NULL;
+    coroutine_main->tsan_fiber = cmi_tsan_get_current_fiber();
     coroutine_current = coroutine_main;
 }
 
@@ -99,8 +150,11 @@ static void create_main(void)
  */
 struct cmi_coroutine *cmi_coroutine_create(void)
 {
-    struct cmi_coroutine *cp = cmi_malloc(sizeof(*cp));
+    struct cmi_coroutine *cp = cmi_mempool_alloc(&coroutine_pool);
     cmi_memset(cp, 0, sizeof(*cp));
+    cp->status = CMI_COROUTINE_UNINITIALIZED;
+    /* In case we ever need to run a thread cleanup handler on this */
+    cp->pool_allocated = true;
 
     return cp;
 }
@@ -109,11 +163,15 @@ struct cmi_coroutine *cmi_coroutine_create(void)
  * cmi_coroutine_initialize - Create a stack context for the coroutine
  */
 void cmi_coroutine_initialize(struct cmi_coroutine *cp,
-                        cmi_coroutine_func *crfunction,
-                        void *context,
-                        cmi_coroutine_exit_func *crexit,
-                        const size_t stack_size)
+                              cmi_coroutine_func *crfunction,
+                              void *context,
+                              cmi_coroutine_exit_func *crexit,
+                              size_t stack_size)
 {
+    cmb_assert_debug(cp != NULL);
+    cmb_assert_debug(crfunction != NULL);
+    /* Might get raw memory with random content, cannot assert _UNINITIALIZED */
+
     /* Create a dummy main coroutine if not already existing */
     if (coroutine_main == NULL) {
         create_main();
@@ -124,15 +182,22 @@ void cmi_coroutine_initialize(struct cmi_coroutine *cp,
     /* Initialize the coroutine struct and allocate the stack */
     cp->parent = NULL;
     cp->caller = NULL;
+    if (stack_size == 0u) {
+        stack_size = CMI_COROUTINE_DEFAULT_STACKSIZE;
+    }
     cp->stack = cmi_coroutine_stack_alloc(stack_size, &(cp->stack_base), &(cp->stack_limit));
+    cp->stack_size = stack_size;
     /* Will be set on first transfer */
     cp->stack_pointer = NULL;
 
-    cp->status = CMI_COROUTINE_CREATED;
+    cp->status = CMI_COROUTINE_INITIALIZED;
     cp->cr_function = crfunction;
     cp->context = context;
     cp->cr_exit = crexit;
     cp->exit_value = NULL;
+    cp->tsan_fiber = cmi_tsan_create_fiber();
+
+    coroutine_registry_add(cp);
 }
 
 /*
@@ -144,8 +209,13 @@ void cmi_coroutine_reset(struct cmi_coroutine *cp)
     cmb_assert_release(cp != NULL);
     cmb_assert_debug(cp != coroutine_main);
     cmb_assert_debug(cp != coroutine_current);
+    cmb_assert_debug(cp->status != CMI_COROUTINE_UNINITIALIZED);
 
-    cp->status = CMI_COROUTINE_CREATED;
+    /* Force TSan to reset its shadow stack, if used */
+    cmi_tsan_destroy_fiber(cp->tsan_fiber);
+    cp->tsan_fiber = cmi_tsan_create_fiber();
+
+    cp->status = CMI_COROUTINE_INITIALIZED;
     cp->exit_value = NULL;
 }
 
@@ -157,15 +227,24 @@ void cmi_coroutine_terminate(struct cmi_coroutine *cp)
     cmb_assert_release(cp != NULL);
     cmb_assert_debug(cp != coroutine_main);
     cmb_assert_debug(cp != coroutine_current);
+    cmb_assert_debug(cp->status != CMI_COROUTINE_UNINITIALIZED);
 
     cmb_assert_debug(cp->stack != NULL);
-    cmi_coroutine_stack_free(cp->stack);
+    coroutine_registry_remove(cp);
+    cmi_tsan_destroy_fiber(cp->tsan_fiber);
+    cmi_coroutine_stack_free(cp->stack, cp->stack_size);
 
+    /* Preserve the pool allocation status for any thread cleanup handling */
+    const bool pool_allocated = cp->pool_allocated;
     cmi_memset(cp, 0, sizeof(*cp));
+    cp->pool_allocated = pool_allocated;
+    cmb_assert_debug(cp->stack == NULL);
+
+    cp->status = CMI_COROUTINE_UNINITIALIZED;
 }
 
 /*
- * cmi_coroutine_destroy - Free memory allocated for a coroutine and its stack.
+ * cmi_coroutine_destroy - Free memory allocated for a coroutine.
  * The given coroutine cannot be main or the currently executing coroutine.
  */
 void cmi_coroutine_destroy(struct cmi_coroutine *cp)
@@ -173,9 +252,12 @@ void cmi_coroutine_destroy(struct cmi_coroutine *cp)
     cmb_assert_debug(cp != NULL);
     cmb_assert_debug(cp != coroutine_main);
     cmb_assert_debug(cp != coroutine_current);
+    cmb_assert_debug(cp->pool_allocated);
+    /* Please call cmi_coroutine_terminate first */
+    cmb_assert_debug(cp->status == CMI_COROUTINE_UNINITIALIZED);
 
-    cmi_free(cp);
-}
+    cmi_mempool_free(&coroutine_pool, cp);
+ }
 
 /*
  * cmi_coroutine_start - Load the given function and argument into the given
@@ -194,6 +276,7 @@ void *cmi_coroutine_start(struct cmi_coroutine *cp, void *msg)
     /* Prepare the stack for launching the coroutine function */
     cmi_coroutine_context_init(cp);
     cmb_assert_debug(cmi_coroutine_stack_valid(cp));
+    cmb_assert_debug(cmi_coroutine_registers_valid(cp));
 
     /* The current coroutine now becomes both the parent and caller of cp */
     cp->parent = coroutine_current;
@@ -227,6 +310,7 @@ void cmi_coroutine_exit(void *retval)
 
     struct cmi_coroutine *cp = coroutine_current;
     cmb_assert_debug(cmi_coroutine_stack_valid(cp));
+    cmb_assert_debug(cmi_coroutine_registers_valid(cp));
 
     cp->exit_value = retval;
     cp->status = CMI_COROUTINE_FINISHED;
@@ -243,6 +327,7 @@ void cmi_coroutine_stop(struct cmi_coroutine *cp, void *retval)
     cmb_assert_release(cp != NULL);
     cmb_assert_release(cp->status == CMI_COROUTINE_RUNNING);
     cmb_assert_debug(cmi_coroutine_stack_valid(cp));
+    cmb_assert_debug(cmi_coroutine_registers_valid(cp));
 
     if (cp == cmi_coroutine_current()) {
         cmi_coroutine_exit(retval);
@@ -269,10 +354,12 @@ extern void *cmi_coroutine_transfer(struct cmi_coroutine *to, void *msg)
     cmb_assert_release(to != NULL);
     cmb_assert_release(to->status == CMI_COROUTINE_RUNNING);
     cmb_assert_debug(cmi_coroutine_stack_valid(to));
+    cmb_assert_debug(cmi_coroutine_registers_valid(to));
 
     struct cmi_coroutine *from = coroutine_current;
     cmb_assert_debug(from != NULL);
     cmb_assert_debug(cmi_coroutine_stack_valid(from));
+    cmb_assert_debug(cmi_coroutine_registers_valid(from));
 
     /* May pass through here on its way out from cmi_coroutine_exit */
     cmb_assert_release((from->status == CMI_COROUTINE_RUNNING)
@@ -280,12 +367,22 @@ extern void *cmi_coroutine_transfer(struct cmi_coroutine *to, void *msg)
     to->caller = from;
     coroutine_current = to;
 
+    /* Announce the fiber switch. ASan wants the destination stack bounds; if
+     * `from` has finished it will never resume, so pass NULL and ASan discards
+     * its fake stack instead of saving it. */
+    void *asan_fake = NULL;
+    cmi_asan_start_switch((from->status == CMI_COROUTINE_FINISHED) ? NULL : &asan_fake,
+                          to->stack_limit,
+                          (size_t)(to->stack_base - to->stack_limit));
+    cmi_tsan_switch_fiber(to->tsan_fiber);
+
     /* The actual context switch happens in assembly */
     void **fromstk = (void **)&(from->stack_pointer);
     void **tostk = (void **)&(to->stack_pointer);
     void *ret = cmi_coroutine_context_switch(fromstk, tostk, msg);
 
     /* Possibly much later, when control has returned here again */
+    cmi_asan_finish_switch(asan_fake);
     cmb_assert_debug(cmi_coroutine_stack_valid(to));
     cmb_assert_debug(cmi_coroutine_stack_valid(from));
 
@@ -329,4 +426,91 @@ struct cmi_coroutine *cmi_coroutine_current(void)
 struct cmi_coroutine *cmi_coroutine_main(void)
 {
     return coroutine_main;
+}
+
+/*
+ * cmi_coroutine_launch - first-entry hook. The assembly trampoline calls this
+ * as the new coroutine's R12 target. It finalizes the sanitizer fiber switch on
+ * the fresh stack and then runs the real coroutine function.
+ */
+void *cmi_coroutine_launch(struct cmi_coroutine *cp, void *arg)
+{
+    cmi_asan_finish_switch(NULL);
+    return cp->cr_function(cp, arg);
+}
+
+/*
+ * Cleanup handler to be called on thread termination,
+ * will free() all still allocated stacks in this thread
+ */
+void cmi_coroutine_thread_cleanup(void)
+{
+    /* Clean up all still existing coroutine objects */
+    while (coroutine_registry != NULL) {
+        struct cmi_coroutine *cp = coroutine_registry;
+        cmb_assert_debug(cp != cmi_coroutine_current());
+        coroutine_registry_remove(cp);
+        cmi_coroutine_stack_free(cp->stack, cp->stack_size);
+        cmi_tsan_destroy_fiber(cp->tsan_fiber);
+        if (cp->pool_allocated) {
+            cmi_mempool_free(&coroutine_pool, cp);
+        }
+    }
+
+    /* Perform any system-dependent cleanup of stack allocations */
+    cmi_coroutine_stack_cleanup();
+
+    /* Nowhere else to go */
+    coroutine_current = coroutine_main;
+}
+
+/* Install cp's stack as the OS-current stack (Windows: TEB fields; Linux: no-op) */
+extern void cmi_coroutine_os_adopt_stack(const struct cmi_coroutine *cp);
+
+/* Prepare ASAN for a sudden change of coroutine context.
+ * Argument unused now, reserved for possible future use. */
+void cmi_coroutine_recovery_prepare(void *stack_marker)
+{
+    cmb_unused(stack_marker);
+
+    if (coroutine_main == NULL || coroutine_current == coroutine_main) {
+        /* Either no coroutine has run yet on this thread, or this was called
+         * from the main coroutine. In either case, the current stack is already
+         * the main stack, no action needed. */
+        return;
+    }
+
+    cmi_asan_start_switch(NULL,
+                          coroutine_main->stack_limit,
+                          (size_t)(coroutine_main->stack_base
+                                   - coroutine_main->stack_limit));
+}
+
+/* Clean up after an abandoned trial */
+void cmi_coroutine_recovery_finalize(void *stack_marker)
+{
+    if (coroutine_main == NULL || coroutine_current == coroutine_main) {
+        /* Either no coroutine has run yet on this thread, or this was called
+         * from the main coroutine. In either case, the current stack is already
+         * the main stack, no action needed. */
+        return;
+    }
+
+    const unsigned char *limit = cmi_coroutine_stacklimit();
+    const unsigned char *mark = stack_marker;
+    if ((limit != NULL) && (mark > limit)) {
+        cmi_asan_unpoison(limit, (size_t)(mark - limit));
+    }
+
+    /* ASan: We are back, no saved state */
+    cmi_asan_finish_switch(NULL);
+
+    /* TSan: We are back on the thread's own fiber. */
+    cmi_tsan_switch_fiber(coroutine_main->tsan_fiber);
+
+    /* Restore any OS-specific  bookkeeping that longjmp skipped, e.g. TEB */
+    cmi_coroutine_os_adopt_stack(coroutine_main);
+
+    /* We should be safe now, officially declare that we are in main */
+    coroutine_current = coroutine_main;
 }

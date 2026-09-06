@@ -21,6 +21,7 @@
  * limitations under the License.
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 
 #include "cmb_logger.h"
@@ -31,41 +32,79 @@
 struct cmb_wtdsummary *cmb_wtdsummary_create(void)
 {
     struct cmb_wtdsummary *wsp = cmi_malloc(sizeof *wsp);
-    ((struct cmb_datasummary *)wsp)->cookie = CMI_UNINITIALIZED;
+    cmi_memset(wsp, 0, sizeof *wsp);
+    struct cmb_datasummary *dsp = &(wsp->ds);
+    dsp->cookie = CMI_UNINITIALIZED;
 
-    cmb_wtdsummary_initialize(wsp);
+    /* We store the memregistry item in the parent class node */
+    cmi_dlist_initialize(&(dsp->destroy.node));
+    dsp->destroy.teardown = (cmi_teardown_func *)cmb_wtdsummary_destroy;
+    dsp->destroy.object = wsp;
+    cmi_memregistry_add(&(dsp->destroy));
 
+    cmb_assert_debug(wsp->ds.cookie == CMI_UNINITIALIZED);
     return wsp;
 }
 
 void cmb_wtdsummary_initialize(struct cmb_wtdsummary *wsp)
 {
     cmb_assert_release(wsp != NULL);
+    /* Might get raw memory with random content, cannot assert _UNINITIALIZED */
 
-    cmb_datasummary_initialize((struct cmb_datasummary *)wsp);
+    /* Initializing base class creates a memregistry item. */
+    struct cmb_datasummary *dsp = &(wsp->ds);
+    cmb_datasummary_initialize(dsp);
+
+    /* The memregistry item is now pointing to cmi_dataset_terminate.
+     * Redirect it to ours (do not call cmb_logger_error in the meantime!) */
+    cmb_assert_debug(dsp->terminate.object == wsp);
+    dsp->terminate.teardown = (cmi_teardown_func *)cmb_wtdsummary_terminate;
+    /* OK, consistent now, continue own initialization */
+
     wsp->wsum = 0.0;
+
+    cmb_assert_debug(dsp->cookie == CMI_INITIALIZED);
 }
 
 void cmb_wtdsummary_reset(struct cmb_wtdsummary *wsp)
 {
     cmb_assert_release(wsp != NULL);
+    const struct cmb_datasummary *dsp = &(wsp->ds);
+    cmb_assert_release(dsp->cookie == CMI_INITIALIZED);
 
     cmb_wtdsummary_terminate(wsp);
     cmb_wtdsummary_initialize(wsp);
+
+    cmb_assert_debug(dsp->cookie == CMI_INITIALIZED);
 }
 
 void cmb_wtdsummary_terminate(struct cmb_wtdsummary *wsp)
 {
     cmb_assert_release(wsp != NULL);
+    struct cmb_datasummary *dsp = &(wsp->ds);
+    cmb_assert_release((dsp->cookie == CMI_INITIALIZED)
+                    || cmi_memregistry_is_demolishing);
 
-    cmb_datasummary_terminate((struct cmb_datasummary *)wsp);
+    if (dsp->cookie == CMI_INITIALIZED) {
+        /* Terminating the parent class will also clear the memregistry item */
+        cmb_datasummary_terminate(&(wsp->ds));
+    }
+
+    cmb_assert_debug(dsp->cookie == CMI_UNINITIALIZED);
 }
 
 void cmb_wtdsummary_destroy(struct cmb_wtdsummary *wsp)
 {
     cmb_assert_release(wsp != NULL);
+    struct cmb_datasummary *dsp = &(wsp->ds);
+    /* Call cmb_datasummary_terminate first, please */
+    cmb_assert_release(dsp->cookie == CMI_UNINITIALIZED);
 
-    cmb_wtdsummary_terminate(wsp);
+    if (!cmi_memregistry_is_demolishing) {
+        /* Destroying normally, remove from parent class register */
+        cmi_memregistry_remove(&(dsp->destroy));
+    }
+
     cmi_free(wsp);
 }
 
@@ -84,10 +123,10 @@ uint64_t cmb_wtdsummary_add(struct cmb_wtdsummary *wsp,
                             const double w)
 {
     cmb_assert_release(wsp != NULL);
-    cmb_assert_release(((struct cmb_datasummary *)wsp)->cookie == CMI_INITIALIZED);
+    cmb_assert_release(wsp->ds.cookie == CMI_INITIALIZED);
     cmb_assert_release(w >= 0.0);
 
-    struct cmb_datasummary *dsp = (struct cmb_datasummary *)wsp;
+    struct cmb_datasummary *dsp = &(wsp->ds);
     if (w == 0.0) {
         return dsp->count;
     }
@@ -150,20 +189,20 @@ uint64_t cmb_wtdsummary_add(struct cmb_wtdsummary *wsp,
  * Returns tgt->count, the number of data points in the combined summary.
  */
 uint64_t cmb_wtdsummary_merge(struct cmb_wtdsummary *tgt,
-                            const struct cmb_wtdsummary *ws1,
-                            const struct cmb_wtdsummary *ws2)
+                              const struct cmb_wtdsummary *ws1,
+                              const struct cmb_wtdsummary *ws2)
 {
     cmb_assert_release(tgt != NULL);
     cmb_assert_release(ws1 != NULL);
-    cmb_assert_release(((struct cmb_datasummary *)ws1)->cookie == CMI_INITIALIZED);
+    cmb_assert_release(ws1->ds.cookie == CMI_INITIALIZED);
     cmb_assert_release(ws2 != NULL);
-    cmb_assert_release(((struct cmb_datasummary *)ws2)->cookie == CMI_INITIALIZED);
+    cmb_assert_release(ws2->ds.cookie == CMI_INITIALIZED);
 
     struct cmb_wtdsummary tws = { 0 };
     cmb_wtdsummary_initialize(&tws);
-    struct cmb_datasummary *ts = (struct cmb_datasummary *)(&tws);
-    const struct cmb_datasummary *dsp1 = (struct cmb_datasummary *)ws1;
-    const struct cmb_datasummary *dsp2 = (struct cmb_datasummary *)ws2;
+    struct cmb_datasummary *ts = &(tws.ds);
+    const struct cmb_datasummary *dsp1 = &(ws1->ds);
+    const struct cmb_datasummary *dsp2 = &(ws2->ds);
 
     ts->count = dsp1->count + dsp2->count;
     ts->min = (dsp1->min < dsp2->min) ? dsp1->min : dsp2->min;
@@ -189,17 +228,62 @@ uint64_t cmb_wtdsummary_merge(struct cmb_wtdsummary *tgt,
                       + 6.0 * (w1 * w1 * dsp2->m2 + w2 * w2 * dsp1->m2) * d21_w_2
                       + 4.0 * (w1 * dsp2->m3 - w2 * dsp1->m3) * d21_w;
 
-    *tgt = tws;
-    return ts->count;
+    if (tgt->ds.cookie == CMI_INITIALIZED) {
+        cmb_wtdsummary_terminate(tgt);
+    }
+
+    cmb_wtdsummary_initialize(tgt);
+    tgt->wsum = tws.wsum;
+    tgt->ds.count = ts->count;
+    tgt->ds.min = ts->min;
+    tgt->ds.max = ts->max;
+    tgt->ds.m1 = ts->m1;
+    tgt->ds.m2 = ts->m2;
+    tgt->ds.m3 = ts->m3;
+    tgt->ds.m4 = ts->m4;
+    cmb_wtdsummary_terminate(&tws);
+
+    return tgt->ds.count;
 }
 
 void cmb_wtdsummary_print(const struct cmb_wtdsummary *wsp,
-                        FILE *fp,
-                        const bool lead_ins)
+                          FILE *fp,
+                          const bool lead_ins)
 {
     cmb_assert_release(wsp != NULL);
-    cmb_assert_release(((struct cmb_datasummary *)wsp)->cookie == CMI_INITIALIZED);
+    cmb_assert_release(wsp->ds.cookie == CMI_INITIALIZED);
+    cmb_assert_release(fp != NULL);
 
-    cmb_datasummary_print((struct cmb_datasummary *)wsp, fp, lead_ins);
+    const uint64_t count = cmb_wtdsummary_count(wsp);
+
+    int r = fprintf(fp, "%s%8" PRIu64, ((lead_ins) ? "N " : ""), count);
+    cmb_assert_release(r > 0);
+
+    if (count > 0u) {
+        r = fprintf(fp, "%s%#8.4g",
+                    ((lead_ins) ? "  Mean " : "\t"), cmb_wtdsummary_mean(wsp));
+        cmb_assert_release(r > 0);
+    }
+    if (count > 1u) {
+        const double var = cmb_wtdsummary_variance(wsp);
+        r = fprintf(fp, "%s%#8.4g",
+                    ((lead_ins) ? "  StdDev " : "\t"), cmb_wtdsummary_stddev(wsp));
+        cmb_assert_release(r > 0);
+        r = fprintf(fp, "%s%#8.4g",
+                    ((lead_ins) ? "  Variance " : "\t"), var);
+        cmb_assert_release(r > 0);
+    }
+    if (count > 2u) {
+        r = fprintf(fp, "%s%#8.4g",
+                    ((lead_ins) ? "  Skewness " : "\t"), cmb_wtdsummary_skewness(wsp));
+        cmb_assert_release(r > 0);
+    }
+    if (count > 3u) {
+        r = fprintf(fp, "%s%#8.4g",
+                    ((lead_ins) ? "  Kurtosis " : "\t"), cmb_wtdsummary_kurtosis(wsp));
+        cmb_assert_release(r > 0);
+    }
+
+    r = fprintf(fp, "\n");
+    cmb_assert_release(r > 0);
 }
-

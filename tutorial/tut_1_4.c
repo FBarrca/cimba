@@ -11,14 +11,20 @@ struct simulation {
 
 void end_sim(void *subject, void *object)
 {
+    cmb_unused(subject);
+    cmb_assert_debug(object != NULL);
+
     struct simulation *sim = object;
     cmb_logger_user(stdout, USERFLAG1, "--- Game Over ---");
     cmb_process_stop(sim->arr, NULL);
     cmb_process_stop(sim->srv, NULL);
 }
 
-void *arrival(struct cmb_process *me, void *ctx)
+void *arrival_proc(struct cmb_process *me, void *ctx)
 {
+    cmb_unused(me);
+    cmb_assert_debug(ctx != NULL);
+
     struct cmb_buffer *bp = ctx;
     while (true) {
         const double rate = 0.75;
@@ -32,8 +38,11 @@ void *arrival(struct cmb_process *me, void *ctx)
     }
 }
 
-void *service(struct cmb_process *me, void *ctx)
+void *service_proc(struct cmb_process *me, void *ctx)
 {
+    cmb_unused(me);
+    cmb_assert_debug(ctx != NULL);
+
     struct cmb_buffer *bp = ctx;
     while (true) {
         const double rate = 1.0;
@@ -52,8 +61,7 @@ int main(void)
     const uint64_t seed = cmb_random_hwseed();
     cmb_random_initialize(seed);
 
-    cmb_logger_flags_off(CMB_LOGGER_INFO);
-    cmb_logger_flags_off(USERFLAG1);
+    cmb_logger_flags_off(USERFLAG1 | CMB_LOGGER_INFO);
 
     cmb_event_queue_initialize(0.0);
 
@@ -63,14 +71,14 @@ int main(void)
     cmb_buffer_recording_start(sim.que);
 
     sim.arr = cmb_process_create();
-    cmb_process_initialize(sim.arr, "Arrival", arrival, sim.que, 0);
+    cmb_process_initialize(sim.arr, "Arrival", arrival_proc, sim.que, 0);
     cmb_process_start(sim.arr);
 
     sim.srv = cmb_process_create();
-    cmb_process_initialize(sim.srv, "Service", service, sim.que, 0);
+    cmb_process_initialize(sim.srv, "Server", service_proc, sim.que, 0);
     cmb_process_start(sim.srv);
 
-    cmb_event_schedule(end_sim, NULL, &sim, 1e6, 0);
+    cmb_event_schedule(end_sim, NULL, &sim, 1.0e6, 0);
     cmb_event_queue_execute();
 
     cmb_buffer_recording_stop(sim.que);
@@ -79,6 +87,8 @@ int main(void)
     struct cmb_timeseries *ts = cmb_buffer_history(sim.que);
     double pacf_arr[21];
     cmb_timeseries_PACF(ts, 20, pacf_arr, NULL);
+    printf("\nPartial autocorrelation coefficients for %s levels\n",
+            cmb_buffer_name(sim.que));
     cmb_timeseries_correlogram_print(ts, stdout, 20, pacf_arr);
 
     cmb_process_terminate(sim.srv);

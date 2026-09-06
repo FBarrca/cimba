@@ -42,6 +42,7 @@
 #ifndef CIMBA_CMB_LOGGER_H
 #define CIMBA_CMB_LOGGER_H
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -124,7 +125,7 @@ extern int cmb_logger_vfprintf(FILE *fp,
                                int line,
                                const char *fmtstr,
                                va_list args)
-                                    __attribute__((format(printf, 3, 0)));
+                                    __attribute__((format(printf, 5, 0)));
 
 /*
  * Wrapper functions for predefined message levels.
@@ -140,46 +141,50 @@ extern int cmb_logger_vfprintf(FILE *fp,
  *        Written as a macro to provide the calling function name and line
  *        number automatically.
  * @param fp File pointer, possibly `stderr`
- * @param fmtstr printf-like format string
- * @param ... Arguments to the format string.
+ * @param ... A printf-like format string, followed by the arguments to the
+ *            format string.
  */
-#define cmb_logger_fatal(fp, fmtstr, ...) \
-    cmi_logger_fatal(fp, __func__, __LINE__, fmtstr,##__VA_ARGS__)
+#define cmb_logger_fatal(fp, ...) \
+    cmi_logger_fatal(fp, __func__, __LINE__, __VA_ARGS__)
 
 /**
- * @brief Wrapper for an error message. Terminates the thread when called.
+ * @brief Wrapper for an error message. Terminates the current trial if called
+ *        from within a worker thread, continuing execution from the next trial.
+ *        Exits the program with exit code `EXIT_FAILURE` if called from outside
+ *        a worker thread.
  *        Written as a macro to provide the calling function name and line
  *        number automatically.
  * @param fp File pointer, possibly `stderr`
- * @param fmtstr printf-like format string
- * @param ... Arguments to the format string.
+ * @param ... A printf-like format string, followed by the arguments to the
+ *            format string.
  */
-#define cmb_logger_error(fp, fmtstr, ...) \
-    cmi_logger_error(fp, __func__, __LINE__, fmtstr, ##__VA_ARGS__)
+#define cmb_logger_error(fp, ...) \
+    cmi_logger_error(fp, __func__, __LINE__, __VA_ARGS__)
 
 /**
- * @brief Wrapper for a warning message. Written as a macro to provide the
- *        calling function name and line number automatically.
+ * @brief Wrapper for a warning message. Does not stop program execution.
+ *        Written as a macro to provide the calling function name and line
+ *        number automatically.
  * @param fp File pointer, possibly `stdout` or `stderr`
- * @param fmtstr printf-like format string
- * @param ... Arguments to the format string.
+ * @param ... A printf-like format string, followed by the arguments to the
+ *            format string.
  */
-#define cmb_logger_warning(fp, fmtstr, ...) \
-    cmi_logger_warning(fp, __func__, __LINE__, fmtstr, ##__VA_ARGS__)
+#define cmb_logger_warning(fp, ...) \
+    cmi_logger_warning(fp, __func__, __LINE__, __VA_ARGS__)
 
 /**
  * @brief Wrapper for an information message. Written as a macro to provide the
  *        calling function name and line number automatically. Goes away entirely
  *        if compiled with -DNLOGINFO (like assert() and -DNDEBUG)
  * @param fp File pointer, possibly `stdout`
- * @param fmtstr printf-like format string
- * @param ... Arguments to the format string.
+ * @param ... A printf-like format string, followed by the arguments to the
+ *            format string.
  */
 #ifndef NLOGINFO
-  #define cmb_logger_info(fp, fmtstr, ...) \
-    cmi_logger_info(fp, __func__, __LINE__, fmtstr, ##__VA_ARGS__)
+  #define cmb_logger_info(fp, ...) \
+    cmi_logger_info(fp, __func__, __LINE__, __VA_ARGS__)
 #else
-  #define cmb_logger_info(fp, fmtstr, ...) ((void)(0))
+  #define cmb_logger_info(fp, ...) ((void)(0))
 #endif
 
 /**
@@ -189,27 +194,29 @@ extern int cmb_logger_vfprintf(FILE *fp,
  * @param flags The user-defined logging bitmask for this logging call, to be
  *              matched against the current logging bitmask. If bitwise `and` is
  *              non-zero, this will be printed.
- * @param fmtstr printf-like format string
- * @param ... Arguments to the format string.
+ * @param ... A printf-like format string, followed by the arguments to the
+ *            format string.
  */
-#define cmb_logger_user(fp, flags, fmtstr, ...) \
-    cmi_logger_user(fp, flags, __func__, __LINE__, fmtstr, ##__VA_ARGS__)
+#define cmb_logger_user(fp, flags, ...) \
+    cmi_logger_user(fp, flags, __func__, __LINE__, __VA_ARGS__)
 
 /** @cond */
 /* The trial index is maintained by the worker threads in cimba.c, we use it in logging messages */
 extern CMB_THREAD_LOCAL uint64_t cmi_logger_trial_idx;
 
 /* Actual functions wrapped by the macros above */
-extern void cmi_logger_fatal(FILE *fp, const char *func, int line, char *fmtstr, ...)
-                      __attribute__((noreturn, format(printf,4,5)));
-extern void cmi_logger_error(FILE *fp, const char *func, int line, char *fmtstr, ...)
-                      __attribute__((noreturn, format(printf,4,5)));
-extern void cmi_logger_warning(FILE *fp, const char *func, int line, char *fmtstr, ...)
-                      __attribute__((format(printf,4,5)));
-extern void cmi_logger_info(FILE *fp, const char *func, int line, char *fmtstr, ...)
-                      __attribute__((format(printf,4,5)));
-extern void cmi_logger_user(FILE *fp, uint32_t flags, const char *func, int line, char *fmtstr, ...)
-                      __attribute__((format(printf,5,6)));
+CMB_NORETURN
+extern void cmi_logger_fatal(FILE *fp, const char *func, int line, const char *fmtstr, ...)
+                            CMB_ATTR_PRINTF(4, 5);
+CMB_NORETURN
+extern void cmi_logger_error(FILE *fp, const char *func, int line, const char *fmtstr, ...)
+                            CMB_ATTR_PRINTF(4, 5);
+extern void cmi_logger_warning(FILE *fp, const char *func, int line, const char *fmtstr, ...)
+                            CMB_ATTR_PRINTF(4, 5);
+extern void cmi_logger_info(FILE *fp, const char *func, int line, const char *fmtstr, ...)
+                            CMB_ATTR_PRINTF(4, 5);
+extern void cmi_logger_user(FILE *fp, uint32_t flags, const char *func, int line, const char *fmtstr, ...)
+                            CMB_ATTR_PRINTF(5, 6);
 /** @endcond */
 
 #endif /* CIMBA_CMB_LOGGER_H */

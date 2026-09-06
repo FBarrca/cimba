@@ -1,6 +1,7 @@
 /*
- * cmi_config.h - preprocessor macros to identify architecture, compiler, and
- *                operating system, defining macros for portability.
+ * cmi_config.h - identify architecture, compiler, and operating system, and
+ *                provide portable spellings of the compiler features used in
+ *                the public headers.
  *
  * Copyright (c) Asbjørn M. Bonvik 1994, 1995, 2025-26.
  *
@@ -21,21 +22,31 @@
 #define CIMBA_CMI_CONFIG_H
 
 /*
- * Identify the processor architecture.
+ * Supported toolchains:
+ *   - Architecture:     x86-64 / AMD64, Apple Silicon arm64
+ *   - Operating system: Linux, macOS, Windows (MinGW-w64 or clang-cl)
+ *   - Compiler:         GCC or Clang, C11 or later
+ *                       (the library itself is built as C23)
+ *
+ * In particular, MSVC is not supported.
+ */
+
+/*
+ * Identify the processor architecture. Supports x86-64 and arm64.
  */
 #define CMI_AMD64 1
 #define CMI_ARM64 2
 #if (defined (__amd64__) || defined (__amd64) || defined (__x86_64__) || \
      defined (__x86_64) || defined (_M_X64) || defined (_M_AMD64))
   #define CMI_ARCH CMI_AMD64
-#elif defined (__aarch64__) || defined (__arm64__) || defined (_M_ARM64)
+#elif defined(__aarch64__) || defined(_M_ARM64)
   #define CMI_ARCH CMI_ARM64
 #else
   #error "Platform architecture not yet supported."
 #endif
 
 /*
- * Identify the operating system.
+ * Identify the operating system. Supports Linux, Windows, and macOS.
  */
 #define CMI_LINUX 1
 #define CMI_WINDOWS 2
@@ -44,48 +55,88 @@
   #define CMI_OS CMI_LINUX
 #elif defined (_WIN64) || defined (_WIN32) || defined (__WIN32__)
   #define CMI_OS CMI_WINDOWS
-#elif defined (__APPLE__) && defined (__MACH__)
+#elif defined(__APPLE__) && defined(__MACH__)
   #define CMI_OS CMI_MACOS
 #else
   #error "Platform operating system not yet supported."
 #endif
 
 /*
- * Identify the compiler. So far, only GCC and Clang are supported.
- * Test for Clang first, in case it defines __GNUC__ for compatibility reasons.
+ * Identify the compiler. Only GCC and Clang are supported (on Windows, through
+ * MinGW-w64); MSVC is not. Test for Clang first, in case it defines __GNUC__
+ * for compatibility reasons.
  */
 #define CMI_GCC 1
 #define CMI_CLANG 2
-#define CMI_MSVC 3
 #if defined (__clang__)
   #define CMI_COMPILER CMI_CLANG
 #elif defined (__GNUC__)
   #define CMI_COMPILER CMI_GCC
-#elif defined (_MSC_VER)
-  #define CMI_COMPILER CMI_MSVC
 #else
-  #error "Compiler not yet supported."
+  #if CMI_OS == CMI_WINDOWS
+    #error "Compiler not supported: build and consume Cimba with GCC or Clang (MinGW-w64 on Windows), not MSVC."
+  #else
+    #error "Compiler not supported: build and consume Cimba with GCC or Clang"
+  #endif
 #endif
 
-#if CMI_OS == CMI_LINUX && (CMI_COMPILER == CMI_GCC || CMI_COMPILER == CMI_CLANG)
+/*
+ * Require C11 or later. Cimba uses _Thread_local (C11) for per-worker state,
+ * which has no portable pre-C11 spelling, so this is a hard floor. It catches
+ * the common mistake of consuming the headers with an older -std= and reports
+ * the actual requirement rather than a confusing error from inside a header.
+ */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ < 201112L)
+  #error "Cimba requires C11 or later (uses _Thread_local)."
+#endif
+
+/*
+ * Portable spellings of the compiler features used in the public headers, so a
+ * downstream translation unit can consume the installed headers at any standard
+ * from C11 up, not only C23. These are intentionally GNU-only: the compiler
+ * gate above already restricts the toolchain to GCC/Clang, so no MSVC or
+ * generic-C fallback branch is needed (nor could one ever be reached). Each
+ * macro is a diagnostic or optimization hint only; dropping or substituting it
+ * changes neither the ABI nor any runtime behavior.
+ */
+
+/* Declares that a function never returns. Prefix the declaration:
+ *     CMB_NORETURN extern void f(void);
+ * Suppresses "unused" warnings on a static inline helper. Prefix it:
+ *     CMB_MAYBE_UNUSED static inline int g(void) { ... } */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 202311L)
+    #define CMB_NORETURN     [[noreturn]]
+    #define CMB_MAYBE_UNUSED [[maybe_unused]]
+#else
+    #define CMB_NORETURN     __attribute__((noreturn))
+    #define CMB_MAYBE_UNUSED __attribute__((unused))
+#endif
+
+/* Basename of the current source file, for assert messages. __FILE_NAME__ is a
+ * GNU extension (GCC 12+, Clang 9+); older GCC/Clang fall back to the full path
+ * in __FILE__, a cosmetic difference only. */
+#if defined(__FILE_NAME__)
+    #define CMB_FILE_NAME __FILE_NAME__
+#else
+    #define CMB_FILE_NAME __FILE__
+#endif
+
+/* Requests printf-style format checking of a variadic function. Postfix the
+ * declaration:  extern void f(const char *fmt, ...) CMB_ATTR_PRINTF(1, 2); */
+#define CMB_ATTR_PRINTF(fmt_idx, first_arg) \
+    __attribute__((format(printf, fmt_idx, first_arg)))
+
+/*
+ * Thread-local storage qualifier. _Thread_local is C11; on Linux we pin the TLS
+ * model to initial-exec for fast access from the worker threads.
+ */
+#if CMI_OS == CMI_LINUX
     #define CMB_THREAD_LOCAL _Thread_local __attribute__((tls_model("initial-exec")))
-#elif CMI_COMPILER == CMI_MSVC
-    #define CMB_THREAD_LOCAL __declspec(thread)
 #else
     #define CMB_THREAD_LOCAL _Thread_local
 #endif
 
-#if CMI_COMPILER == CMI_MSVC
-    #define CMI_MAYBE_UNUSED
-    #define CMI_NORETURN __declspec(noreturn)
-#else
-    /*
-     * AppleClang 15 accepts -std=c2x but does not yet accept the C23
-     * CMI_MAYBE_UNUSED/CMI_NORETURN spelling used by newer compilers.
-     */
-    #define CMI_MAYBE_UNUSED __attribute__((unused))
-    #define CMI_NORETURN __attribute__((noreturn))
-#endif
-
+#define CMI_NORETURN CMB_NORETURN
+#define CMI_MAYBE_UNUSED CMB_MAYBE_UNUSED
 
 #endif /* CIMBA_CMI_CONFIG_H */

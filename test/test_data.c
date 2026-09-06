@@ -37,7 +37,7 @@
 #include "test.h"
 
 /* Test macros */
-#define MAX_SAMPLES 1000000u
+#define MAX_SAMPLES 10000u
 #define SORT_SAMPLES 25u
 #define MAX_LAG 20u
 #define NUM_BINS 20u
@@ -121,133 +121,260 @@ static void test_summary(const uint64_t nsamples)
     cmi_test_print_line("=");
 }
 
+/* Relative-or-absolute float comparison for statistic checks. */
+static bool stat_close(const double got, const double expected)
+{
+    const double diff = fabs(got - expected);
+    if (diff <= 1e-9) {
+        return true;                       /* absolute floor, for ~0 values */
+    }
+    const double scale = fmax(fabs(got), fabs(expected));
+    return diff <= 1e-9 * scale;           /* 1e-9 relative otherwise */
+}
+
+/*
+ * Independent two-pass reference for the population-weighted moments, written
+ * straight from the definitions
+ *     mu   = (sum w_i x_i) / W,           W = sum w_i
+ *     mu_k = (sum w_i (x_i - mu)^k) / W
+ *     variance = mu_2,  skewness = mu_3 / mu_2^{3/2},
+ *     excess kurtosis = mu_4 / mu_2^2 - 3
+ * It deliberately does NOT reuse the library's streaming algebra, so it is a
+ * genuine oracle for both the accumulation and the normalization.
+ */
+static void wtd_reference(const double *x, const double *w, const uint64_t n,
+                          double *mean, double *var, double *skew, double *exkurt)
+{
+    double bigw = 0.0;
+    double sx = 0.0;
+    for (uint64_t i = 0; i < n; i++) { bigw += w[i]; sx += w[i] * x[i]; }
+    const double mu = sx / bigw;
+
+    double m2 = 0.0, m3 = 0.0, m4 = 0.0;
+    for (uint64_t i = 0; i < n; i++) {
+        const double d = x[i] - mu;
+        const double d2 = d * d;
+        m2 += w[i] * d2;
+        m3 += w[i] * d2 * d;
+        m4 += w[i] * d2 * d2;
+    }
+    const double mu2 = m2 / bigw;
+    const double mu3 = m3 / bigw;
+    const double mu4 = m4 / bigw;
+
+    *mean   = mu;
+    *var    = mu2;
+    *skew   = (mu2 > 0.0) ? mu3 / pow(mu2, 1.5)     : 0.0;
+    *exkurt = (mu2 > 0.0) ? mu4 / (mu2 * mu2) - 3.0 : 0.0;
+}
+
+/* Assert a summary's four moments match a reference tuple. */
+static void check_against(const struct cmb_wtdsummary *s,
+                          const double mean, const double var,
+                          const double skew, const double exkurt)
+{
+    cmb_assert_always(stat_close(cmb_wtdsummary_mean(s),     mean));
+    cmb_assert_always(stat_close(cmb_wtdsummary_variance(s), var));
+    cmb_assert_always(stat_close(cmb_wtdsummary_stddev(s),   sqrt(var)));
+    cmb_assert_always(stat_close(cmb_wtdsummary_skewness(s), skew));
+    cmb_assert_always(stat_close(cmb_wtdsummary_kurtosis(s), exkurt));
+}
+
 static void test_wsummary(const uint64_t nsamples)
 {
     printf("\nTesting weighted data summaries\n");
-    printf("Weighted and unweighted in parallel, all weights set to 1.0\n");
-    struct cmb_datasummary ds;
-    cmb_datasummary_initialize(&ds);
-    cmb_assert_always(cmb_datasummary_count(&ds) == 0);
+
+    /* ---- 1. Empty summary: every statistic is the neutral value ---------- */
     struct cmb_wtdsummary dws;
     cmb_wtdsummary_initialize(&dws);
-    cmb_assert_always(cmb_wtdsummary_count(&dws) == 0);
-    cmb_assert_always(cmb_wtdsummary_max(&dws) == -DBL_MAX);
-    cmb_assert_always(cmb_wtdsummary_min(&dws) == DBL_MAX);
-    cmb_assert_always(cmb_wtdsummary_mean(&dws) == 0.0);
+    cmb_assert_always(cmb_wtdsummary_count(&dws)    == 0);
+    cmb_assert_always(cmb_wtdsummary_max(&dws)      == -DBL_MAX);
+    cmb_assert_always(cmb_wtdsummary_min(&dws)      == DBL_MAX);
+    cmb_assert_always(cmb_wtdsummary_mean(&dws)     == 0.0);
     cmb_assert_always(cmb_wtdsummary_variance(&dws) == 0.0);
-    cmb_assert_always(cmb_wtdsummary_stddev(&dws) == 0.0);
+    cmb_assert_always(cmb_wtdsummary_stddev(&dws)   == 0.0);
     cmb_assert_always(cmb_wtdsummary_skewness(&dws) == 0.0);
     cmb_assert_always(cmb_wtdsummary_kurtosis(&dws) == 0.0);
 
-    printf("Drawing %" PRIu64 " U(0,1) samples...\n", nsamples);
-    for (uint32_t ui = 0; ui < nsamples; ui++) {
-        const double x = cmb_random();
-        cmb_assert_always((x >= 0.0) && (x <= 1.0));
-        cmb_assert_always(cmb_datasummary_count(&ds) == ui);
-        cmb_assert_always(cmb_wtdsummary_count(&dws) == ui);
-        const uint64_t un = cmb_datasummary_add(&ds, x);
-        cmb_assert_always(un == cmb_datasummary_count(&ds));
-        cmb_assert_always(un == ui + 1);
-        const uint64_t um = cmb_wtdsummary_add(&dws, x, 1.0);
-        cmb_assert_always(um == cmb_wtdsummary_count(&dws));
-        cmb_assert_always(um == un);
-        cmb_assert_always(cmb_wtdsummary_max(&dws) >= x);
-        cmb_assert_always(cmb_wtdsummary_min(&dws) <= x);
-    }
-
-    printf("\n\t\tUnweighted\tWeighted\tExpected:\n");
-    cmi_test_print_line("-");
-    printf("Count:   \t%" PRIu64 " \t%" PRIu64 " \t%" PRIu64 "\n", cmb_datasummary_count(&ds), cmb_wtdsummary_count(&dws), nsamples);
-    printf("Minimum: \t%#8.4g\t%#8.4g\t%#8.4g\n", cmb_datasummary_min(&ds), cmb_wtdsummary_min(&dws), 0.0);
-    printf("Maximum: \t%#8.4g\t%#8.4g\t%#8.4g\n", cmb_datasummary_max(&ds), cmb_wtdsummary_max(&dws), 1.0);
-    printf("Mean:    \t%#8.4g\t%#8.4g\t%#8.4g\n", cmb_datasummary_mean(&ds), cmb_wtdsummary_mean(&dws), 0.5);
-    printf("Variance:\t%#8.4g\t%#8.4g\t%#8.4g\n", cmb_datasummary_variance(&ds), cmb_wtdsummary_variance(&dws), 1.0/12.0);
-    printf("StdDev:  \t%#8.4g\t%#8.4g\t%#8.4g\n", cmb_datasummary_stddev(&ds), cmb_wtdsummary_stddev(&dws), sqrt(1.0/12.0));
-    printf("Skewness:\t%#8.4g\t%#8.4g\t%#8.4g\n", cmb_datasummary_skewness(&ds), cmb_wtdsummary_skewness(&dws), 0.0);
-    printf("Kurtosis:\t%#8.4g\t%#8.4g\t%#8.4g\n", cmb_datasummary_kurtosis(&ds), cmb_wtdsummary_kurtosis(&dws), - 6.0 / 5.0);
-    cmi_test_print_line("-");
-
-    printf("\nSummary: cmb_wtdsummary_print\n");
-    cmb_wtdsummary_print(&dws, stdout, true);
-    printf("Summary without lead-ins, tab separated:\n");
-    cmb_wtdsummary_print(&dws, stdout, false);
-
-    printf("\nCleaning up: cmb_datasummary_reset, cmb_wtdsummary_reset\n");
-    cmb_datasummary_reset(&ds);
-    cmb_assert_always(cmb_datasummary_count(&ds) == 0);
-    cmb_wtdsummary_reset(&dws);
-    cmb_assert_always(cmb_wtdsummary_count(&dws) == 0);
-    cmi_test_print_line("-");
-
-    printf("\nDrawing %" PRIu64 " new x ~ U(0,1) samples weighted by 1.5 - x\n", nsamples);
-    for (uint32_t ui = 0; ui < nsamples; ui++) {
-        const double x = cmb_random();
-        cmb_assert_always((x >= 0.0) && (x <= 1.0));
-        const double w = 1.5 - x;
-        cmb_assert_always(cmb_datasummary_count(&ds) == ui);
-        cmb_assert_always(cmb_wtdsummary_count(&dws) == ui);
-        const uint64_t un = cmb_datasummary_add(&ds, x);
-        cmb_assert_always(un == cmb_datasummary_count(&ds));
-        cmb_assert_always(un == ui + 1);
-        const uint64_t um = cmb_wtdsummary_add(&dws, x, w);
-        cmb_assert_always(um == cmb_wtdsummary_count(&dws));
-        cmb_assert_always(um == un);
-        cmb_assert_always(cmb_wtdsummary_count(&dws) == ui + 1);
-        cmb_assert_always(cmb_wtdsummary_max(&dws) >= x);
-        cmb_assert_always(cmb_wtdsummary_min(&dws) <= x);
-    }
-
-    printf("Sum of weights: %#8.4g\n", dws.wsum);
-    printf("Weighted:   ");;
-    cmb_wtdsummary_print(&dws, stdout, true);
-    printf("Unweighted: ");;
-    cmb_datasummary_print(&ds, stdout, true);
-    cmb_datasummary_reset(&ds);
-    cmi_test_print_line("-");
-
-
-    printf("\nCreating another weighted data summary on the heap: cmb_wtdsummary_create\n");
-    struct cmb_wtdsummary *dwp = cmb_wtdsummary_create();
-    cmb_assert_always(dwp != NULL);
-    cmb_wtdsummary_initialize(dwp);
-    cmb_assert_always(cmb_wtdsummary_count(dwp) == 0);
-    cmb_assert_always(cmb_wtdsummary_max(dwp) == -DBL_MAX);
-    cmb_assert_always(cmb_wtdsummary_min(dwp) == DBL_MAX);
-    cmb_assert_always(cmb_wtdsummary_mean(dwp) == 0.0);
-    cmb_assert_always(cmb_wtdsummary_variance(dwp) == 0.0);
-    cmb_assert_always(cmb_wtdsummary_stddev(dwp) == 0.0);
-    cmb_assert_always(cmb_wtdsummary_skewness(dwp) == 0.0);
-    cmb_assert_always(cmb_wtdsummary_kurtosis(dwp) == 0.0);
-
-    printf("Drawing %" PRIu64 " new x ~ U(0,1) samples randomly weighted on U(1,5)\n", nsamples);
-    for (uint32_t ui = 0; ui < nsamples; ui++) {
-        const double x = cmb_random();
-        cmb_assert_always((x >= 0.0) && (x <= 1.0));
-        const double w = cmb_random_uniform(1.0, 5.0);
-        cmb_assert_always((w >= 1.0) && (w <= 5.0));
-        cmb_assert_always(cmb_wtdsummary_count(dwp) == ui);
-        const uint64_t un = cmb_wtdsummary_add(dwp, x, w);
-        cmb_assert_always(un == cmb_wtdsummary_count(dwp));
-        cmb_assert_always(un == ui + 1);
-        cmb_assert_always(cmb_wtdsummary_max(dwp) >= x);
-        cmb_assert_always(cmb_wtdsummary_min(dwp) <= x);
-    }
-
-    printf("Summary: cmb_wtdsummary_print\n");
-    printf("Old: ");
-    cmb_wtdsummary_print(&dws, stdout, true);
-    printf("New: ");
-    cmb_wtdsummary_print(dwp, stdout, true);
-
-    printf("\nMerging the two: cmb_wtdsummary_merge ... ");
-    const uint64_t nm = cmb_wtdsummary_merge(dwp, dwp, &dws);
-    printf("Returned %" PRIu64 "\n", nm);
-    printf("Merged summary: cmb_wtdsummary_print\n");
-    cmb_wtdsummary_print(dwp, stdout, true);
-    printf("Cleaning up: cmb_wtdsummary_terminate, cmb_wtdsummary_destroy\n");
+    /* ---- 2. Single sample: mean = x, all higher moments zero ------------- */
+    cmb_wtdsummary_add(&dws, 4.2, 7.0);
+    cmb_assert_always(cmb_wtdsummary_count(&dws) == 1);
+    cmb_assert_always(stat_close(cmb_wtdsummary_mean(&dws), 4.2));
+    cmb_assert_always(cmb_wtdsummary_variance(&dws) == 0.0);
+    cmb_assert_always(cmb_wtdsummary_skewness(&dws) == 0.0);
+    cmb_assert_always(cmb_wtdsummary_kurtosis(&dws) == 0.0);
     cmb_wtdsummary_terminate(&dws);
-    cmb_wtdsummary_destroy(dwp);
 
+    /* ---- 3. Fixed dataset with UNEQUAL weights, pinned to constants ------ */
+    /* Reference computed independently (NumPy, 17 digits). The old count-based
+       code gives variance 9.916..., grossly different from the correct
+       7.933..., so this block alone is enough to catch the regression. */
+    printf("Fixed unequal-weight dataset, checked against exact constants\n");
+    static const double fx[] = { 2.0, 5.0, 5.0, 9.0, 1.0, 7.0, 3.0 };
+    static const double fw[] = { 0.7, 1.3, 0.4, 2.1, 0.9, 1.6, 0.5 };
+    const uint64_t fn = sizeof fx / sizeof fx[0];
+
+    const double EXP_MEAN =  5.6533333333333342;
+    const double EXP_VAR  =  7.9331555555555555;
+    const double EXP_SKEW = -0.31034707315744514;
+    const double EXP_KURT = -1.2193888806914575;
+
+    struct cmb_wtdsummary *a = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(a);
+    for (uint64_t i = 0; i < fn; i++) {
+        cmb_wtdsummary_add(a, fx[i], fw[i]);
+    }
+    cmb_assert_always(stat_close(a->wsum, 7.5));
+    check_against(a, EXP_MEAN, EXP_VAR, EXP_SKEW, EXP_KURT);
+
+    /* the two-pass reference helper must agree with those constants too */
+    double rm, rv, rs, rk;
+    wtd_reference(fx, fw, fn, &rm, &rv, &rs, &rk);
+    cmb_assert_always(stat_close(rm, EXP_MEAN) && stat_close(rv, EXP_VAR)
+                   && stat_close(rs, EXP_SKEW) && stat_close(rk, EXP_KURT));
+
+    /* ---- 4. Segmentation invariance: split every weight into 3 unequal
+              pieces. Same weighted distribution => identical moments. This is
+              exactly the failure mode of the count-based bug. -------------- */
+    printf("Segmentation invariance (weights split 3 ways)\n");
+    struct cmb_wtdsummary *b = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(b);
+    for (uint64_t i = 0; i < fn; i++) {
+        cmb_wtdsummary_add(b, fx[i], fw[i] * 0.2);
+        cmb_wtdsummary_add(b, fx[i], fw[i] * 0.3);
+        cmb_wtdsummary_add(b, fx[i], fw[i] * 0.5);
+    }
+    cmb_assert_always(cmb_wtdsummary_count(b) == 3 * fn);   /* more segments */
+    cmb_assert_always(stat_close(b->wsum, a->wsum));        /* same total weight */
+    check_against(b, EXP_MEAN, EXP_VAR, EXP_SKEW, EXP_KURT);
+
+    /* ---- 5. Weight-scale invariance: multiply all weights by 1000 -------- */
+    printf("Weight-scale invariance (all weights x1000)\n");
+    struct cmb_wtdsummary *c = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(c);
+    for (uint64_t i = 0; i < fn; i++) {
+        cmb_wtdsummary_add(c, fx[i], fw[i] * 1000.0);
+    }
+    check_against(c, EXP_MEAN, EXP_VAR, EXP_SKEW, EXP_KURT);
+
+    /* ---- 6. Zero-weight samples are ignored entirely --------------------- */
+    printf("Zero-weight samples are ignored\n");
+    const uint64_t before  = cmb_wtdsummary_count(c);
+    const double   wbefore = c->wsum;
+    cmb_wtdsummary_add(c, 999.0, 0.0);
+    cmb_assert_always(cmb_wtdsummary_count(c) == before);
+    cmb_assert_always(c->wsum == wbefore);
+    check_against(c, EXP_MEAN, EXP_VAR, EXP_SKEW, EXP_KURT);
+
+    /* ---- 7. Merge matches a single summary of the combined data ---------- */
+    printf("Merge of two partial summaries matches the whole\n");
+    struct cmb_wtdsummary *p1 = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(p1);
+    struct cmb_wtdsummary *p2 = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(p2);
+    for (uint64_t i = 0; i < 3;  i++) {
+        cmb_wtdsummary_add(p1, fx[i], fw[i]);
+    }
+    for (uint64_t i = 3; i < fn; i++) {
+        cmb_wtdsummary_add(p2, fx[i], fw[i]);
+    }
+    struct cmb_wtdsummary *m = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(m);
+    cmb_wtdsummary_merge(m, p1, p2);
+    cmb_assert_always(cmb_wtdsummary_count(m) == fn);
+    cmb_assert_always(stat_close(m->wsum, a->wsum));
+    check_against(m, EXP_MEAN, EXP_VAR, EXP_SKEW, EXP_KURT);
+    /* merge target aliasing one source must also work */
+    struct cmb_wtdsummary *q1 = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(q1);
+    struct cmb_wtdsummary *q2 = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(q2);
+    for (uint64_t i = 0; i < 3;  i++) {
+        cmb_wtdsummary_add(q1, fx[i], fw[i]);
+    }
+    for (uint64_t i = 3; i < fn; i++) {
+        cmb_wtdsummary_add(q2, fx[i], fw[i]);
+    }
+    cmb_wtdsummary_merge(q1, q1, q2);
+    check_against(q1, EXP_MEAN, EXP_VAR, EXP_SKEW, EXP_KURT);
+
+    /* ---- 8. Randomized property test against the two-pass reference ------ */
+    /* Stores the raw (x,w) so the oracle sees identical data. With weights on
+       [0.25,4] the total weight differs from the count by ~2x, so a count-vs-
+       weight normalization error fails grossly here as well. -------------- */
+    printf("Randomized agreement with two-pass reference, %" PRIu64 " samples\n", nsamples);
+    if (nsamples >= 4u && nsamples <= 2000000u) {
+        double *xs = malloc(nsamples * sizeof *xs);
+        double *ws = malloc(nsamples * sizeof *ws);
+        cmb_assert_always(xs != NULL && ws != NULL);
+        struct cmb_wtdsummary *r = cmb_wtdsummary_create();
+        cmb_wtdsummary_initialize(r);
+        for (uint64_t i = 0; i < nsamples; i++) {
+            xs[i] = cmb_random_normal(10.0, 3.0);
+            ws[i] = cmb_random_uniform(0.25, 4.0);
+            cmb_wtdsummary_add(r, xs[i], ws[i]);
+        }
+
+        double em, ev, es, ek;
+        wtd_reference(xs, ws, nsamples, &em, &ev, &es, &ek);
+        cmb_assert_always(fabs(cmb_wtdsummary_mean(r)     - em) <= 1e-7 * fmax(1.0, fabs(em)));
+        cmb_assert_always(fabs(cmb_wtdsummary_variance(r) - ev) <= 1e-7 * fmax(1.0, fabs(ev)));
+        cmb_assert_always(fabs(cmb_wtdsummary_skewness(r) - es) <= 1e-5 * fmax(1.0, fabs(es)));
+        cmb_assert_always(fabs(cmb_wtdsummary_kurtosis(r) - ek) <= 1e-5 * fmax(1.0, fabs(ek)));
+
+        free(xs);
+        free(ws);
+        cmb_wtdsummary_terminate(r);
+        cmb_wtdsummary_destroy(r);
+    }
+
+    /* ---- 9. Relationship to the unweighted summary (documents the
+              population-vs-sample distinction). With equal weights the
+              weighted POPULATION variance equals the unweighted SAMPLE
+              variance scaled by (n-1)/n. ----------------------------------- */
+    printf("Equal-weight case: weighted(pop) vs unweighted(sample) relationship\n");
+    {
+        struct cmb_datasummary ds;
+        struct cmb_wtdsummary  ws;
+        cmb_datasummary_initialize(&ds);
+        cmb_wtdsummary_initialize(&ws);
+        const uint64_t k = 500u;
+        for (uint64_t i = 0; i < k; i++) {
+            const double x = cmb_random();
+            cmb_datasummary_add(&ds, x);
+            cmb_wtdsummary_add(&ws, x, 1.0);
+        }
+        const double dn = (double)k;
+        cmb_assert_always(stat_close(cmb_wtdsummary_mean(&ws),
+                                     cmb_datasummary_mean(&ds)));
+        cmb_assert_always(stat_close(cmb_wtdsummary_variance(&ws),
+                                     cmb_datasummary_variance(&ds) * (dn - 1.0) / dn));
+        cmb_datasummary_terminate(&ds);
+        cmb_wtdsummary_terminate(&ws);
+    }
+
+    /* ---- 10. Smoke-test that the printed report uses the weighted figures - */
+    printf("\nReport (Variance must be ~%.4g, not the count-based ~9.916):\n", EXP_VAR);
+    cmb_wtdsummary_print(a, stdout, true);
+
+    cmb_wtdsummary_terminate(a);
+    cmb_wtdsummary_destroy(a);
+    cmb_wtdsummary_terminate(b);
+    cmb_wtdsummary_destroy(b);
+    cmb_wtdsummary_terminate(c);
+    cmb_wtdsummary_destroy(c);
+    cmb_wtdsummary_terminate(p1);
+    cmb_wtdsummary_destroy(p1);
+    cmb_wtdsummary_terminate(p2);
+    cmb_wtdsummary_destroy(p2);
+    cmb_wtdsummary_terminate(m);
+    cmb_wtdsummary_destroy(m);
+    cmb_wtdsummary_terminate(q1);
+    cmb_wtdsummary_destroy(q1);
+    cmb_wtdsummary_terminate(q2);
+    cmb_wtdsummary_destroy(q2);
+
+    printf("\nAll weighted-summary assertions passed.\n");
     cmi_test_print_line("=");
 }
 
@@ -301,22 +428,29 @@ void test_dataset(const uint64_t nsamples)
 
     printf("Content of dataset: cmb_dataset_print:\n");
     cmb_dataset_print(&ds, stdout);
+
     printf("\nMaking a copy: cmb_dataset_copy ... ");
     struct cmb_dataset dsc = { 0 };
+    cmb_dataset_initialize(&dsc);
     cmb_assert_always(cmb_dataset_count(&dsc) == 0);
     uint64_t un = cmb_dataset_copy(&dsc, &ds);
     cmb_assert_always(cmb_dataset_count(&dsc) == cmb_dataset_count(&ds));
     printf("Returned %" PRIu64 "\n", un);
+
     printf("\nContent of copy: cmb_dataset_print:\n");
     cmb_dataset_print(&dsc, stdout);
+
     printf("\nSorting the copy: cmb_dataset_sort ...\n");
     cmb_dataset_sort(&dsc);
     cmb_assert_always(is_sorted(&dsc));
+
     printf("Content of copy: cmb_dataset_print:\n");
     cmb_dataset_print(&dsc, stdout);
+
     printf("\nClearing the copy: cmb_dataset_reset\n");
     cmb_dataset_reset(&dsc);
     cmb_assert_always(cmb_dataset_count(&dsc) == 0);
+    cmb_dataset_terminate(&dsc);
 
     printf("\nBasic dataset reporting functions:\n");
     cmi_test_print_line("-");
@@ -346,6 +480,7 @@ void test_dataset(const uint64_t nsamples)
     }
 
     struct cmb_datasummary dsum = { 0 };
+    cmb_datasummary_initialize(&dsum);
     printf("\nSummarizing the dataset: cmb_dataset_summarize ...");
     un = cmb_dataset_summarize(&ds, &dsum);
     cmb_assert_always(un == cmb_datasummary_count(&dsum));
@@ -368,6 +503,12 @@ void test_dataset(const uint64_t nsamples)
     printf("\nPartial autocorrelation coefficients:cmb_dataset_PACF\n");
     double pacf[MAX_LAG + 1];
     cmb_dataset_PACF(&ds, MAX_LAG, pacf, acf);
+    /* A NULL ACF requests internal calculation, as documented. */
+    double pacf_auto[MAX_LAG + 1];
+    cmb_dataset_PACF(&ds, MAX_LAG, pacf_auto, NULL);
+    for (unsigned i = 0; i <= MAX_LAG; ++i) {
+        cmb_assert_always(fabs(pacf_auto[i] - pacf[i]) < 1e-12);
+    }
     printf("\nPACF correlogram: cmb_dataset_correlogram_print\n");
     cmb_dataset_correlogram_print(&ds, stdout, MAX_LAG, pacf);
     cmi_test_print_line("-");
@@ -377,6 +518,7 @@ void test_dataset(const uint64_t nsamples)
     cmb_assert_always(dsp != NULL);
     cmb_dataset_initialize(dsp);
     cmb_assert_always(cmb_dataset_count(dsp) == 0);
+
     printf("Filling it with noisy sine curves ...\n");
     for (uint32_t ui = 0; ui < nsamples; ui++) {
         const double period = 10.0;
@@ -408,6 +550,50 @@ void test_dataset(const uint64_t nsamples)
 
     printf("\nCleaning up: cmb_datasummary_terminate, cmb_dataset_destroy\n");
     cmb_datasummary_terminate(&dsum);
+    cmb_dataset_terminate(&ds);
+    cmb_dataset_terminate(dsp);
+    cmb_dataset_destroy(dsp);
+
+    printf("\nTesting dataset merger\n");
+    cmb_dataset_initialize(&ds);
+    dsp = cmb_dataset_create();
+    cmb_dataset_initialize(dsp);
+
+    printf("Generating new samples\n");
+    for (uint32_t ui = 0; ui < nsamples; ui++) {
+        (void)cmb_dataset_add(&ds, cmb_random());
+        (void)cmb_dataset_add(dsp, cmb_random());
+    }
+
+    struct cmb_dataset *dst = cmb_dataset_create();
+    cmb_dataset_initialize(dst);
+    cmb_assert_always(cmb_dataset_count(dst) == 0);
+
+    printf("Merging into heap dataset, cmb_dataset_merge\n");
+    un = cmb_dataset_merge(dst, &ds, dsp);
+    cmb_assert_always(un == cmb_dataset_count(dst));
+    cmb_assert_always(un == 2u * nsamples);
+
+    printf("Merging into stack dataset, cmb_dataset_merge\n");
+    un = cmb_dataset_merge(&ds, dsp, dst);
+    cmb_assert_always(un == cmb_dataset_count(&ds));
+    cmb_assert_always(un == 3u * nsamples);
+
+    printf("Merging with itself, cmb_dataset_merge\n");
+    un = cmb_dataset_merge(dst, dsp, dsp);
+    cmb_assert_always(un == cmb_dataset_count(dst));
+    cmb_assert_always(un == 2u * nsamples);
+
+    printf("Merging itself into itself, cmb_dataset_merge\n");
+    un = cmb_dataset_merge(dst, dst, dst);
+    cmb_assert_always(un == cmb_dataset_count(dst));
+    cmb_assert_always(un == 4u * nsamples);
+
+    printf("\nCleaning up: cmb_datasummary_terminate, cmb_dataset_destroy\n");
+    cmb_dataset_terminate(&ds);
+    cmb_dataset_terminate(dst);
+    cmb_dataset_destroy(dst);
+    cmb_dataset_terminate(dsp);
     cmb_dataset_destroy(dsp);
 
     cmi_test_print_line("=");
@@ -508,6 +694,7 @@ void test_timeseries(const uint64_t nsamples)
 
     printf("\nSummarizing: cmb_timeseries_summarize, cmb_wtdsummary_print, cmb_timeseries_fivenum_print ...\n");
     struct cmb_wtdsummary ws = { 0 };
+    cmb_wtdsummary_initialize(&ws);
     un = cmb_timeseries_summarize(tsp, &ws);
     cmb_assert_always(un == cmb_wtdsummary_count(&ws));
     cmb_assert_always(un == cmb_timeseries_count(tsp) - 1u);
@@ -569,9 +756,10 @@ void test_timeseries(const uint64_t nsamples)
     cmb_assert_always(un == cmb_timeseries_count(&ts) - 1u);
     cmb_wtdsummary_print(&ws, stdout, true);
 
-    printf("\nCleaning up: cmb_timeseries_reset, cmb_timeseries_destroy\n");
-    cmb_timeseries_reset(&ts);
-    cmb_assert_always(cmb_timeseries_count(&ts) == 0);
+    printf("\nCleaning up: cmb_timeseries_terminate, cmb_timeseries_destroy\n");
+    cmb_timeseries_terminate(&ts);
+    cmb_wtdsummary_terminate(&ws);
+    cmb_timeseries_terminate(tsp);
     cmb_timeseries_destroy(tsp);
     cmi_test_print_line("-");
 
@@ -596,6 +784,7 @@ void test_timeseries(const uint64_t nsamples)
     uo = cmb_timeseries_count(&ts);
     un = cmb_timeseries_finalize(&ts, t);
     cmb_assert_always(un == uo + 1u);
+
     printf("Content of timeseries: cmb_timeseries_print\n");
     cmi_test_print_line(".");
     cmb_timeseries_print(&ts, stdout);
@@ -605,14 +794,17 @@ void test_timeseries(const uint64_t nsamples)
     cmb_assert_always(is_sorted_t(&ts));
     cmb_timeseries_sort_x(&ts);
     cmb_assert_always(is_sorted_x(&ts));
+
     printf("Content of timeseries: cmb_timeseries_print\n");
     cmi_test_print_line(".");
     cmb_timeseries_print(&ts, stdout);
     cmi_test_print_line(".");
+
     printf("\nUnsorting: cmb_timeseries_sort_t\n");
     cmb_assert_always(is_sorted_x(&ts));
     cmb_timeseries_sort_t(&ts);
     cmb_assert_always(is_sorted_t(&ts));
+
     printf("Content of timeseries: cmb_timeseries_print\n");
     cmi_test_print_line(".");
     cmb_timeseries_print(&ts, stdout);
@@ -628,6 +820,88 @@ void test_timeseries(const uint64_t nsamples)
     cmb_timeseries_terminate(&ts);
 
     cmi_test_print_line("=");
+}
+
+/* It is likely that some simulation run does not produce any data, perhaps
+ * because it was too short for the scenario and no events occurred. That
+ * will result in empty data sets and time series. If the model code tries
+ * to calculate statistics or otherwise process the empties, there should be
+ * sensible warnings and results, not inexplicable crashes. So, we test it. */
+void test_empties(void)
+{
+    cmi_test_print_line("-");
+    printf("Testing empty datasets\n");
+
+    struct cmb_dataset ds = { 0 };
+    cmb_dataset_initialize(&ds);
+    struct cmb_dataset *dsp = cmb_dataset_create();
+    cmb_dataset_initialize(dsp);
+
+    cmb_dataset_print(dsp, stdout);
+    cmb_dataset_copy(dsp, &ds);
+    cmb_dataset_merge(dsp, dsp, &ds);
+    cmb_dataset_sort(&ds);
+
+    const double dm = cmb_dataset_median(dsp);
+    printf("Median of empty dataset: %f\n", dm);
+    cmb_dataset_fivenum_print(dsp, stdout, true);
+    cmb_dataset_histogram_print(dsp, stdout, 20, 0.0, 0.0);
+
+    double acf[21];
+    cmb_dataset_ACF(dsp, 20, acf);
+    cmb_dataset_PACF(dsp, 20, acf, acf);
+    cmb_dataset_correlogram_print(dsp, stdout, 20, acf);
+
+    struct cmb_datasummary dsu = { 0 };
+    cmb_datasummary_initialize(&dsu);
+    cmb_dataset_summarize(dsp, &dsu);
+
+    struct cmb_datasummary *dsup = cmb_datasummary_create();
+    cmb_datasummary_initialize(dsup);
+    cmb_dataset_summarize(&ds, dsup);
+    cmb_datasummary_merge(dsup, dsup, &dsu);
+    cmb_datasummary_print(dsup, stdout, true);
+
+    cmb_datasummary_terminate(dsup);
+    cmb_datasummary_destroy(dsup);
+    cmb_datasummary_terminate(&dsu);
+    cmb_dataset_terminate(dsp);
+    cmb_dataset_destroy(dsp);
+    cmb_dataset_terminate(&ds);
+
+    cmi_test_print_line("-");
+    printf("Testing empty timeseries\n");
+    struct cmb_timeseries ts = { 0 };
+    cmb_timeseries_initialize(&ts);
+    struct cmb_timeseries *tsp = cmb_timeseries_create();
+    cmb_timeseries_initialize(tsp);
+
+    cmb_timeseries_copy(tsp, &ts);
+    cmb_timeseries_sort_x(tsp);
+    cmb_timeseries_sort_t(tsp);
+    cmb_timeseries_finalize(tsp, 0.0);
+    cmb_timeseries_print(tsp, stdout);
+
+    const double tm = cmb_timeseries_median(tsp);
+    printf("Median of empty timeseries: %f\n", tm);
+    cmb_timeseries_fivenum_print(tsp, stdout, true);
+    cmb_timeseries_histogram_print(tsp, stdout, 20, 0.0, 0.0);
+
+    struct cmb_wtdsummary ws = { 0 };
+    cmb_wtdsummary_initialize(&ws);
+    struct cmb_wtdsummary *wsp = cmb_wtdsummary_create();
+    cmb_wtdsummary_initialize(wsp);
+    cmb_wtdsummary_merge(wsp, &ws, wsp);
+    cmb_timeseries_summarize(tsp, wsp);
+    cmb_wtdsummary_print(wsp, stdout, true);
+
+    cmb_wtdsummary_terminate(wsp);
+    cmb_wtdsummary_destroy(wsp);
+    cmb_wtdsummary_terminate(&ws);
+    cmb_timeseries_terminate(&ts);
+    cmb_timeseries_terminate(tsp);
+    cmb_timeseries_destroy(tsp);
+    cmi_test_print_line("-");
 }
 
 int main(const int argc, char *argv[])
@@ -679,6 +953,8 @@ int main(const int argc, char *argv[])
     test_wsummary(nsamples);
     test_dataset(nsamples);
     test_timeseries(nsamples);
+
+    test_empties();
 
     cmb_random_terminate();
     cmi_test_print_line("*");

@@ -3,6 +3,14 @@
 Tutorial: Modeling with Cimba
 =============================
 
+Over the course of five different worked examples, we will go from a simple M/M/1 queue
+simulation with just two active processes, make it run as a designed experiment
+with parallel trials, and then gradually add more powerful simulation tools such as
+resource acquisition, timers, and condition variables. We will end the tutorial by
+demonstrating how to harness CUDA kernels for massively parallel simulated physics
+inside a military simulation with hundreds of parallel trials and a thousand active
+processes inside each trial.
+
 .. _tut_1:
 
 A simple M/M/1 queue parallelized
@@ -37,8 +45,12 @@ Let us start with the arrival and service processes. The code can be very simple
 
 .. code-block:: c
 
-    void *arrival(struct cmb_process *me, void *ctx)
+    #include <cimba.h>
+
+    void *arrival_proc(struct cmb_process *me, void *ctx)
     {
+        cmb_unused(me);
+
         struct cmb_buffer *bp = ctx;
         while (true) {
             const double rate = 0.75;
@@ -50,8 +62,10 @@ Let us start with the arrival and service processes. The code can be very simple
         }
     }
 
-    void *service(struct cmb_process *me, void *ctx)
+    void *service_proc(struct cmb_process *me, void *ctx)
     {
+        cmb_unused(me);
+
         struct cmb_buffer *bp = ctx;
         while (true) {
             const double rate = 1.0;
@@ -63,23 +77,27 @@ Let us start with the arrival and service processes. The code can be very simple
         }
     }
 
-This should hopefully be quite intuitive.
+
+The first statement in each function, ``cmb_unused(me)`` just states that the
+argument ``me`` will not be used. It has no other effect than suppressing any
+compiler warnings about that.
+
 The arrivals process generates an exponentially distributed random value with
 mean 1/0.75, holds for that amount of interarrival time, puts one new customer
-into the queue, and does it again.
+into the queue, and does it again. Note that the function runs in an infinite loop.
 
 Similarly, the service process gets a customer from the queue (waiting for one to
 arrive if there are none waiting), generates a random service time with mean 1.0,
 holds for the service time, and does it all over again. An average arrival rate
-of 0.75 and service rate of 1.0 gives the 0.75 utilization we wanted.
+of 0.75 and service rate of 1.0 gives the 0.75 utilization we wanted. This function
+also runs in an infinite loop.
 
 Note that the number of customers to ``put`` or ``get`` is given as a *pointer to
 a variable* containing the number, not just a value. In more complex scenarios
 than this, the process may encounter a partially completed put or get, and we
 need a way to capture the actual state in these cases. For now, just note that
 the amount argument to :c:func:`cmb_buffer_put()` and
-:c:func:`cmb_buffer_get()` is a
-pointer to an unsigned 64-bit integer variable.
+:c:func:`cmb_buffer_get()` is a pointer to an unsigned 64-bit integer variable.
 
 The process function signature is a function returning a pointer to void (i.e. a
 raw address to anything). It takes two arguments, the first one a pointer to a
@@ -87,7 +105,7 @@ raw address to anything). It takes two arguments, the first one a pointer to a
 context the process needs to execute. For now, we only use the context pointer as a
 pointer to the queue, and do not use the ``me`` pointer or the return value.
 
-Note also that all Cimba functions used here start with ``cmb_``, indicating
+Note also that all Cimba functions used here start with ``cmb_`` indicating
 that they belong in the namespace of things in the simulated world. There are
 functions from three Cimba modules here, :c:struct:`cmb_process`, :c:struct:`cmb_buffer`,
 and :c:struct:`cmb_random`. We will encounter other namespaces and modules soon.
@@ -108,11 +126,11 @@ afterwards. Let us try this:
         cmb_buffer_initialize(que, "Queue", CMB_UNLIMITED);
 
         struct cmb_process *arr_proc = cmb_process_create();
-        cmb_process_initialize(arr_proc, "Arrival", arrival, que, 0);
+        cmb_process_initialize(arr_proc, "Arrival", arrival_proc, que, 0);
         cmb_process_start(arr_proc);
 
         struct cmb_process *serv_proc = cmb_process_create();
-        cmb_process_initialize(serv_proc, "Service", service, que, 0);
+        cmb_process_initialize(serv_proc, "Server", service_proc, que, 0);
         cmb_process_start(serv_proc);
 
         cmb_event_queue_execute();
@@ -132,14 +150,15 @@ afterwards. Let us try this:
         return 0;
     }
 
+
 The first thing it does is to get a suitable random number seed from a hardware
 entropy source and initialize our pseudo-random number generators with it.
 
-It then initializes the simulation event queue, specifying at our clock will
-start from 0.0. (It could be any other value, but why not 0.0.)
+It then initializes the simulation event queue, specifying that our clock will
+start from the value 0.0. (It could be any other value.)
 
-Next, it creates and initializes the :c:struct:`cmb_buffer`, naming it "Queue" and setting
-it to unlimited size.
+Next, it creates and initializes the :c:struct:`cmb_buffer`, naming it "Queue"
+and giving it unlimited size.
 
 After that, it creates, initializes, and starts the arrival and service processes.
 They get a pointer to the newly created :c:struct:`cmb_buffer` as their context argument,
@@ -167,56 +186,80 @@ Note that there are matching ``_terminate()`` calls for each ``_initialize()`` a
 matching ``_destroy()`` for each ``_create()``. These functions un-initialize and
 and de-allocate the objects that were allocated and initialized.
 
+Every initialized object needs to be terminated before it is destroyed. This will
+deallocate any memory that the object may have allocated during its lifetime. In
+C++ terms, the Cimba `cmb_X_terminate` function for some class `X` corresponds to
+the C++ destructor function `~X`.
+Since C does not provide the convenience of automatically calling destructors when an
+object goes out of scope, it needs to be called manually. There will also be some
+internal Cimba bookkeeping that depends on correct termination sequence to work.
+Skipping it may cause obscure errors later, such as during error handling in a
+multithreaded simulation.
+
+The `_destroy()` function deallocates the memory used by the object itself. This may be
+as simple as a wrapper to `free()`, or it may be based on an internal memory pool for
+fast allocations. It may also do internal bookkeeping, but it will not call
+`_terminate` for you, since that will still be needed separately for objects that just
+were declared as local variables and initialized there. `_destroy()` can not help you
+with that, and then it is cleaner to separate the two functions of destructor and
+deallocator everywhere.
+
+.. admonition:: Object lifecycle
+
+    The user code is responsible for managing the object lifecycle. Objects declared as
+    local variables or embedded in other objects need to be initialized and terminated
+    before going out of scope. Objects created on the heap also need to be destroyed to
+    avoid memory leakage.  These four calls, ``_create()``, ``_initialize()``,
+    ``_terminate()``, and  ``_destroy()``, must happen in the right sequence.
+    Terminating an object that has not been initialized, or destroying an object that has
+    not been terminated, will cause an error message. This rigor is necessary to provide
+    automatic recovery of memory if abandoning one trial in a multi-threaded simulation.
+
 We can now run
 `our first simulation <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_1_1.c>`_
-and see what happens. It will generate output like this:
+and see what happens. If you have configured ``meson`` with build type ``debug``, the
+program will generate output like this:
 
 .. code-block:: none
 
-    [ambonvik@Threadripper cimba]$ build/tutorial/tut_1_1 | more
-        0.0000	dispatcher	cmb_event_queue_execute (294):  Starting simulation run
-        0.0000	Arrival	cmb_process_hold (278):  Holding for 2.317172 time units
-        0.0000	Arrival	cmb_process_timer_add (343):  Scheduled timeout event at 2.317172
-        0.0000	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 0
-        0.0000	Service	cmb_buffer_get (244):  Waiting for more, level now 0
-        0.0000	Service	cmb_resourceguard_wait (149):  Waits for Queue
-        2.3172	dispatcher	wakeup_event_time (310):  Wakes Arrival signal 0
-        2.3172	Arrival	cmb_buffer_put (291):  Puts 1 into Queue, level 0
-        2.3172	Arrival	cmb_buffer_put (298):  Success, found room for 1, has 0 remaining
-        2.3172	Arrival	cmb_resourceguard_signal (219):  Scheduling wakeup event for Service
-        2.3172	Arrival	cmb_process_hold (278):  Holding for 1.262760 time units
-        2.3172	Arrival	cmb_process_timer_add (343):  Scheduled timeout event at 3.579932
-        2.3172	dispatcher	wakeup_event_resource (173):  Wakes Service signal 0
-        2.3172	Service	cmb_buffer_get (251):  Returned successfully from wait
-        2.3172	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 1
-        2.3172	Service	cmb_buffer_get (214):  Success, 1 was available, got 1
-        2.3172	Service	cmb_process_hold (278):  Holding for 0.313617 time units
-        2.3172	Service	cmb_process_timer_add (343):  Scheduled timeout event at 2.630789
-        2.6308	dispatcher	wakeup_event_time (310):  Wakes Service signal 0
-        2.6308	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 0
-        2.6308	Service	cmb_buffer_get (244):  Waiting for more, level now 0
-        2.6308	Service	cmb_resourceguard_wait (149):  Waits for Queue
-        3.5799	dispatcher	wakeup_event_time (310):  Wakes Arrival signal 0
-        3.5799	Arrival	cmb_buffer_put (291):  Puts 1 into Queue, level 0
-        3.5799	Arrival	cmb_buffer_put (298):  Success, found room for 1, has 0 remaining
-        3.5799	Arrival	cmb_resourceguard_signal (219):  Scheduling wakeup event for Service
-        3.5799	Arrival	cmb_process_hold (278):  Holding for 1.859304 time units
-        3.5799	Arrival	cmb_process_timer_add (343):  Scheduled timeout event at 5.439236
-        3.5799	dispatcher	wakeup_event_resource (173):  Wakes Service signal 0
-        3.5799	Service	cmb_buffer_get (251):  Returned successfully from wait
-        3.5799	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 1
-        3.5799	Service	cmb_buffer_get (214):  Success, 1 was available, got 1
-        3.5799	Service	cmb_process_hold (278):  Holding for 0.079210 time units
-        3.5799	Service	cmb_process_timer_add (343):  Scheduled timeout event at 3.659142
-        3.6591	dispatcher	wakeup_event_time (310):  Wakes Service signal 0
-        3.6591	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 0
-        3.6591	Service	cmb_buffer_get (244):  Waiting for more, level now 0
-        3.6591	Service	cmb_resourceguard_wait (149):  Waits for Queue
-        5.4392	dispatcher	wakeup_event_time (310):  Wakes Arrival signal 0
-        5.4392	Arrival	cmb_buffer_put (291):  Puts 1 into Queue, level 0
-        5.4392	Arrival	cmb_buffer_put (298):  Success, found room for 1, has 0 remaining
-        5.4392	Arrival	cmb_resourceguard_signal (219):  Scheduling wakeup event for Service
-        5.4392	Arrival	cmb_process_hold (278):  Holding for 0.473225 time units
+    [ambonvik@Threadripper tutorial]$ ./tut_1_1 | more
+        0.0000	dispatcher	cmb_event_queue_execute (406):  Starting simulation run
+        0.0000	Arrival	cmb_process_hold (459):  Holding for 0.352716 time units
+        0.0000	Arrival	cmb_process_timer_add (531):  Scheduled timeout event at 0.352716
+        0.0000	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 0
+        0.0000	Server	cmb_buffer_get (282):  Waiting for more, level now 0
+        0.0000	Server	cmb_resourceguard_wait (158):  Waits for Queue
+       0.35272	Arrival	cmb_buffer_put (329):  Puts 1 into Queue, level 0
+       0.35272	Arrival	cmb_buffer_put (336):  Success, found room for 1, has 0 remaining
+       0.35272	Arrival	cmb_resourceguard_signal (277):  Scheduling wakeup event for Server
+       0.35272	Arrival	cmb_process_hold (459):  Holding for 0.872962 time units
+       0.35272	Arrival	cmb_process_timer_add (531):  Scheduled timeout event at 1.225678
+       0.35272	Server	cmb_buffer_get (289):  Returned successfully from wait
+       0.35272	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 1
+       0.35272	Server	cmb_buffer_get (252):  Success, 1 was available, got 1
+       0.35272	Server	cmb_process_hold (459):  Holding for 0.446180 time units
+       0.35272	Server	cmb_process_timer_add (531):  Scheduled timeout event at 0.798896
+       0.79890	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 0
+       0.79890	Server	cmb_buffer_get (282):  Waiting for more, level now 0
+       0.79890	Server	cmb_resourceguard_wait (158):  Waits for Queue
+        1.2257	Arrival	cmb_buffer_put (329):  Puts 1 into Queue, level 0
+        1.2257	Arrival	cmb_buffer_put (336):  Success, found room for 1, has 0 remaining
+        1.2257	Arrival	cmb_resourceguard_signal (277):  Scheduling wakeup event for Server
+        1.2257	Arrival	cmb_process_hold (459):  Holding for 0.196033 time units
+        1.2257	Arrival	cmb_process_timer_add (531):  Scheduled timeout event at 1.421711
+        1.2257	Server	cmb_buffer_get (289):  Returned successfully from wait
+        1.2257	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 1
+        1.2257	Server	cmb_buffer_get (252):  Success, 1 was available, got 1
+        1.2257	Server	cmb_process_hold (459):  Holding for 0.222806 time units
+        1.2257	Server	cmb_process_timer_add (531):  Scheduled timeout event at 1.448484
+        1.4217	Arrival	cmb_buffer_put (329):  Puts 1 into Queue, level 0
+        1.4217	Arrival	cmb_buffer_put (336):  Success, found room for 1, has 0 remaining
+        1.4217	Arrival	cmb_process_hold (459):  Holding for 1.432564 time units
+        1.4217	Arrival	cmb_process_timer_add (531):  Scheduled timeout event at 2.854275
+        1.4485	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 1
+        1.4485	Server	cmb_buffer_get (252):  Success, 1 was available, got 1
+        1.4485	Server	cmb_process_hold (459):  Holding for 1.910950 time units
+        1.4485	Server	cmb_process_timer_add (531):  Scheduled timeout event at 3.359434
         ...
 
 ...and will keep on doing that forever. We have to press Ctrl-C or similar
@@ -226,28 +269,30 @@ what function and line number is logging, and a formatted message about what is
 happening. Our simulated processes seem to be doing what we asked them to do,
 but there is a wee bit too much information here.
 
-Stopping a simulation
-^^^^^^^^^^^^^^^^^^^^^
+On the other hand, if you configured ``meson`` with build type ``release``, the program
+does not produce any output, just seems to hang there, again having to be interrupted
+with Ctrl-C. In the following, we will assume a ``debug`` build type until further notice.
+
+Ending a simulation
+^^^^^^^^^^^^^^^^^^^
 
 We will address stopping first. The processes are *coroutines*, executing
 concurrently on a separate stack for each process. Only one process can execute
 at a time. It continues executing until it voluntarily *yields* the CPU to some
-other coroutine. Calling :c:func:`cmb_process_hold()` will do exactly
-that, transferring
+other coroutine. Calling :c:func:`cmb_process_hold()` will do exactly that, transferring
 control to the hidden dispatcher process that determines what to do next.
 
-However, the dispatcher only knows about events, not coroutines or processes. It will
+However, the dispatcher only knows about *events*, not coroutines or processes. It will
 run as long as there are scheduled events to execute. Our little simulation will always
 have scheduled events, and the dispatcher will not stop on its own. These events
 originate from our two processes: To ensure that a process returns to the other end of
 its :c:func:`cmb_process_hold()` call, it will schedule a wakeup event
-at the expected time
-before it yields control to the dispatcher. When executed, this event will *resume*
-the coroutine where it left off, returning through the
-:c:func:`cmb_process_hold()` call
-with a return value that indicates normal or abnormal return. (We have ignored the
-return values for now in the example above.) So, whenever there are more than
-one process running, there may be future events scheduled in the event queue.
+at the expected time before it yields control to the dispatcher. When executed, this event
+will *resume* the coroutine where it left off, returning through the
+:c:func:`cmb_process_hold()` call with a return value that indicates normal or abnormal
+return. (We have ignored the return values for now in the example above.) So, whenever
+there are more than one process running, there may be future events scheduled in the event
+queue.
 
 To stop the simulation, we can schedule an "end simulation" event, which
 stops any running processes at that point. The dispatcher then ends the run.
@@ -266,6 +311,8 @@ the function for an end simulation event:
 
     void end_sim(void *subject, void *object)
     {
+        cmb_unused(subject);
+
         struct simulation *sim = object;
         cmb_process_stop(sim->arr, NULL);
         cmb_process_stop(sim->srv, NULL);
@@ -280,6 +327,7 @@ and schedule an ``end_sim`` event before executing the event queue:
     {
         const uint64_t seed = cmb_random_hwseed();
         cmb_random_initialize(seed);
+
         cmb_event_queue_initialize(0.0);
 
         struct simulation sim = {};
@@ -287,11 +335,11 @@ and schedule an ``end_sim`` event before executing the event queue:
         cmb_buffer_initialize(sim.que, "Queue", CMB_UNLIMITED);
 
         sim.arr = cmb_process_create();
-        cmb_process_initialize(sim.arr, "Arrival", arrival, sim.que, 0);
+        cmb_process_initialize(sim.arr, "Arrival", arrival_proc, sim.que, 0);
         cmb_process_start(sim.arr);
 
         sim.srv = cmb_process_create();
-        cmb_process_initialize(sim.srv, "Service", service, sim.que, 0);
+        cmb_process_initialize(sim.srv, "Server", service_proc, sim.que, 0);
         cmb_process_start(sim.srv);
 
         cmb_event_schedule(end_sim, NULL, &sim, 10.0, 0);
@@ -317,14 +365,19 @@ object pointers, the simulated time when this event will happen, and an event
 priority. We have set end time 10.0 here. It could also be expressed as
 ``cmb_time() + 10.0`` for "in 10.0 time units from now".
 
+Note that we now have a mixed simulation world view model, freely combining the two
+processes with an event. The difference is that the event is instantaneous, occurs at one
+specific time only, while the processes can have a duration in simulated time.
+
 The simulation end event does not need to be at a predetermined time. It is
 equally valid for some process in the simulation to schedule an end simulation
 event at the current time whenever some condition is met, such as a certain
 number of customers having been serviced, a statistics collector having a
-certain number of samples, or something else. Or, perhaps even easier for this simple
-simulation, the arrival
-process could just stop generating new arrivals after a certain count, the event queue
-would clear, and the simulation would stop. (See
+certain number of samples, or something else.
+
+Or, even easier for this simple
+simulation, the arrival process could just stop generating new arrivals after a certain
+number of customers, the event queue would clear, and the simulation would stop. (See
 `benchmark/MM1_single.c <https://github.com/ambonvik/cimba/blob/main/benchmark/MM1_single.c>`__
 for an example doing exactly that.)
 
@@ -335,15 +388,15 @@ scheduled time as the next event. The simulation clock then jumps to that time a
 event will be executed. If several events
 have the *same* scheduled time, the dispatcher will execute the one with the
 highest priority first. If several events have the same scheduled time *and*
-the same priority, it will execute them in first in first out order.
+the same priority, it will execute them in first-in, first-out (FIFO) order.
 
 Again, we ignored the event handle returned by :c:func:`cmb_event_schedule()`,
 since we will not be using it in this example. If we wanted to keep it, it is an
 unsigned 64-bit integer (``uint64_t``).
 
 When initializing our arrivals and service processes, we quietly set the last
-argument to :c:func:`cmb_process_initialize()` to 0. This is the inherent process
-priority for scheduling any events pertaining to this process, its
+argument to :c:func:`cmb_process_initialize()`, the *priority*, to 0. This is the
+inherent process priority for scheduling any events pertaining to this process, its
 priority when waiting for some resource, and so on. The processes can adjust
 their own (or each other's) priorities during the simulation, dynamically
 moving themselves up or down in various queues. Cimba does not attempt to
@@ -356,69 +409,40 @@ and get something like this:
 
 .. code-block:: none
 
-    [ambonvik@Threadripper cimba]$ build/tutorial/tut_1_2
-        0.0000	dispatcher	cmb_event_queue_execute (294):  Starting simulation run
-        0.0000	Arrival	cmb_process_hold (278):  Holding for 0.013427 time units
-        0.0000	Arrival	cmb_process_timer_add (343):  Scheduled timeout event at 0.013427
-        0.0000	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 0
-        0.0000	Service	cmb_buffer_get (244):  Waiting for more, level now 0
-        0.0000	Service	cmb_resourceguard_wait (149):  Waits for Queue
-      0.013427	dispatcher	wakeup_event_time (310):  Wakes Arrival signal 0
-      0.013427	Arrival	cmb_buffer_put (291):  Puts 1 into Queue, level 0
-      0.013427	Arrival	cmb_buffer_put (298):  Success, found room for 1, has 0 remaining
-      0.013427	Arrival	cmb_resourceguard_signal (219):  Scheduling wakeup event for Service
-      0.013427	Arrival	cmb_process_hold (278):  Holding for 1.117654 time units
-      0.013427	Arrival	cmb_process_timer_add (343):  Scheduled timeout event at 1.131082
-      0.013427	dispatcher	wakeup_event_resource (173):  Wakes Service signal 0
-      0.013427	Service	cmb_buffer_get (251):  Returned successfully from wait
-      0.013427	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 1
-      0.013427	Service	cmb_buffer_get (214):  Success, 1 was available, got 1
-      0.013427	Service	cmb_process_hold (278):  Holding for 0.907590 time units
-      0.013427	Service	cmb_process_timer_add (343):  Scheduled timeout event at 0.921017
-       0.92102	dispatcher	wakeup_event_time (310):  Wakes Service signal 0
-       0.92102	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 0
-       0.92102	Service	cmb_buffer_get (244):  Waiting for more, level now 0
-       0.92102	Service	cmb_resourceguard_wait (149):  Waits for Queue
-        1.1311	dispatcher	wakeup_event_time (310):  Wakes Arrival signal 0
-        1.1311	Arrival	cmb_buffer_put (291):  Puts 1 into Queue, level 0
-        1.1311	Arrival	cmb_buffer_put (298):  Success, found room for 1, has 0 remaining
-        1.1311	Arrival	cmb_resourceguard_signal (219):  Scheduling wakeup event for Service
-        1.1311	Arrival	cmb_process_hold (278):  Holding for 0.525121 time units
-        1.1311	Arrival	cmb_process_timer_add (343):  Scheduled timeout event at 1.656202
-        1.1311	dispatcher	wakeup_event_resource (173):  Wakes Service signal 0
-        1.1311	Service	cmb_buffer_get (251):  Returned successfully from wait
-        1.1311	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 1
-        1.1311	Service	cmb_buffer_get (214):  Success, 1 was available, got 1
-        1.1311	Service	cmb_process_hold (278):  Holding for 0.176342 time units
-        1.1311	Service	cmb_process_timer_add (343):  Scheduled timeout event at 1.307423
-        1.3074	dispatcher	wakeup_event_time (310):  Wakes Service signal 0
-        1.3074	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 0
-        1.3074	Service	cmb_buffer_get (244):  Waiting for more, level now 0
-        1.3074	Service	cmb_resourceguard_wait (149):  Waits for Queue
-        1.6562	dispatcher	wakeup_event_time (310):  Wakes Arrival signal 0
-        1.6562	Arrival	cmb_buffer_put (291):  Puts 1 into Queue, level 0
-        1.6562	Arrival	cmb_buffer_put (298):  Success, found room for 1, has 0 remaining
-        1.6562	Arrival	cmb_resourceguard_signal (219):  Scheduling wakeup event for Service
-        1.6562	Arrival	cmb_process_hold (278):  Holding for 1.383170 time units
-        1.6562	Arrival	cmb_process_timer_add (343):  Scheduled timeout event at 3.039372
+    [ambonvik@Threadripper tutorial]$ ./tut_1_2
+        0.0000	dispatcher	cmb_event_queue_execute (406):  Starting simulation run
+        0.0000	Arrival	cmb_process_hold (459):  Holding for 2.984589 time units
+        0.0000	Arrival	cmb_process_timer_add (531):  Scheduled timeout event at 2.984589
+        0.0000	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 0
+        0.0000	Server	cmb_buffer_get (282):  Waiting for more, level now 0
+        0.0000	Server	cmb_resourceguard_wait (158):  Waits for Queue
+        2.9846	Arrival	cmb_buffer_put (329):  Puts 1 into Queue, level 0
+        2.9846	Arrival	cmb_buffer_put (336):  Success, found room for 1, has 0 remaining
+        2.9846	Arrival	cmb_resourceguard_signal (277):  Scheduling wakeup event for Server
+        2.9846	Arrival	cmb_process_hold (459):  Holding for 2.043605 time units
+        2.9846	Arrival	cmb_process_timer_add (531):  Scheduled timeout event at 5.028194
+        2.9846	Server	cmb_buffer_get (289):  Returned successfully from wait
+        2.9846	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 1
+        2.9846	Server	cmb_buffer_get (252):  Success, 1 was available, got 1
 
         ...
 
-        9.4105	dispatcher	wakeup_event_time (310):  Wakes Arrival signal 0
-        9.4105	Arrival	cmb_buffer_put (291):  Puts 1 into Queue, level 0
-        9.4105	Arrival	cmb_buffer_put (298):  Success, found room for 1, has 0 remaining
-        9.4105	Arrival	cmb_resourceguard_signal (219):  Scheduling wakeup event for Service
-        9.4105	Arrival	cmb_process_hold (278):  Holding for 3.841477 time units
-        9.4105	Arrival	cmb_process_timer_add (343):  Scheduled timeout event at 13.252013
-        9.4105	dispatcher	wakeup_event_resource (173):  Wakes Service signal 0
-        9.4105	Service	cmb_buffer_get (251):  Returned successfully from wait
-        9.4105	Service	cmb_buffer_get (207):  Gets 1 from Queue, level 1
-        9.4105	Service	cmb_buffer_get (214):  Success, 1 was available, got 1
-        9.4105	Service	cmb_process_hold (278):  Holding for 1.190526 time units
-        9.4105	Service	cmb_process_timer_add (343):  Scheduled timeout event at 10.601062
-        10.000	dispatcher	cmb_process_stop (705):  Stop Arrival value (nil)
-        10.000	dispatcher	cmb_process_stop (705):  Stop Service value (nil)
-        10.000	dispatcher	cmb_event_queue_execute (297):  No more events in queue
+        7.3736	Arrival	cmb_buffer_put (329):  Puts 1 into Queue, level 0
+        7.3736	Arrival	cmb_buffer_put (336):  Success, found room for 1, has 0 remaining
+        7.3736	Arrival	cmb_resourceguard_signal (277):  Scheduling wakeup event for Server
+        7.3736	Arrival	cmb_process_hold (459):  Holding for 2.975370 time units
+        7.3736	Arrival	cmb_process_timer_add (531):  Scheduled timeout event at 10.348998
+        7.3736	Server	cmb_buffer_get (289):  Returned successfully from wait
+        7.3736	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 1
+        7.3736	Server	cmb_buffer_get (252):  Success, 1 was available, got 1
+        7.3736	Server	cmb_process_hold (459):  Holding for 1.439294 time units
+        7.3736	Server	cmb_process_timer_add (531):  Scheduled timeout event at 8.812922
+        8.8129	Server	cmb_buffer_get (245):  Gets 1 from Queue, level 0
+        8.8129	Server	cmb_buffer_get (282):  Waiting for more, level now 0
+        8.8129	Server	cmb_resourceguard_wait (158):  Waits for Queue
+        10.000	dispatcher	cmb_process_stop (987):  Stop Arrival value (nil)
+        10.000	dispatcher	cmb_process_stop (987):  Stop Server value (nil)
+        10.000	dispatcher	cmb_event_queue_execute (409):  No more events in queue
 
 Progress: It started, ran, and now also stopped.
 
@@ -441,7 +465,7 @@ unsigned integer (``uint32_t``) as a bit mask to determine what log entries to p
 and which to ignore. Cimba reserves the top four bits for its own use, identifying
 messages of various severities, leaving the 28 remaining bits for the user application.
 
-There is a global (actually thread local) bit field and a bit mask in each call. If a
+There is a global bit field and a bit mask in each call. If a
 simple bitwise and (``&``) between the global bit field and the caller's bit mask gives a
 non-zero result, that line is printed, otherwise not. Initially, all bits in the global
 bit field are on, ``0xFFFFFFFF``. You can turn selected bits on and off with
@@ -466,15 +490,19 @@ format strings and arguments:
 
     void end_sim(void *subject, void *object)
     {
-        struct simulation *sim = object;
+        cmb_unused(subject);
 
+        struct simulation *sim = object;
         cmb_logger_user(stdout, USERFLAG1, "--- Game Over ---");
         cmb_process_stop(sim->arr, NULL);
         cmb_process_stop(sim->srv, NULL);
     }
 
-    void *arrival(struct cmb_process *me, void *ctx)
+    void *arrival_proc(struct cmb_process *me, void *ctx)
     {
+        cmb_unused(me);
+        cmb_assert_debug(ctx != NULL);
+
         struct cmb_buffer *bp = ctx;
         while (true) {
             const double rate = 0.75;
@@ -488,8 +516,11 @@ format strings and arguments:
         }
     }
 
-    void *service(struct cmb_process *me, void *ctx)
+    void *service_proc(struct cmb_process *me, void *ctx)
     {
+        cmb_unused(me);
+        cmb_assert_debug(ctx != NULL);
+
         struct cmb_buffer *bp = ctx;
         while (true) {
             const double rate = 1.0;
@@ -503,7 +534,26 @@ format strings and arguments:
         }
     }
 
-We also suppress the Cimba informationals from the main function:
+.. _tut_1_assert:
+
+.. admonition:: Asserts and debuggers
+
+    Notice the :c:macro:`cmb_assert_debug()` in this code
+    fragment. It is a custom version of the standard ``assert()`` macro, triggering
+    a hard stop if the condition evaluates to ``false``. Our custom asserts come in
+    three flavors, :c:macro:`cmb_assert_debug()`, :c:macro:`cmb_assert_release()`, and
+    :c:macro:`cmb_assert_always()`.
+    The ``_debug`` assert
+    behaves like the standard one and goes away if the preprocessor symbol ``NDEBUG``
+    is ``#defined``. The ``_release`` assert is still there, but also goes away if ``NASSERT``
+    is ``#defined``. The ``_always`` assert remains in the code, no matter what.
+    See :ref:`the background section <background_error>` for more details.
+
+    If using a debugger, place a breakpoint in :c:func:`cmi_assert_failed()`.
+    If some assert trips, control will always go there. You can then page up the stack
+    and see exactly what happened.
+
+We also suppress the (debug build only) Cimba informationals from the main function:
 
 .. code-block:: c
 
@@ -513,27 +563,29 @@ We compile and run, and get something like this:
 
 .. code-block:: none
 
-    [ambonvik@Threadripper cimba]$ build/tutorial/tut_1_3
-    0.0000	Arrival	arrival (25):  Holds for 5.990663 time units
-    0.0000	Service	service (38):  Gets one from the queue
-    5.9907	Arrival	arrival (28):  Puts one into the queue
-    5.9907	Arrival	arrival (25):  Holds for 0.687769 time units
-    5.9907	Service	service (41):  Got one, services it for 0.758971 time units
-    6.6784	Arrival	arrival (28):  Puts one into the queue
-    6.6784	Arrival	arrival (25):  Holds for 2.199251 time units
-    6.7496	Service	service (38):  Gets one from the queue
-    6.7496	Service	service (41):  Got one, services it for 0.589826 time units
-    7.3395	Service	service (38):  Gets one from the queue
-    8.8777	Arrival	arrival (28):  Puts one into the queue
-    8.8777	Arrival	arrival (25):  Holds for 0.523423 time units
-    8.8777	Service	service (41):  Got one, services it for 1.277856 time units
-    9.4011	Arrival	arrival (28):  Puts one into the queue
-    9.4011	Arrival	arrival (25):  Holds for 1.751825 time units
-    10.000	dispatcher	end_sim (15):  --- Game Over ---
+    [ambonvik@Threadripper tutorial]$ ./tut_1_3
+        0.0000	Arrival	arrival_proc (32):  Holds for 3.400762 time units
+        0.0000	Server	service_proc (50):  Gets one from the queue
+        3.4008	Arrival	arrival_proc (35):  Puts one into the queue
+        3.4008	Arrival	arrival_proc (32):  Holds for 3.529830 time units
+        3.4008	Server	service_proc (53):  Got one, services it for 0.684011 time units
+        4.0848	Server	service_proc (50):  Gets one from the queue
+        6.9306	Arrival	arrival_proc (35):  Puts one into the queue
+        6.9306	Arrival	arrival_proc (32):  Holds for 2.702912 time units
+        6.9306	Server	service_proc (53):  Got one, services it for 0.192825 time units
+        7.1234	Server	service_proc (50):  Gets one from the queue
+        9.6335	Arrival	arrival_proc (35):  Puts one into the queue
+        9.6335	Arrival	arrival_proc (32):  Holds for 0.075689 time units
+        9.6335	Server	service_proc (53):  Got one, services it for 2.820073 time units
+        9.7092	Arrival	arrival_proc (35):  Puts one into the queue
+        9.7092	Arrival	arrival_proc (32):  Holds for 0.309229 time units
+        10.000	dispatcher	end_sim (17):  --- Game Over ---
 
-Only our user-defined logging messages are printed. Note how the simulation time,
-the name of the active process, the calling function, and the line number are
-automagically prepended to the user-defined message.
+Only our user-defined logging messages are printed, also for a debug build. Note how the
+simulation time, the name of the active process, the calling function, and the line number are
+automagically prepended to the user-defined message. The output from a release build
+will be similar. `The code for this version is here <https://github
+.com/ambonvik/cimba/blob/main/tutorial/tut_1_3.c>`_
 
 We turn off our user-defined messages like this:
 
@@ -542,9 +594,13 @@ We turn off our user-defined messages like this:
     cmb_logger_flags_off(CMB_LOGGER_INFO);
     cmb_logger_flags_off(USERFLAG1);
 
-As you would expect,
-`this version of the program <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_1_3.c>`_
-produces no output.
+We can also combine these with a simple bitwise OR:
+
+.. code-block:: c
+
+    cmb_logger_flags_off(CMB_LOGGER_INFO | USERFLAG1);
+
+As you would expect, this version of the program produces no output.
 
 Collecting and reporting statistics
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -555,7 +611,7 @@ start reporting some statistics on the queue length.
 
 It will be no surprise that Cimba contains flexible and powerful statistics
 collectors and reporting functions. There is actually one built into the
-:c:struct:`cmb_buffer` we have been using. We just need to turn it on:
+:c:struct:`cmb_buffer` we have been using. We just need to turn it on from our ``main()``:
 
 .. code-block::
 
@@ -564,44 +620,46 @@ collectors and reporting functions. There is actually one built into the
     cmb_buffer_initialize(sim.que, "Queue", CMB_UNLIMITED);
     cmb_buffer_start_recording(sim.que);
 
-After the simulation is finished, we can make it report its history like this:
+After the simulation is finished executing the event queue, we can make it report its
+history like this:
 
 .. code-block::
 
     cmb_buffer_stop_recording(sim.que);
     cmb_buffer_print_report(sim.que, stdout);
 
-We increase the running time from ten to one million time units, compile, and run.
+We increase the running time from ten to one million time units by scheduling the
+``end_sim`` event at time 1.0e6, compile, and run.
 Very shortly thereafter, output appears:
 
 .. code-block:: none
 
-    /home/ambonvik/github/cimba/build/tutorial/tut_1_4
+    [ambonvik@Threadripper tutorial]$ ./tut_1_4
     Buffer levels for Queue
-    N  1314513  Mean    2.249  StdDev    2.867  Variance    8.221  Skewness    2.743  Kurtosis    11.94
+    N  1313824  Mean    2.256  StdDev    3.297  Variance    10.87  Skewness    2.405  Kurtosis    8.442
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
-    [     0.000,      2.050)   |##################################################
-    [     2.050,      4.100)   |##########-
-    [     4.100,      6.150)   |#####=
-    [     6.150,      8.200)   |###-
-    [     8.200,      10.25)   |#=
-    [     10.25,      12.30)   |=
-    [     12.30,      14.35)   |=
-    [     14.35,      16.40)   |-
-    [     16.40,      18.45)   |-
-    [     18.45,      20.50)   |-
-    [     20.50,      22.55)   |-
-    [     22.55,      24.60)   |-
-    [     24.60,      26.65)   |-
-    [     26.65,      28.70)   |-
-    [     28.70,      30.75)   |-
-    [     30.75,      32.80)   |-
-    [     32.80,      34.85)   |-
-    [     34.85,      36.90)   |-
-    [     36.90,      38.95)   |-
-    [     38.95,      41.00)   |-
-    [     41.00,  Infinity )   |-
+    [     0.000,      1.850)   |##################################################
+    [     1.850,      3.700)   |###############=
+    [     3.700,      5.550)   |#########-
+    [     5.550,      7.400)   |#####-
+    [     7.400,      9.250)   |##=
+    [     9.250,      11.10)   |#=
+    [     11.10,      12.95)   |-
+    [     12.95,      14.80)   |=
+    [     14.80,      16.65)   |-
+    [     16.65,      18.50)   |-
+    [     18.50,      20.35)   |-
+    [     20.35,      22.20)   |-
+    [     22.20,      24.05)   |-
+    [     24.05,      25.90)   |-
+    [     25.90,      27.75)   |-
+    [     27.75,      29.60)   |-
+    [     29.60,      31.45)   |-
+    [     31.45,      33.30)   |-
+    [     33.30,      35.15)   |-
+    [     35.15,      37.00)   |-
+    [     37.00,   Infinity)   |-
     --------------------------------------------------------------------------------
 
 The text-mode histogram uses the character ``#`` to indicate a full pixel, ``=`` for
@@ -610,78 +668,62 @@ than half filled.
 
 We can also get a pointer to the :c:struct:`cmb_timeseries` object by
 calling :c:func:`cmb_buffer_history()` and doing further analysis on
-that. As an
-example, let's do the first 20 partial autocorrelation coefficients of the queue
-length time series and print a correlogram of that as well:
+that. As an example, let's do the first 20 partial autocorrelation coefficients of
+the queue length time series and print a correlogram of that as well:
 
 .. code-block:: c
 
     struct cmb_timeseries *ts = cmb_buffer_history(sim.que);
     double pacf_arr[21];
     cmb_timeseries_PACF(ts, 20, pacf_arr, NULL);
-    cmb_timeseries_print_correlogram(ts, stdout, 20, pacf_arr);
+    printf("\nPartial autocorrelation coefficients for %s levels\n",
+            cmb_buffer_name(sim.que));
+    cmb_timeseries_correlogram_print(ts, stdout, 20, pacf_arr);
 
 Output:
 
 .. code-block:: none
 
+    Partial autocorrelation coefficients for Queue levels
                -1.0                              0.0                              1.0
     --------------------------------------------------------------------------------
-       1   0.952                                  |###############################-
-       2   0.348                                  |###########-
-       3  -0.172                            =#####|
-       4   0.138                                  |####=
-       5  -0.089                               =##|
-       6   0.087                                  |##=
-       7  -0.058                                =#|
-       8   0.064                                  |##-
-       9  -0.046                                =#|
+       1   0.955                                  |###############################=
+       2   0.342                                  |###########-
+       3  -0.170                            =#####|
+       4   0.139                                  |####=
+       5  -0.088                               =##|
+       6   0.086                                  |##=
+       7  -0.060                                =#|
+       8   0.065                                  |##-
+       9  -0.043                                -#|
       10   0.051                                  |#=
-      11  -0.037                                -#|
-      12   0.042                                  |#-
-      13  -0.032                                -#|
-      14   0.036                                  |#-
-      15  -0.026                                 =|
+      11  -0.036                                -#|
+      12   0.043                                  |#-
+      13  -0.031                                -#|
+      14   0.037                                  |#-
+      15  -0.024                                 =|
       16   0.033                                  |#-
-      17  -0.023                                 =|
+      17  -0.022                                 =|
       18   0.029                                  |=
-      19  -0.022                                 =|
-      20   0.025                                  |=
+      19  -0.020                                 =|
+      20   0.026                                  |=
     --------------------------------------------------------------------------------
 
 The code for this stage `can be found here. <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_1_4.c>`_
 
 This is not quite publication-ready graphics, but can be useful at the model
 development stage we are at now: We have numbers. Theory predicts an average
-queue length of 2.25 for a M/M/1 queue at 75 % utilization. We just got 2.249.
+queue length of 2.25 for a M/M/1 queue at 75 % utilization. We just got 2.256.
 
 Close, but is it close enough? We need more resolving power.
 
 Refactoring for parallelism
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Before we go there, we will clean up a few rough edges. The compiler keeps warning
-us about unused function arguments. Unused arguments is not unusual with Cimba,
-since we often do not need all arguments to event and process functions. However,
-we do not want to turn off the warning altogether, but will inform the compiler
-(and human readers of the code) that this is intentional by using the
-:c:macro:`cmb_unused()` macro:
-
-.. code-block:: c
-
-    void end_sim(void *subject, void *object)
-    {
-        cmb_unused(subject);
-        struct simulation *sim = object;
-
-        cmb_logger_user(stdout, USERFLAG1, "--- Game Over ---");
-        cmb_process_stop(sim->arr, NULL);
-        cmb_process_stop(sim->srv, NULL);
-    }
-
-Warnings gone. Next, we want to tidy up the hard-coded parameters to a proper
+Before we go there, we will clean up a few rough edges. We want to tidy up the
+hard-coded parameters to a proper
 data structure. We define a ``struct trial`` to contain parameters and output
-values, and bundle both our existing ``struct simulation`` and ``struct trial`` in
+values, bundle both our existing ``struct simulation`` and ``struct trial`` in
 a ``struct context``, and pass that between the functions.
 
 .. code-block:: c
@@ -696,8 +738,8 @@ a ``struct context``, and pass that between the functions.
         /* Parameters */
         double arr_rate;
         double srv_rate;
-        double warmup_time;
-        double duration;
+        double warmup_s;
+        double duration_h;
         /* Results */
         double avg_queue_length;
     };
@@ -709,62 +751,6 @@ a ``struct context``, and pass that between the functions.
 
 For now, we just declare these structs as local variables on the stack.
 
-We define a small helper function to load the parameters into the ``trial``:
-
-.. code-block:: c
-
-    void load_params(struct trial *trl)
-    {
-        cmb_assert_release(trl != NULL);
-
-        trl->arr_rate = 0.75;
-        trl->srv_rate = 1.0;
-        trl->warmup_time = 1000.0;
-        trl->duration = 1e6;
-    }
-
-.. _tut_1_assert:
-
-.. admonition:: Asserts and debuggers
-
-    Notice the :c:macro:`cmb_assert_release()` in this code
-    fragment. It is a custom version of the standard ``assert()`` macro, triggering
-    a hard stop if the condition evaluates to ``false``. Our custom asserts come in
-    two flavors, :c:macro:`cmb_assert_debug()` and :c:macro:`cmb_assert_release()`.
-    The ``_debug`` assert
-    behaves like the standard one and goes away if the preprocessor symbol ``NDEBUG``
-    is ``#defined``. The ``_release`` assert is still there, but also goes away if ``NASSERT``
-    is ``#defined``. See :ref:`the background section <background_error>` for details.
-
-    We will trip one and see how it looks. We temporarily replace the
-    exponentially distributed service time with a normally distributed one, mean
-    1.0 and sigma 0.25. This will almost surely generate a negative value
-    sooner or later, which will cause the service process to try to hold for a
-    negative time, resuming in its own past. That should not be possible:
-
-    .. code-block:: c
-
-                // const double t_srv = cmb_random_exponential(t_srv_mean);
-                const double t_srv = cmb_random_normal(1.0, 0.25);
-
-    Sure enough::
-
-        /home/ambonvik/github/cimba/build/tutorial/tut_1_5
-        9359.5	Service	cmb_process_hold (272):  Fatal: Assert "dur >= 0.0" failed, source file cmb_process.c, seed 0x9bec8a16f0aa802a
-
-        Process finished with exit code 134 (interrupted by signal 6:SIGABRT)
-
-    The output line lists the simulated time, the process, the function and line of code,
-    the condition that failed, the source code file where it blew up, and the random
-    number seed that was used to initialize the run.
-
-    If using a debugger, place a breakpoint  in :c:func:`cmi_assert_failed()`.
-    If some assert trips, control will always
-    go there. You can then page up the stack and see exactly what happened.
-
-    .. image:: ../images/debugger_assert.png
-
-
 We also need a pair of events to turn data recording on and off at specified times:
 
 .. code-block:: c
@@ -772,34 +758,40 @@ We also need a pair of events to turn data recording on and off at specified tim
     static void start_rec(void *subject, void *object)
     {
         cmb_unused(subject);
-        const struct context *ctx = object;
+        cmb_assert_debug(object != NULL);
 
+        const struct context *ctx = object;
         const struct simulation *sim = ctx->sim;
-        cmb_buffer_start_recording(sim->que);
+        cmb_buffer_recording_start(sim->que);
     }
 
     static void stop_rec(void *subject, void *object)
     {
         cmb_unused(subject);
-        const struct context *ctx = object;
+        cmb_assert_debug(object != NULL);
 
+        const struct context *ctx = object;
         const struct simulation *sim = ctx->sim;
-        cmb_buffer_stop_recording(sim->que);
+        cmb_buffer_recording_stop(sim->que);
     }
 
 As the last refactoring step before we parallelize, we move the simulation driver
 code from ``main()`` to a separate function ``run_MM1_trial()`` and call it from
-``main()``. For reasons that soon will be evident, its argument is a single pointer
-to void, even if we immediately cast this to our ``struct trial *`` once inside the
+``main()``. For reasons that soon will become clear, its argument is a single pointer
+to ``void``, even if we immediately cast this to our ``struct trial *`` once inside the
 function. We remove the call to :c:func:`cmb_buffer_report`, calculate the average
 queue length, and store it in the ``trial`` results field:
 
 .. code-block:: c
 
-        struct cmb_wtdsummary wtdsum;
-        const struct cmb_timeseries *ts = cmb_buffer_history(ctx.sim->que);
-        cmb_timeseries_summarize(ts, &wtdsum);
-        ctx.trl->avg_queue_length = cmb_wtdsummary_mean(&wtdsum);
+    struct cmb_wtdsummary wtdsum;
+    cmb_wtdsummary_initialize(&wtdsum);
+    const struct cmb_timeseries *ts = cmb_buffer_history(ctx.sim->que);
+    cmb_timeseries_summarize(ts, &wtdsum);
+    ctx.trl->avg_queue_length = cmb_wtdsummary_mean(&wtdsum);
+    cmb_wtdsummary_terminate(&wtdsum);
+
+Note that ``wtdsum`` is initialized before use and terminated when done.
 
 The ``main()`` function is now reduced to this:
 
@@ -808,7 +800,10 @@ The ``main()`` function is now reduced to this:
     int main(void)
     {
         struct trial trl = {};
-        load_params(&trl);
+        trl.arr_rate = 0.75;
+        trl.srv_rate = 1.0;
+        trl.warmup_s = 1000.0;
+        trl.duration_h = 1e6;
 
         run_MM1_trial(&trl);
 
@@ -823,8 +818,8 @@ Instead, we compile and run it, receiving output similar to this:
 
 .. code-block:: none
 
-    /home/ambonvik/github/cimba/build/tutorial/tut_1_5
-    Avg 2.234060
+    [ambonvik@Threadripper tutorial]$ ./tut_1_5
+    Avg 2.299748
 
 .. _tut_1_parallel:
 
@@ -839,14 +834,15 @@ detached interest. Let's put them to work.
 
 Cimba is built from the ground up for coarse-grained parallelism. Depending on
 the viewpoint, parallelizing a discrete event simulation is either terribly
-hard or trivially simple. The hard way to do it is to try to parallelize a
-single simulation run. This is near impossible, since the outcome of each event
-may influence all future events in complex and model-dependent ways.
+hard or trivially simple. The *hard* way to do it is to try to parallelize a
+single simulation run. This is difficult and inefficient, since the outcome of each event
+may influence all future events in complex and model-dependent ways. The discrete event
+simulation algorthm itself is heavily serializing.
 
-The easy way is to realize that we rarely do a *single* simulation run. We want to
+The *easy* way is to realize that we rarely do a *single* simulation run. We want to
 run *many* to generate statistically significant answers to questions and/or to test
-many parameter combinations, perhaps in a full factorial experimental design.
-Even if we could answer a question by a single very long run, we may get a better
+many parameter combinations, perhaps in a full factorial or some other experimental
+design. Even if we could answer a question by a single very long run, we may get a better
 understanding by splitting it into many shorter runs to not just get an average, but
 also a sense of the variability of our results.
 
@@ -858,7 +854,8 @@ by just running them at the same time and collecting the output.
 
 Cimba creates a pool of worker threads, one per (logical) CPU core on the system.
 You describe your experiment as an array of trials and the function to execute each
-trial, and pass these to :c:func:`cimba_run_experiment()`.
+trial, and pass these to :c:func:`cimba_run()`.
+
 The worker threads will pull trials from the experiment array and run them,
 storing the results back in your trial struct, before moving to the next un-executed
 trial in the array. This gives an inherent load balancing with minimal overhead. When all
@@ -871,7 +868,7 @@ want to calculate and plot the mean and 95 % confidence bands for each parameter
 combination, and compare that to the analytically calculated value in publication
 ready graphics.
 
-We can set up the experiment like this:
+We can set up our experimental design like this:
 
 .. code-block:: c
 
@@ -887,6 +884,7 @@ We can set up the experiment like this:
     printf("Setting up experiment\n");
     const unsigned n_trials = n_rhos * n_reps;
     struct trial *experiment = calloc(n_trials, sizeof(*experiment));
+    cmb_assert_always(experiment != NULL);
 
     uint64_t ui_exp = 0u;
     double rho = rho_start;
@@ -894,8 +892,8 @@ We can set up the experiment like this:
         for (unsigned ui_rep = 0u; ui_rep < n_reps; ui_rep++) {
             experiment[ui_exp].arr_rate = rho * srv_rate;
             experiment[ui_exp].srv_rate = srv_rate;
-            experiment[ui_exp].warmup_time = warmup_time;
-            experiment[ui_exp].duration = duration;
+            experiment[ui_exp].warmup_s = warmup_time;
+            experiment[ui_exp].duration_h = duration;
             experiment[ui_exp].seed_used = 0u;
             experiment[ui_exp].avg_queue_length = 0.0;
 
@@ -905,80 +903,86 @@ We can set up the experiment like this:
         rho += rho_step;
     }
 
-We allocate the experiment array on the heap, since its size will depend on the
-parameters. Here, we have hard-coded them for the sake of the tutorial, but they
+Here, we have hard-coded the parameters for the sake of the tutorial, but they
 would probably be given as an input file or as interactive input in real usage.
 
 .. note::
 
     Do not use any writeable global variables in your model. The entire parallelized
-    experiment exists in a shared memory space. Threads will be sharing CPU cores
-    in unpredictable ways. A global variable accessible to several threads can be
-    read and written by any thread, creating potential hard-to-diagnose bugs.
+    experiment exists in a shared memory space. Threads will be interleaving
+    in unpredictable ways. A mutable global variable accessible to several threads can be
+    written and read by any thread in any sequence, creating potential hard-to-diagnose
+    bugs.
 
     Do not use any static local variables in your model either. Your model
     functions will be called by all threads. A static local variable remembers its
     value from the last call, which may have been a completely different thread.
-    Diagnosing those bugs will not be any easier.
+    Debugging that will not be any easier.
 
-    Regular local variables, function arguments, and heap memory (``malloc()`` /
-    ``free()``) is thread safe.
+    Regular local variables, function arguments, and heap allocated memory are thread
+    safe.
 
     If you absolutely *must* have a global or static variable, consider prefixing
     it by :c:macro:`CMB_THREAD_LOCAL` to make it global or static *within that thread only*,
-    creating separate copies per thread.
+    creating separate copies per thread. If it also must allow global write across threads,
+    then you will need to read up on Posix mutexes and GCC ``__atomic`` intrinsics first,
+    which are beyond the scope of this Cimba tutorial.
 
 We can then run the experiment:
 
 .. code-block:: c
 
-        cimba_run_experiment(experiment, n_trials, sizeof(*experiment), run_MM1_trial);
+    printf("Executing experiment\n");
+    cimba_run(experiment, n_trials, sizeof(*experiment), run_MM1_trial);
 
-The first argument is the experiment array, the last argument the simulation
-driver function we have developed earlier. It will take a pointer to a trial as
-its argument, but the internals of :c:func:`cimba_run_experiment()` cannot know the
+The first argument to ``cimba_run()``is the experiment array, the last argument the
+simulation driver function we have developed earlier. It will take a pointer to a trial as
+its argument, but the internals of :c:func:`cimba_run()` cannot know the
 detailed structure of your ``struct trial``, so it will be passed as a ``void *``.
 We need to explain the number of trials and the size of each trial struct as the
-second and third arguments to :c:func:`cimba_run_experiment()` for it to do correct
+second and third arguments to :c:func:`cimba_run()` for it to do correct
 pointer arithmetic internally.
 
 When done, we can collect the results like this:
 
 .. code-block:: c
 
-        ui_exp = 0u;
-        FILE *datafp = fopen("tut_1_6.dat", "w");
-        fprintf(datafp, "# utilization\tavg_queue_length\tconf_interval\n");
-        for (unsigned ui_rho = 0u; ui_rho < n_rhos; ui_rho++) {
-            const double ar = experiment[ui_exp].arr_rate;
-            const double sr = experiment[ui_exp].srv_rate;
-            const double rho_used = ar / sr;
+    ui_exp = 0u;
+    FILE *datafp = fopen("tut_1_6.dat", "w");
+    fprintf(datafp, "# utilization\tavg_queue_length\tconf_interval\n");
+    for (unsigned ui_rho = 0u; ui_rho < n_rhos; ui_rho++) {
+        const double ar = experiment[ui_exp].arr_rate;
+        const double sr = experiment[ui_exp].srv_rate;
+        const double rho_used = ar / sr;
 
-            struct cmb_datasummary cds;
-            cmb_datasummary_initialize(&cds);
-            for (unsigned ui_rep = 0u; ui_rep < n_reps; ui_rep++) {
-                cmb_datasummary_add(&cds, experiment[ui_exp].avg_queue_length);
-                ui_exp++;
-            }
-
-            cmb_assert_debug(cmb_datasummary_count(&cds) == n_reps);
-            const double sample_avg = cmb_datasummary_mean(&cds);
-            const double sample_sd = cmb_datasummary_stddev(&cds);
-            const double t_crit = 2.228;
-            fprintf(datafp, "%f\t%f\t%f\n", rho_used, sample_avg, t_crit * sample_sd);
-            cmb_datasummary_terminate(&cds);
+        struct cmb_datasummary cds;
+        cmb_datasummary_initialize(&cds);
+        for (unsigned ui_rep = 0u; ui_rep < n_reps; ui_rep++) {
+            cmb_datasummary_add(&cds, experiment[ui_exp].avg_queue_length);
+            ui_exp++;
         }
 
-        fclose(datafp);
-        free(experiment);
+        cmb_assert_debug(cmb_datasummary_count(&cds) == n_reps);
+        const double sample_avg = cmb_datasummary_mean(&cds);
+        const double sample_sd = cmb_datasummary_stddev(&cds);
+        const double t_crit = 2.228;
+        fprintf(datafp, "%f\t%f\t%f\n", rho_used, sample_avg, t_crit * sample_sd);
+        cmb_datasummary_terminate(&cds);
+    }
 
-        write_gnuplot_commands();
-        system("gnuplot -persistent tut_1_6.gp");
+    fclose(datafp);
+    free(experiment);
 
-We use a :c:struct:`cmb_datasummary` to simplify the calculation of confidence intervals,
-knowing that it will calculate correct moments in a single pass of the data. We
+    write_gnuplot_commands();
+    if (system("gnuplot -persistent tut_1_6.gp") != 0) {
+        cmb_logger_warning(stderr, "gnuplot launch failed");
+    }
+
+We use a :c:struct:`cmb_datasummary` to simplify the calculation of confidence
+intervals, knowing that it will calculate correct moments in a single pass of the
+data. Once done, we can deallocate the experiment array. We
 then write the results to an output file, write a gnuplot command file to plot
-the results, and spawn a gnuplot window to display the chart.
+the results, and spawn a persistent gnuplot window to display the chart.
 
 Also, we would like to know the progress of our experiment, so we define a
 separate level of logger messages like this:
@@ -1013,37 +1017,36 @@ and run, and get output similar to this:
 
 .. code-block:: none
 
-    /home/ambonvik/github/cimba/build/tutorial/tut_1_6
-    Cimba version 3.0.0-beta
+    [ambonvik@Threadripper tutorial]$ ./tut_1_6
+    Cimba version 3.0.0-RC1
     Setting up experiment
     Executing experiment
-    0	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xc81e7ac2d54abef1 rho: 0.025000
-    2	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xb995a846d37f1522 rho: 0.025000
-    1	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x246364a107f945e7 rho: 0.025000
-    5	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xa7b5e743900ccc53 rho: 0.025000
-    4	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x775e54d85c8760eb rho: 0.025000
-    3	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x6d4f0bb78fab7321 rho: 0.025000
-    6	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xa0d4d65c953e6ba9 rho: 0.025000
-    7	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xc66885b9c3e01198 rho: 0.025000
-    10	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x0d0324ac1ad47314 rho: 0.050000
-    9	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x60ea3e25c23886cd rho: 0.025000
-    8	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xb2cf2d84fb2cd36e rho: 0.025000
-    11	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x04b83d03be4d5393 rho: 0.050000
-    12	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x6a3c8c7d7657b5a2 rho: 0.050000
-    13	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x79e878ab601d9ba9 rho: 0.050000
-    14	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xcd50fbb55578f7d2 rho: 0.050000
-    15	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xfabb1c5f934c9aad rho: 0.050000
+    0	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x7866d3d38917be45 rho: 0.025000
+    3	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x7c34fba6010fc4b8 rho: 0.025000
+    1	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x492abf0803226872 rho: 0.025000
+    2	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xe637bd0ed6acfe44 rho: 0.025000
+    6	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xb3a6c991530672ac rho: 0.025000
+    5	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x57b05c8064b8e1b0 rho: 0.025000
+    7	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x750292b4962e365a rho: 0.025000
+    4	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x9decfa8eaa97f26b rho: 0.025000
+    8	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x20606e14460e981b rho: 0.025000
+    13	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xe3f29afa1d30ff88 rho: 0.050000
+    11	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xf34a7ee712b7a2e1 rho: 0.050000
+    10	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xb30f5b4f19651e2e rho: 0.050000
+    14	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x830343619ae31b22 rho: 0.050000
+    15	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x1ee4082b456ca442 rho: 0.050000
+    12	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x322f23e96b874958 rho: 0.050000
 
     ...
 
-    384	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x8aa3bb76ccc324a6 rho: 0.975000
-    385	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x9290801927a4f348 rho: 0.975000
-    386	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xeaff225d8d61a4ad rho: 0.975000
-    387	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xc2c20c0bef3959b7 rho: 0.975000
-    388	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0xc11445ad99b4a5c9 rho: 0.975000
-    389	    0.0000	dispatcher	run_MM1_trial (120):  seed: 0x5faccc75f803deef rho: 0.975000
+    383	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x71b22699502bd80f rho: 0.975000
+    384	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x0c945ed9a795e3eb rho: 0.975000
+    385	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xdd60213eedbd12e5 rho: 0.975000
+    386	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xe2754f584dfa18fb rho: 0.975000
+    387	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xb4ac68426d59068f rho: 0.975000
+    388	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0x61aa9359b4765149 rho: 0.975000
+    389	    0.0000	dispatcher	run_MM1_trial (124):  seed: 0xafb5efc7b7d5d145 rho: 0.975000
     Finished experiment, writing results to file
-    It took 3.41133 sec
 
 Note that the Cimba logger understands that it is now running multithreaded and
 prepends each logging line with the trial index in your experiment array. Note
@@ -1051,29 +1054,184 @@ also that the trials may not be executed in strict sequence, since we do not
 control the detailed interleaving of the threads. That is up to the operating
 system.
 
-We also get this image in a separate window:
+We also get an image like this in a separate window:
 
     .. image:: ../images/tut_1_6.png
 
 Evidently, we cannot reject the null hypothesis that conventional queuing theory
 may be correct. Nor can we reject the hypothesis that Cimba may be working correctly.
 
-This concludes our first tutorial. We have followed the development steps from a
-first minimal model to demonstrate process interactions to a complete parallelized
-experiment with graphical output. The files ``tutorial/tut_1_*.c`` include working
-code for each stage of development. The version
-`tutorial/tut_1_7.c <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_1_7.c>`__
-is functionally the same as our final
-`tutorial/tut_1_6.c <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_1_6.c>`__
-but with additional inline explanatory comments and simulation parameters settable from
-the command line using 'getopt()' for argument parsing.
+Seed management
+^^^^^^^^^^^^^^^
 
-For additional variations of this theme, see also
+Since we used ``cmb_random_hwseed()`` to seed the pseudo-random number generators in
+each trial, our pseudo-random number generators are seeded with real entropy from the
+computer hardware. If we run the model again, we will get a slightly different result.
+This independence is of course a good thing, but we may also need reproducibility.
+
+We can make our simulation reproducible by providing a master seed as input, e.g., on the
+command line, and then use a hashing function to create different seeds for each trial in
+the experiment. We can also provide other simulation parameters in the same way:
+
+.. code-block:: c
+
+    #include <errno.h>
+
+    int main(const int argc, char *argv[])
+    {
+        /* Can be set on command line */
+        bool timing_enabled = false;
+        uint64_t master_seed = cmb_random_hwseed();
+        uint32_t n_reps = 10;
+        double warmup_time = 1000.0;
+        double duration = 1.0e6;
+
+        /* Not yet added to command line params */
+        const unsigned n_rhos = 39;
+        const double rho_start = 0.025;
+        const double rho_step = 0.025;
+        const double srv_rate = 1.0;
+
+        /* Parse command line options, if any */
+        int opt;
+        while ((opt = getopt(argc, argv, "d:n:s:tw:")) != -1) {
+            switch (opt) {
+                case 'd': {
+                    errno = 0;
+                    duration = strtod(optarg, NULL);
+                    if (errno != 0 || duration <= 0.0) {
+                        fprintf(stderr, "Invalid argument %s\n", optarg);
+                        return EXIT_FAILURE;
+                    }
+                    break;
+                }
+                case 'n': {
+                    errno = 0;
+                    n_reps = (uint32_t)strtoul(optarg, NULL, 0);
+                    if (errno != 0) {
+                        fprintf(stderr, "Invalid argument %s\n", optarg);
+                        return EXIT_FAILURE;
+                    }
+                    break;
+                }
+                case 's': {
+                    errno = 0;
+                    master_seed = (uint64_t)strtoull(optarg, NULL, 0);
+                    if (errno != 0 || master_seed == 0u) {
+                        fprintf(stderr, "Invalid argument %s\n", optarg);
+                        return EXIT_FAILURE;
+                    }
+                    break;
+                }
+                case 't': {
+                    timing_enabled = true;
+                    break;
+                }
+                case 'w': {
+                    errno = 0;
+                    warmup_time = (double)strtod(optarg, NULL);
+                    if (errno != 0 || warmup_time < 0.0) {
+                        fprintf(stderr, "Invalid argument %s\n", optarg);
+                        return EXIT_FAILURE;
+                    }
+                    break;
+                }
+                default: {
+                    fprintf(stderr, "Usage: %s [-d <duration>][-n <num_replications>][-s <seed>][-t][-w <warmup_time>]\n", argv[0]);
+                    return EXIT_FAILURE;
+                }
+            }
+        }
+
+By using the hash function ``cmb_random_fmix64()`` and a running trial counter as the
+unique nonce value for hashing the trial seed., we can now create suitable
+deterministic seeds for each trial in our experiment like this:
+
+.. code-block:: c
+
+    printf("Setting up experiment\n");
+    printf("Master seed: 0x%" PRIx64 "\n", master_seed);
+    const unsigned n_trials = n_rhos * n_reps;
+    struct trial *experiment = cmi_calloc(n_trials, sizeof(*experiment));
+
+    uint64_t ui_exp = 0u;
+    double rho = rho_start;
+    for (unsigned ui_rho = 0u; ui_rho < n_rhos; ui_rho++) {
+        for (unsigned ui_rep = 0u; ui_rep < n_reps; ui_rep++) {
+            experiment[ui_exp].arr_rate = rho * srv_rate;
+            experiment[ui_exp].srv_rate = srv_rate;
+            experiment[ui_exp].warmup_s = warmup_time;
+            experiment[ui_exp].duration_h = duration;
+            experiment[ui_exp].seed_used = cmb_random_fmix64(master_seed, ui_exp);
+            experiment[ui_exp].avg_queue_length = 0.0;
+
+            ui_exp++;
+        }
+
+        rho += rho_step;
+    }
+
+Each trial can now use its pre-assigned seed:
+
+.. code-block:: c
+
+        cmb_random_initialize(trl->seed_used);
+
+We can then type, e.g.:
+
+.. code-block:: none
+
+    [ambonvik@Threadripper tutorial]$ ./tut_1_7 -s 0x123456789abcd0 -d 1e7 -n 15 -w 1e6
+    Cimba version 3.0.0-RC1
+    Setting up experiment
+    Master seed: 0x123456789abcd0
+    Executing experiment
+    5	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x7b67c6418c63aae2 rho: 0.025000
+    0	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xfdec9c60e9175db9 rho: 0.025000
+    4	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x4074149906797ad1 rho: 0.025000
+    3	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x6efb9a53ec801f99 rho: 0.025000
+    7	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x85c4ac085200f398 rho: 0.025000
+    2	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x8c86cd3226e7c39a rho: 0.025000
+    1	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xa0f0a732375fb48f rho: 0.025000
+    6	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x8402740fc59daac0 rho: 0.025000
+    8	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xa622550fd8b73be6 rho: 0.025000
+    11	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xf92ed9cb02c4ffad rho: 0.025000
+    9	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xf80baffa542f3b03 rho: 0.025000
+    10	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xee25017da603acb5 rho: 0.025000
+    13	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x009cd75e4d3deb65 rho: 0.025000
+
+    ...
+
+    573	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xda57f730cc5809e5 rho: 0.975000
+    574	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x9e94f96a6035f669 rho: 0.975000
+    575	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x4c1497ef015d4c70 rho: 0.975000
+    576	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x7c248e1d06156897 rho: 0.975000
+    577	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x0860d4c67e72f345 rho: 0.975000
+    578	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xc7d13810b2cd773b rho: 0.975000
+    579	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x5d20f8af7ddbb0c4 rho: 0.975000
+    580	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x4c79c5afe47c077a rho: 0.975000
+    581	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x24e1643bbf3f2bef rho: 0.975000
+    582	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x218448f76e55882c rho: 0.975000
+    583	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0x87cf1c7dd681deb2 rho: 0.975000
+    584	    0.0000	dispatcher	run_MM1_trial (173):  seed: 0xb6c0c5fb0077fbe3 rho: 0.975000
+    Finished experiment, writing results to file
+
+The chart looks similar, but since we used longer run times and more replications, our
+confidence intervals are tighter:
+
+    .. image:: ../images/tut_1_7.png
+
+This concludes our first tutorial. We have followed the development steps from a
+first minimal model with basic process interactions to a complete parallelized
+experiment with graphical output. The files ``tutorial/tut_1_*.c`` include working
+code for each stage of development.
+
+For additional variations of this theme, see
 `benchmark/MM1_multi.c <https://github.com/ambonvik/cimba/blob/main/benchmark/MM1_multi.c>`__
 where the queue is modeled as a :c:struct:`cmb_objectqueue` with individual customers
 tracking their time in the system, and
 `test/test_cimba.c <https://github.com/ambonvik/cimba/blob/main/test/test_cimba.c>`__
-modeling a M/G/1 queue with different utilizations and service time varibilities.
+modeling a M/G/1 queue with different utilizations and service time variabilities.
 
 .. _tut_2:
 
@@ -1083,8 +1241,9 @@ Acquiring, preempting, holding, and releasing resources, with interruptions
 We will now introduce the Cimba methods for acquiring and releasing resources
 of various kinds. We will also show additional process interactions where
 the active process is acting directly on some other process. We will
-demonstrate these through a somewhat cartoonish example. First, some necessary
-background.
+demonstrate these through a somewhat cartoonish example.
+
+First, some necessary background.
 
 Resources and resource pools
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1140,8 +1299,8 @@ until then.
 
 Note also that there are some differences between the ``_acquire()``/``_release()`` pairs
 and the similar ``_get()``/``_put()`` pairs for buffers and queues. Suppose that you
-have a ``cmb_buffer`` of maximal size 10. It is still possible to call
-``cmb_buffer_put(bufp, 100)``. The call just puts in 10 to begin with, waits for
+have a ``cmb_buffer`` of maximal size ten. It is still possible to call
+``cmb_buffer_put(bufp, 100)``. The call just puts in ten to begin with, waits for
 someone to get one or more of them, and then keeps refilling the queue until all 100 are
 put in. The call only returns at that point (unless interrupted, which we will discuss in
 a moment).  Similarly, ``cmb_buffer_get(bufp, 100)`` works as expected, and trying to
@@ -1149,9 +1308,9 @@ a moment).  Similarly, ``cmb_buffer_get(bufp, 100)`` works as expected, and tryi
 :c:struct:`cmb_priorityqueue` just suspends the caller until space becomes available.
 
 Resources and resource pools are not like that. Requesting more from a resource pool
-than its maximum is an error. If we have a resource pool with maximum size 10, 5 of
+than its maximum is an error. If we have a resource pool with maximum size ten, five of
 which already are in use, it is fine to call ``cmb_resourcepool_acquire(rpp, 10)``. The
-call just waits until all 10 are available, accumulating its holding whenever some
+call just waits until all ten are available, accumulating to its holding whenever some
 become available until it has all, and then returns. On the other hand, calling
 ``cmb_resourcepool_acquire(rpp, 11)`` will not work. It is not a meaningful call, so
 Cimba will do the most helpful thing it can: Trip an `assert()` and crash your program
@@ -1168,7 +1327,8 @@ yield (and resume) points are hidden inside functions like :c:func:`cmb_process_
 or :c:func:`cmb_resource_acquire()`. Inside the call, control may (or may not) be
 passed to some other process. The call will only return when control is transferred
 back to this process. To the calling process just sitting on its own stack, it
-looks very simple, but a lot of things may be happening elsewhere in the meantime.
+looks very simple, just another function call, but a lot of things may be happening
+elsewhere in the model in the meantime.
 
 A yielded process does not have any guarantees for what may be happening to it
 before it resumes control. Other processes may act on this process, perhaps
@@ -1184,14 +1344,14 @@ Cimba has reserved a few possible return values for itself. Most importantly,
 For example, if :c:func:`cmb_process_hold()` returns :c:macro:`CMB_PROCESS_SUCCESS`, the
 calling process knows that it was woken up at the scheduled time without any shenanigans.
 
-The second most important value is :c:macro:`CMB_PROCESS_PREEMPTED`. That means that a
+Another important value is :c:macro:`CMB_PROCESS_PREEMPTED`. That means that a
 higher priority process just forcibly took away some resource held by this
 process. There are also :c:macro:`CMB_PROCESS_INTERRUPTED`, :c:macro:`CMB_PROCESS_STOPPED`,
-:c:macro:`CMB_PROCESS_CANCELLED`, and :c:macro:`CMB_PROCESS_TIMEOUT`. These predefined signals
-are all defined as small negative values, leaving an enormous number of available
+:c:macro:`CMB_PROCESS_CANCELLED`, and :c:macro:`CMB_PROCESS_TIMEOUT`. These predefined
+signals are all defined as small negative values, leaving an enormous number of available
 signal values to application-defined meanings. In particular, all positive
-integers are available to the application for coding various interrupt signals
-between processes.
+integers are available to the application for coding various model-specific interrupt
+signals between its processes.
 
 These signal values create a rich set of direct process interactions. As an
 example, suppose some process currently holds 10 units from some resource pool.
@@ -1207,7 +1367,7 @@ There are now three different outcomes for the ``_acquire()`` call:
    takes them, and returns :c:macro:`CMB_PROCESS_SUCCESS`. It now holds 20 units.
 
 2. Some higher priority process calls :c:func:`cmb_resourcepool_preempt()` and this
-   process is targeted. The higher priority process takes *all* units held by
+   process gets targeted. The higher priority process takes *all* units held by
    the victim process. Its acquire call returns :c:macro:`CMB_PROCESS_PREEMPTED`. It
    now holds 0 units.
 
@@ -1221,8 +1381,8 @@ There are now three different outcomes for the ``_acquire()`` call:
 
 Preempt calls can themselves be preempted by higher priority processes or
 interrupted in the same way as acquire calls if the preempt was not immediately
-fulfilled and the process had to wait at the resource guard. Once there, it is
-fair game for preempts and interrupts.
+fulfilled and the preempting process had to wait at the resource guard. Once there,
+it is fair game for preempts and interrupts.
 
 Another potential complexity: Suppose a process holds more than one type of
 resource, for example:
@@ -1233,14 +1393,14 @@ resource, for example:
     cmb_resourcepool_acquire(rsp1, 10);
     cmb_resourcepool_acquire(rsp2, 15);
 
-    int64_t signal = cmb_process_hold(100,0);
+    int64_t signal = cmb_process_hold(100.0);
 
     if (signal == CMB_PROCESS_PREEMPTED) {
         /* ??? */
     }
 
-In cases like this, the functions :c:func:`cmb_resource_held_by_process()` and
-:c:func:`cmb_resourcepool_held_by_process()` with a pointer to the process itself as the
+In cases like this, the functions :c:func:`cmb_resource_held()` and
+:c:func:`cmb_resourcepool_held()` with a pointer to the process itself as the
 second argument can be useful to figure out which resource was preempted. If the caller
 does not have a pointer to itself handy (it is always the first argument to the
 process function), it can get one by calling :c:func:`cmb_process_current()`,
@@ -1254,29 +1414,30 @@ resource pools. A process can acquire and hold a resource, making it unavailable
 for other processes until it is released. Preempting it naturally means taking
 the resource away from the process because someone else needs it more, right now.
 
-Buffers and their cousins act differently. Once something is put in, other
+Buffers and their cousins act differently. Once something is put into a buffer, other
 processes can get it and consume it immediately. Preempting a put or get operation
 does not have any obvious meaning. If a buffer is empty, a process get call is waiting
-at the resource guard, and a higher priority process wants to get some first, it
-just calls :c:func:`cmb_buffer_get()` and goes first in the priority queue.
+at the resource guard, and a higher priority process wants to get some first, the
+higher priority process just calls :c:func:`cmb_buffer_get()` and goes first in the
+priority queue.
 
-However, waiting puts and gets can still be interrupted. For the
-:c:struct:`cmb_objectqueue`
-and :c:struct:`cmb_priorityqueue`, it is very simple. If the respective ``_put()`` or
+However, waiting puts and gets can still be interrupted. For :c:struct:`cmb_objectqueue`
+and :c:struct:`cmb_priorityqueue`, it is quite simple: If the respective ``_put()`` or
 ``_get()`` call returned :c:macro:`CMB_PROCESS_SUCCESS` the object was successfully
 added to the queue or retrieved from it. If it returned anything else, it was not.
 
 The :c:struct:`cmb_buffer` is similarly intuitive. Recall from
-:ref:`our first tutorial <tut_1>`
-that the ``amount`` argument is given as a pointer to a variable, not as a value. As
-the put and get calls get underway, the value at this location is updated to
-reflect the progress. If interrupted, this value indicates how much was placed
-or obtained. The call returns at this point with no attempt to roll back to the
-state at the beginning of the call. If successful, the put call will return
-:c:macro:`CMB_PROCESS_SUCCESS` and have a zero value in this location. Similarly, the
-`_get()` call
-will have the requested amount. If interrupted, it will return something else and
-the amount variable will contain some other value between zero and the requested amount.
+:ref:`our first tutorial <tut_1>` that the ``amount`` argument is given as a pointer
+to a variable, not as a value. As the put and get calls get underway, the value at
+this location is updated to reflect the progress. If interrupted, this value indicates
+how much was placed or obtained. The call returns at this point with no attempt to
+roll back to the state at the beginning of the call. If successful, the put call will
+return :c:macro:`CMB_PROCESS_SUCCESS` and have a zero value in this location.
+
+In the same way, the `_get()` call will return  :c:macro:`CMB_PROCESS_SUCCESS` if it
+has received the requested amount. If interrupted, it will return something else and
+the amount variable will contain some other value, ranging from zero and up to one less
+than the requested amount.
 
 While the cat is away...
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1298,6 +1459,28 @@ to just the simulation struct. We can then write something like:
 
 .. code-block:: c
 
+    #define CHECK_OUTCOME(sig, me, rpoolp, amnt)                                    \
+    {                                                                               \
+        if (sig == CMB_PROCESS_SUCCESS) {                                           \
+            /* Acquire returned successfully */                                     \
+            cmb_logger_user(stdout, USERFLAG1,                                      \
+                            "Success, has %" PRIu64,                                \
+                            amnt);                                                  \
+        }                                                                           \
+        else if (sig == CMB_PROCESS_PREEMPTED) {                                    \
+            /* The acquire() call did not end well */                               \
+            cmb_logger_user(stdout, USERFLAG1,                                      \
+                            "Preempted, all is gone, has %" PRIu64,                 \
+                            amnt);                                                  \
+        }                                                                           \
+        else {                                                                      \
+            /* Interrupted, but we still have the same amount as before */          \
+            cmb_logger_user(stdout, USERFLAG1,                                      \
+                            "Interrupted by signal %" PRIi64 ", still has %" PRIu64,\
+                            sig, amnt);                                             \
+        }                                                                           \
+    }
+
     /* The busy life of a mouse */
     void *mousefunc(struct cmb_process *me, void *ctx)
     {
@@ -1305,69 +1488,51 @@ to just the simulation struct. We can then write something like:
         cmb_assert_release(ctx != NULL);
 
         const struct simulation *simp = ctx;
-        struct cmb_resourcepool *sp = simp->cheese;
-        uint64_t amount_held = 0u;
+        struct cmb_resourcepool *rpoolp = simp->cheese;
 
         while (true) {
+            cmb_logger_user(stdout, USERFLAG1,
+                            "Top of loop, has %" PRIu64,
+                            cmb_resourcepool_held(rpoolp, me));
+
             /* Decide on a random amount to get next time and set a random priority */
             const uint64_t amount_req = cmb_random_dice(1, 5);
             const int64_t pri = cmb_random_dice(-10, 10);
-            cmb_process_set_priority(me, pri);
+            cmb_process_priority_set(me, pri);
+
             cmb_logger_user(stdout, USERFLAG1, "Acquiring %" PRIu64, amount_req);
-            int64_t sig = cmb_resourcepool_acquire(sp, amount_req);
-            if (sig == CMB_PROCESS_SUCCESS) {
-                /* Acquire returned successfully */
-                amount_held += amount_req;
-                cmb_logger_user(stdout, USERFLAG1, "Success, new amount held: %" PRIu64, amount_held);
-            }
-            else if (sig == CMB_PROCESS_PREEMPTED) {
-                /* The acquire call did not end well */
-                cmb_logger_user(stdout, USERFLAG1, "Preempted during acquire, all my %s is gone",
-                                cmb_resourcepool_name(sp));
-                amount_held = 0u;
-            }
-            else {
-                /* Interrupted, but we still have the same amount as before */
-                cmb_logger_user(stdout, USERFLAG1, "Interrupted by signal %" PRIi64, sig);
-            }
+            int64_t sig = cmb_resourcepool_acquire(rpoolp, amount_req);
+            check_outcome(sig, me, rpoolp, cmb_resourcepool_held(rpoolp, me));
 
             /* Hold on to it for a while */
+            cmb_logger_user(stdout, USERFLAG1,
+                            "Holding %" PRIu64,
+                            cmb_resourcepool_held(rpoolp, me));
             sig = cmb_process_hold(cmb_random_exponential(1.0));
-            if (sig == CMB_PROCESS_SUCCESS) {
-                /* We still have it */
-                cmb_logger_user(stdout, USERFLAG1, "Hold returned successfully");
-            }
-            else if (sig == CMB_PROCESS_PREEMPTED) {
-                /* Somebody snatched it all away from us */
-                cmb_logger_user(stdout, USERFLAG1, "Someone stole all my %s from me!",
-                                cmb_resourcepool_name(sp));
-                amount_held = 0u;
-            }
-            else {
-                /* Interrupted while holding. Still have the cheese, though */
-                cmb_logger_user(stdout, USERFLAG1, "Interrupted by signal %" PRIi64, sig);
-            }
+            check_outcome(sig, me, rpoolp, cmb_resourcepool_held(rpoolp, me));
 
             /* Drop some amount */
-            if (amount_held > 1u) {
-                const uint64_t amount_rel = cmb_random_dice(1, (long)amount_held);
-                cmb_logger_user(stdout, USERFLAG1, "Holds %" PRIu64 ", releasing %" PRIu64,
-                                amount_held, amount_rel);
-                cmb_resourcepool_release(sp, amount_rel);
-                amount_held -= amount_rel;
-            }
+            uint64_t amnt = cmb_resourcepool_held(rpoolp, me);
+            if (amnt > 1u) {
+                const uint64_t amount_rel = cmb_random_dice(1, amnt);
+                cmb_logger_user(stdout, USERFLAG1,
+                                "Has %" PRIu64 ", releasing %" PRIu64,
+                                amnt, amount_rel);
+                cmb_resourcepool_release(rpoolp, amount_rel);
+           }
 
             /* Hang on a moment before trying again */
-            cmb_logger_user(stdout, USERFLAG1, "Holding, amount held: %" PRIu64, amount_held);
+            cmb_logger_user(stdout, USERFLAG1,
+                            "Holding %" PRIu64,
+                            cmb_resourcepool_held(rpoolp, me));
             sig = cmb_process_hold(cmb_random_exponential(1.0));
-            if (sig == CMB_PROCESS_PREEMPTED) {
-                cmb_logger_user(stdout, USERFLAG1,
-                                "Someone stole the rest of my %s, signal %" PRIi64,
-                                cmb_resourcepool_name(sp), sig);
-                amount_held = 0u;
-           }
+            check_outcome(sig, me, rpoolp, cmb_resourcepool_held(rpoolp, me));
         }
     }
+
+We used a preprosessor macro for `CHECK_OUTCOME()` here to avoid repetitive code
+while keeping the logger line numbers referring to the `mousefunc`, not into the
+helper function.
 
 The rats are pretty much the same as the mice, just a bit hungrier and stronger
 (i.e. assigning themselves somewhat higher priorities), and using
@@ -1378,7 +1543,8 @@ The rats are pretty much the same as the mice, just a bit hungrier and stronger
     /* Decide on a random amount to get next time and set a random priority */
     const uint64_t amount_req = cmb_random_dice(3, 10);
     const int64_t pri = cmb_random_dice(-5, 15);
-    cmb_process_set_priority(me, pri);
+    cmb_process_priority_set(me, pri);
+
     cmb_logger_user(stdout, USERFLAG1, "Preempting %" PRIu64, amount_req);
     int64_t sig = cmb_resourcepool_preempt(sp, amount_req);
 
@@ -1400,16 +1566,20 @@ The cats, on the other hand, are never interrupted and just ignore return values
             cmb_logger_user(stdout, USERFLAG1, "Zzzzz...");
             (void)cmb_process_hold(cmb_random_exponential(5.0));
             do {
-                cmb_logger_user(stdout, USERFLAG1, "Awake, looking for rodents");
-                (void)cmb_process_hold(cmb_random_exponential(1.0));
+                cmb_logger_user(stdout, USERFLAG1,
+                                "Awake, looking for rodents");
                 struct cmb_process *tgt = cpp[cmb_random_dice(0, num - 1)];
-                cmb_logger_user(stdout, USERFLAG1, "Chasing %s", cmb_process_name(tgt));
+                cmb_logger_user(stdout, USERFLAG1,
+                                "Chasing %s", cmb_process_name(tgt));
 
                 /* Send it a random interrupt signal */
                 const int64_t sig = (cmb_random_flip()) ?
                                      CMB_PROCESS_INTERRUPTED :
                                      cmb_random_dice(10, 100);
                 cmb_process_interrupt(tgt, sig, 0);
+
+                cmb_logger_user(stdout, USERFLAG1, "Pondering");
+                (void)cmb_process_hold(cmb_random_exponential(1.0));
 
                 /* Flip a coin to decide whether to go back to sleep */
             } while (cmb_random_flip());
@@ -1422,85 +1592,91 @@ We compile and run, and get output similar to this:
 
 .. code-block:: none
 
-    [ambonvik@Threadripper cimba]$ build/tutorial/tut_3_1 | more
+    [ambonvik@Threadripper cimba]$ build/tutorial/tut_2_1 | more
     Create a pile of 20 cheese cubes
     Create 5 mice to compete for the cheese
     Create 2 rats trying to preempt the cheese
     Create 1 cats chasing all the rodents
     Schedule end event
     Execute simulation...
-        0.0000	Cat_1	catfunc (218):  Zzzzz...
-        0.0000	Rat_2	ratfunc (151):  Preempting 4
-        0.0000	Rat_2	ratfunc (156):  Success, new amount held: 4
-        0.0000	Mouse_4	mousefunc (77):  Acquiring 1
-        0.0000	Mouse_4	mousefunc (82):  Success, new amount held: 1
-        0.0000	Rat_1	ratfunc (151):  Preempting 8
-        0.0000	Rat_1	ratfunc (156):  Success, new amount held: 8
-        0.0000	Mouse_1	mousefunc (77):  Acquiring 5
-        0.0000	Mouse_1	mousefunc (82):  Success, new amount held: 5
-        0.0000	Mouse_3	mousefunc (77):  Acquiring 2
-        0.0000	Mouse_3	mousefunc (82):  Success, new amount held: 2
-        0.0000	Mouse_5	mousefunc (77):  Acquiring 1
-        0.0000	Mouse_2	mousefunc (77):  Acquiring 3
-       0.23852	Mouse_1	mousefunc (99):  Hold returned normally
-       0.23852	Mouse_1	mousefunc (115):  Holds 5, releasing 5
-       0.23852	Mouse_1	mousefunc (122):  Holding, amount held: 0
-       0.23852	Mouse_5	mousefunc (82):  Success, new amount held: 1
-       0.23852	Mouse_2	mousefunc (82):  Success, new amount held: 3
-       0.30029	Cat_1	catfunc (221):  Awake, looking for rodents
-       0.46399	Mouse_2	mousefunc (99):  Hold returned normally
-       0.46399	Mouse_2	mousefunc (115):  Holds 3, releasing 1
-       0.46399	Mouse_2	mousefunc (122):  Holding, amount held: 2
-       0.56088	Mouse_1	mousefunc (77):  Acquiring 1
-       0.56088	Mouse_1	mousefunc (82):  Success, new amount held: 1
-       0.58910	Mouse_4	mousefunc (99):  Hold returned normally
-       0.58910	Mouse_4	mousefunc (122):  Holding, amount held: 1
-       0.73649	Mouse_5	mousefunc (99):  Hold returned normally
-       0.73649	Mouse_5	mousefunc (122):  Holding, amount held: 1
-       0.74171	Mouse_3	mousefunc (99):  Hold returned normally
-       0.74171	Mouse_3	mousefunc (115):  Holds 2, releasing 2
-       0.74171	Mouse_3	mousefunc (122):  Holding, amount held: 0
-       0.83936	Mouse_3	mousefunc (77):  Acquiring 4
-       0.89350	Mouse_5	mousefunc (77):  Acquiring 5
-        1.3408	Rat_2	ratfunc (173):  Hold returned normally
-        1.3408	Rat_2	ratfunc (189):  Holds 4, releasing 1
-        1.3408	Rat_2	ratfunc (196):  Holding, amount held: 3
-        1.3408	Mouse_3	mousefunc (82):  Success, new amount held: 4
-        1.4394	Mouse_4	mousefunc (77):  Acquiring 5
-        1.8889	Mouse_2	mousefunc (77):  Acquiring 1
-        1.8992	Mouse_3	mousefunc (99):  Hold returned normally
-        1.8992	Mouse_3	mousefunc (115):  Holds 4, releasing 4
-        1.8992	Mouse_3	mousefunc (122):  Holding, amount held: 0
-        1.9260	Mouse_1	mousefunc (99):  Hold returned normally
-        1.9260	Mouse_1	mousefunc (122):  Holding, amount held: 1
-        2.5697	Mouse_3	mousefunc (77):  Acquiring 3
-        3.1025	Mouse_1	mousefunc (77):  Acquiring 4
-        3.7215	Rat_2	ratfunc (151):  Preempting 6
-        3.7215	Mouse_4	mousefunc (86):  Preempted during acquire, all my Cheese is gone
-        3.7215	Mouse_1	mousefunc (86):  Preempted during acquire, all my Cheese is gone
-        4.2186	Mouse_1	mousefunc (99):  Hold returned normally
-        4.2186	Mouse_1	mousefunc (122):  Holding, amount held: 0
-        4.7152	Mouse_1	mousefunc (77):  Acquiring 5
-        4.8393	Cat_1	catfunc (224):  Chasing Mouse_1
-        4.8393	Cat_1	catfunc (221):  Awake, looking for rodents
-        4.8393	Mouse_1	mousefunc (92):  Interrupted by signal -2
-        5.3060	Cat_1	catfunc (224):  Chasing Mouse_4
-        5.3060	Cat_1	catfunc (221):  Awake, looking for rodents
-        5.3060	Mouse_4	mousefunc (109):  Interrupted by signal 20
-        5.3060	Mouse_4	mousefunc (122):  Holding, amount held: 0
-        5.8149	Mouse_1	mousefunc (99):  Hold returned normally
-        5.8149	Mouse_1	mousefunc (122):  Holding, amount held: 0
-        6.0788	Mouse_1	mousefunc (77):  Acquiring 4
-        6.1803	Rat_1	ratfunc (173):  Hold returned normally
-        6.1803	Rat_1	ratfunc (189):  Holds 8, releasing 3
-        6.1803	Rat_1	ratfunc (196):  Holding, amount held: 5
-
+        0.0000	Mouse_3	mousefunc (91):  Top of loop, has 0
+        0.0000	Mouse_3	mousefunc (100):  Acquiring 4
+        0.0000	Mouse_3	mousefunc (102):  Success, has 4
+        0.0000	Mouse_3	mousefunc (105):  Holding 4
+        0.0000	Mouse_2	mousefunc (91):  Top of loop, has 0
+        0.0000	Mouse_2	mousefunc (100):  Acquiring 1
+        0.0000	Mouse_2	mousefunc (102):  Success, has 1
+        0.0000	Mouse_2	mousefunc (105):  Holding 1
+        0.0000	Mouse_1	mousefunc (91):  Top of loop, has 0
+        0.0000	Mouse_1	mousefunc (100):  Acquiring 4
+        0.0000	Mouse_1	mousefunc (102):  Success, has 4
+        0.0000	Mouse_1	mousefunc (105):  Holding 4
+        0.0000	Rat_1	ratfunc (140):  Top of loop, has: 0
+        0.0000	Rat_1	ratfunc (149):  Preempting 9
+        0.0000	Rat_1	ratfunc (151):  Success, has 9
+        0.0000	Rat_1	ratfunc (154):  Holding 9
+        0.0000	Cat_1	catfunc (190):  Zzzzz...
+        0.0000	Mouse_5	mousefunc (91):  Top of loop, has 0
+        0.0000	Mouse_5	mousefunc (100):  Acquiring 3
+        0.0000	Mouse_4	mousefunc (91):  Top of loop, has 0
+        0.0000	Mouse_4	mousefunc (100):  Acquiring 4
+        0.0000	Rat_2	ratfunc (140):  Top of loop, has: 0
+        0.0000	Rat_2	ratfunc (149):  Preempting 9
+        0.0000	Rat_2	ratfunc (151):  Success, has 9
+        0.0000	Rat_2	ratfunc (154):  Holding 9
+        0.0000	Mouse_3	mousefunc (109):  Preempted, all is gone, has 0
+        0.0000	Mouse_3	mousefunc (122):  Holding 0
+        0.0000	Mouse_1	mousefunc (109):  Preempted, all is gone, has 0
+        0.0000	Mouse_1	mousefunc (122):  Holding 0
+        0.0000	Mouse_2	mousefunc (109):  Preempted, all is gone, has 0
+        0.0000	Mouse_2	mousefunc (122):  Holding 0
+        1.3546	Rat_1	ratfunc (158):  Success, has 9
+        1.3546	Rat_1	ratfunc (164):  Has 9, releasing 4
+        1.3546	Rat_1	ratfunc (171):  Holding 5
+        1.3546	Mouse_5	mousefunc (102):  Success, has 3
+        1.3546	Mouse_5	mousefunc (105):  Holding 3
+        1.5029	Cat_1	catfunc (193):  Awake, looking for rodents
+        1.5029	Cat_1	catfunc (196):  Chasing Mouse_3
+        1.5029	Cat_1	catfunc (205):  Pondering
+        1.5029	Mouse_3	mousefunc (126):  Interrupted by signal 42, still has 0
+        1.5029	Mouse_3	mousefunc (91):  Top of loop, has 0
+        1.5029	Mouse_3	mousefunc (100):  Acquiring 1
+        1.5654	Mouse_1	mousefunc (126):  Success, has 0
+        1.5654	Mouse_1	mousefunc (91):  Top of loop, has 0
+        1.5654	Mouse_1	mousefunc (100):  Acquiring 5
+        1.8091	Rat_1	ratfunc (175):  Success, has 5
+        1.8091	Rat_1	ratfunc (140):  Top of loop, has: 5
+        1.8091	Rat_1	ratfunc (149):  Preempting 5
+        1.8091	Rat_1	ratfunc (151):  Success, has 10
+        1.8091	Rat_1	ratfunc (154):  Holding 10
+        1.8091	Mouse_3	mousefunc (102):  Success, has 1
+        1.8091	Mouse_3	mousefunc (105):  Holding 1
+        1.8091	Mouse_5	mousefunc (109):  Preempted, all is gone, has 0
+        1.8091	Mouse_5	mousefunc (122):  Holding 0
+        1.8091	Mouse_4	mousefunc (102):  Preempted, all is gone, has 0
+        1.8091	Mouse_4	mousefunc (105):  Holding 0
+        2.2274	Cat_1	catfunc (193):  Awake, looking for rodents
+        2.2274	Cat_1	catfunc (196):  Chasing Mouse_4
+        2.2274	Cat_1	catfunc (205):  Pondering
+        2.2274	Mouse_4	mousefunc (109):  Interrupted by signal 79, still has 0
+        2.2274	Mouse_4	mousefunc (122):  Holding 0
+        2.3894	Rat_2	ratfunc (158):  Success, has 9
+        2.3894	Rat_2	ratfunc (164):  Has 9, releasing 9
+        2.3894	Rat_2	ratfunc (171):  Holding 0
+        2.3894	Mouse_1	mousefunc (102):  Success, has 5
+        2.3894	Mouse_1	mousefunc (105):  Holding 5
+        2.4937	Rat_1	ratfunc (158):  Success, has 10
+        2.4937	Rat_1	ratfunc (164):  Has 10, releasing 10
+        2.4937	Rat_1	ratfunc (171):  Holding 0
+        2.6472	Mouse_2	mousefunc (126):  Success, has 0
+        ...
 
 ...and so on. The interactions can get rather intricate, but hopefully intuitive:
 A :c:func:`cmb_resourcepool_preempt()` call will start from the lowest priority victim
-process and take *all* of its resource, but only if the victim has strictly lower
+process and take *all* of its holdinge, but only if the victim has strictly lower
 priority than the caller. If the requested amount is not satisfied from the first
-victim, it will continue to the next lowest priority victim. If some amount is
+victim, it will continue to the next lowest priority victim. If several victims are
+available at the same priority, it proceeds in LIFO order. If some amount is
 left over after taking everything the victim held, the resource guard is signalled
 to evaluate what process gets the remainder. If no potential victims with strictly
 lower priority than the caller process exists, the caller will join the priority
@@ -1509,32 +1685,37 @@ queue and wait in line for some amount to become available.
 Cimba does not try to be "fair" or "optimal" in its resource allocation, just
 efficient and predictable. If the application needs different allocation rules,
 it can either adjust process priorities dynamically or create a derived class
-with a custom demand function.
+with a custom demand function and/or priority ordering. (See the default demand
+function :c:func:`is_available()` and the ranking function
+:c:func:`holder_queue_rank()` in
+`cmb_resourcepool.c <https://github.com/ambonvik/cimba/blob/main/src/cmb_resourcepool.c>`_
+for the details.)
 
-Real world uses
-^^^^^^^^^^^^^^^
+It is possible to create deadlocks if multiple processes are waiting for each other.
+If you build a model with that property, such as Dijkstra's famous Dining Philosophers,
+the purpose of the model could be to compare the performance of different deadlock
+prevention algorithms. That logic belongs in the user model, not hidden inside Cimba.
+It does not try to detect or prevent deadlocks in the modelled system. Your model will
+just stop.
 
-The example above was originally written as part of the Cimba unit test suite
-to ensure that the library tracking of how many units each process holds from
-the resource pool always matches the expected values calculated here.
-We wanted to make very sure that this is correct in all possible
-sequences of events, hence this frantic stress test with preemptions and
-interruptions galore.
+Althogh this example was rather cartoonish, the preempt and interrupt mechanisms we
+have demonstrated are important in a range of real-world modeling applications ranging
+from hospital emergency room triage operations to manufacturing job shops and machine
+breakdown processes.
 
-The preempt and interrupt mechanisms will be important in a range of real-world
-modeling applications, ranging from hospital emergency room triage operations to
-manufacturing job shops and machine breakdown processes.
-
-Building, validating, and parallelizing the simulation will follow the same
-pattern as in :ref:`our first tutorial <tut_1>`, so we will not repeat that here.
+Parallelizing the simulation will follow the same pattern as in :ref:`our first
+tutorial <tut_1>`, so we will not repeat that here.
 
 This completes our second tutorial, demonstrating how to "``_acquire()`` and
 ``_release()`` resources, and to use direct process interactions like
 :c:func:`cmb_process_interrupt()` and :c:func:`cmb_resourcepool_preempt`.
+
 We also have mentioned, but not demonstrated :c:func:`cmb_process_wait_process()`
-and :c:func:`cmb_process_wait_event()`. We encourage you to look up these in
+and :c:func:`cmb_process_wait_event()` that make it possible for a process to wait
+for another process and for an event, respectively. We encourage you to look
+up these in
 `the API reference documentation <https://cimba.readthedocs.io/en/latest/api/library_root.html>`_
-next.
+.
 
 .. _tut_3:
 
@@ -1557,32 +1738,32 @@ the arrival process will make their own decisions on whether to join the queue o
 (balking), leave midway (reneging), or switch to another queue that seems to be moving
 faster (jockeying). Or patiently wait until they get served and then leave for new
 adventures. Since the active entities in Cimba are the instances of
-:c:struct:`cmb_process`,
-this requires each customer to be represented as a process or a class derived from
-the process. We will make our customers a derived class from the
+:c:struct:`cmb_process`, this requires each customer to be represented as a process
+or derived class. We will make our customers a derived class from the
 :c:struct:`cmb_process`, inheriting its properties and methods, and adding some more
-specifics.
+specifics. By doing so, we will demonstate both object-oriented inheritance and that
+Cimba processes themselves can spawn other processes.
 
 The use case is to model an amusement park with guests wanting to use various
-attractions, where the park operator wants us to analyze ways of influencing customer
-behavior. The overall metric is the time spent in the park per visitor and the
+attractions. Our customer, the park operator, wants us to analyze ways of influencing
+customer behavior. The overall metric is the time spent in the park per visitor and the
 breakdown of this time between riding, waiting, and walking. The time unit is minutes.
 
 Classes derived from cmb_process
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The object-oriented paradigm is very natural for simulation modeling, and was first
+The object-oriented paradigm is very natural for simulation modeling. It was first
 developed for this purpose in Simula67. Obviously, C does not directly support
 object-orientation as a language feature, but is flexible enough to support an
 object-oriented programming style. We will discuss this in more detail in the
-:ref:`background section <background_oop>`. In this tutorial we will just focus on
+:ref:`background section <background_oop>`. In this tutorial, we will just focus on
 how to use it.
 
 Basically, in object-oriented C, the ``struct`` becomes the class. By placing one
 struct as the first member of another, the outer struct effectively becomes a derived
 class from the inner one. A pointer to the outer struct will point to the same address
 as the inner struct, and one can freely cast the same pointer value between the two
-types.
+types. They exist at the same memory address.
 
 For example, we want our server process to also contain a pointer to the queue it gets
 visitors from, the number of visitors that can board for each run of the ride, and the
@@ -1645,7 +1826,7 @@ the server class:
 
 The most important member function is the server process function itself. It gets a group of
 suspended ``visitor`` processes from the priority queue, loads them into the attraction,
-holds them for the duration of the ride, stores some statistics in them, before
+holds them for the duration of the ride, ands stores some statistics in them, before
 resuming them as active processes. It can look like this:
 
 .. code-block:: c
@@ -1698,9 +1879,13 @@ resuming them as active processes. It can look like this:
     }
 
 Since our processes are *asymmetric* coroutines, the :c:func:`cmb_process_resume()` call
-does not directly resume the target process (coroutine), but schedules an event that will
-make the dispatcher resume the target process (coroutine). That way, all control passes
-through the dispatcher, and all coroutines are resumed by the dispatcher only.
+does not directly resume the target process (coroutine), but *schedules an event* that
+will make the dispatcher resume the target process (coroutine) at the current time. That
+way, all control passes through the dispatcher, and all processes are resumed by the
+dispatcher only. For this server function, it implies that :c:func:`cmb_process_resume()`
+is a non-blocking call. It returns immediately and the server can unload all visitors
+before yielding the CPU in the :c:func:`cmb_priorityqueue_get()` or
+:c:func:`cmb_process_hold()` calls.
 
 Setting and clearing timers
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1859,7 +2044,6 @@ brings some new features:
         return NULL;
     }
 
-
 To model the jockeying and reneging behavior, we use additional :c:struct:`cmb_process`
 methods: The process can schedule a future timeout event for itself by calling
 :c:func:`cmb_process_timer_set()`. When the timer event occurs, the process will be
@@ -1873,11 +2057,16 @@ Here, we set *two* different timers, one with the signal ``TIMER_JOCKEYING`` and
 unconditionally by calling :c:func:`cmb_process_yield()` after entering the
 :c:struct:`cmb_priorityqueue`. The visitor process is then a passive object managed by
 the server process until it is resumed by the server, or until one of the timers goes off
-and it awakes with a start and shows signs of impatience.
+and the visitor process awakes with a start and shows signs of impatience.
 
 Note that the timers remain active past the call to :c:func:`cmb_priorityqueue_put()`.
-The timers are part of the process state, not the function call. They remain active
-until either going off or getting cancelled / cleared.
+The timers are *part of the process state*, not of the function call. They remain active
+until either going off or getting cancelled / cleared. This is a far more flexible and
+general mechanism than having an optional timeout value argument in each ``_put()``,
+``_get()``, ``_wait()`` etc etc function call.
+
+In this case, we cancel the jockeying timer if the reneging timer goes off, but not
+the other way around, since they model two different behaviors.
 
 Note also that one of the first things the server process does after getting a visitor
 from the priority queue is to call :c:func:`cmb_process_timers_clear()` to make sure it
@@ -1886,8 +2075,8 @@ first things the visitor process does after waking up on a timer signal is to ca
 :c:func:`cmb_priorityqueue_cancel()` to make sure that it is not admitted on a ride
 when it actually is walking away from that attraction.
 
-The entire dynamic of having the same process object both act as an active, opinionated
-agent in its simulated world, and act as a passive object being handled by other
+The entire dynamic of having the same process object act both as an active opinionated
+agent in its simulated world, and as a passive object being handled by other
 processes is enabled by our processes being stackful coroutines. When suspended, their
 entire state is safely stored on their own execution stack until it is resumed from the
 same point where it left off. Our processes are first-class objects that can be passed
@@ -1932,8 +2121,9 @@ process can wait for it there, collect its statistics, and reclaim its allocated
         }
     }
 
-Here, we have not bothered to define this as a derived class, but just pass it the
-pointer to the ``departeds`` object queue as part of the context argument.
+Here, we have not bothered to define this as a separate derived class, but just pass it
+the pointer to the ``departeds`` object queue as part of the ``cmb_process`` context
+argument.
 
 Alias sampling probabilities
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1958,6 +2148,13 @@ calling :c:func:`cmb_random_alias_sample()`, and clean it up when no longer need
 calling :c:func:`cmb_random_alias_destroy()`. The overhead in construction and
 destruction pays for itself in overall efficiency already for *n > 7* or so.
 
+.. note::
+
+    The alert reader will notice that this collapses our usual four-part harmony of
+    ``_create()``, ``_initialize()``, ``_terminate()``, and ``_destroy()`` into just the
+    two functions ``_create()`` and ``_destroy()``. Since we are not anticipating any
+    derived classes from the alias table, we found this a reasonable exception to make.
+
 It looks like this in the ``struct attraction``:
 
 .. code-block:: c
@@ -1971,14 +2168,15 @@ It looks like this in the ``struct attraction``:
     };
 
 It is initialized like this in ``attraction_initialize`` from one row of the transition
-probability matrix:
+probability matrix, the probability vector for a visitor going to any other attraction
+after finishing at this one:
 
 .. code-block:: c
 
     ap->quo_vadis = cmb_random_alias_create(NUM_ATTRACTIONS + 2, transition_probs[ui]);
 
-and, as we saw above, sampled like this by the ``visitor_proc`` when deciding where to
-go next.
+As we saw above, it is sampled like this by the ``visitor_proc`` when deciding where to
+go next:
 
 .. code-block:: c
 
@@ -1990,11 +2188,11 @@ It eventually gets destroyed from ``attraction_terminate()``:
 
     cmb_random_alias_destroy(ap->quo_vadis);
 
-A day in the park
-^^^^^^^^^^^^^^^^^
-
 You can find the rest of the code in
 `tutorials/tut_3_1.c <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_3_1.c>`__
+
+A day in the park
+^^^^^^^^^^^^^^^^^
 
 Running it, we get output like this:
 
@@ -2067,146 +2265,168 @@ Running it, we get output like this:
 .. code-block:: none
 
     Number of rides taken:
-    N      489  Mean    2.656  StdDev    2.065  Variance    4.263  Skewness    1.161  Kurtosis    1.826
+    N      477  Mean    2.696  StdDev    2.171  Variance    4.712  Skewness    1.504  Kurtosis    4.213
     Time spent in park:
-    N      489  Mean    57.29  StdDev    28.75  Variance    826.4  Skewness    1.922  Kurtosis    5.839
+    N      477  Mean    58.68  StdDev    31.71  Variance    1006.  Skewness    2.786  Kurtosis    13.48
     Riding times:
-    N      489  Mean    18.25  StdDev    15.74  Variance    247.8  Skewness    1.437  Kurtosis    3.119
+    N      477  Mean    18.75  StdDev    16.99  Variance    288.5  Skewness    1.971  Kurtosis    7.142
     Waiting times:
-    N      489  Mean    5.135  StdDev    5.840  Variance    34.11  Skewness    1.506  Kurtosis    2.701
+    N      477  Mean    4.877  StdDev    5.794  Variance    33.57  Skewness    1.985  Kurtosis    7.021
     Walking times:
-    N      489  Mean    32.36  StdDev    10.38  Variance    107.7  Skewness    1.819  Kurtosis    6.464
+    N      477  Mean    33.30  StdDev    12.12  Variance    146.9  Skewness    2.914  Kurtosis    15.28
 
     Detailed queue reports:
     Queue lengths for Queue_01_00:
-    N      291  Mean   0.6106  StdDev    1.966  Variance    3.864  Skewness    1.035  Kurtosis   -1.130
+    N      286  Mean   0.4110  StdDev   0.7480  Variance   0.5594  Skewness    2.007  Kurtosis    4.068
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
     [     0.000,      1.000)   |##################################################
-    [     1.000,      2.000)   |################-
-    [     2.000,      3.000)   |######-
-    [     3.000,      4.000)   |###-
-    [     4.000,      5.000)   |#-
-    [     5.000,  Infinity )   |=
+    [     1.000,      2.000)   |#############-
+    [     2.000,      3.000)   |#####-
+    [     3.000,      4.000)   |#-
+    [     4.000,      5.000)   |-
+    [     5.000,   Infinity)   |
     --------------------------------------------------------------------------------
     Queue lengths for Queue_02_00:
-    N      208  Mean  0.02090  StdDev   0.3534  Variance   0.1249  Skewness    3.552  Kurtosis    11.59
+    N      195  Mean  0.02044  StdDev   0.1670  Variance  0.02788  Skewness    9.533  Kurtosis    105.4
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
     [     0.000,      1.000)   |##################################################
     [     1.000,      2.000)   |=
-    [     2.000,  Infinity )   |-
+    [     2.000,      3.000)   |-
+    [     3.000,      4.000)   |-
+    [     4.000,   Infinity)   |
     --------------------------------------------------------------------------------
     Queue lengths for Queue_03_00:
-    N      226  Mean  0.05570  StdDev   0.5429  Variance   0.2947  Skewness    2.165  Kurtosis    2.624
+    N      226  Mean  0.07242  StdDev   0.3426  Variance   0.1174  Skewness    6.695  Kurtosis    61.08
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
-    [     0.000,      1.000)   |##################################################
+    [     0.000,      1.000)   |##################################################-
     [     1.000,      2.000)   |##-
-    [     2.000,  Infinity )   |-
+    [     2.000,      3.000)   |-
+    [     3.000,      4.000)   |-
+    [     4.000,      5.000)   |-
+    [     5.000,      6.000)   |-
+    [     6.000,   Infinity)   |
     --------------------------------------------------------------------------------
     Queue lengths for Queue_04_00:
-    N      124  Mean   0.6596  StdDev    1.430  Variance    2.046  Skewness  -0.1934  Kurtosis   -2.882
+    N      127  Mean   0.7141  StdDev   0.5106  Variance   0.2608  Skewness  -0.2920  Kurtosis  -0.5959
+    --------------------------------------------------------------------------------
+    ( -Infinity,      0.000)   |
+    [     0.000,      1.000)   |#######################=
+    [     1.000,      2.000)   |##################################################
+    [     2.000,      3.000)   |##-
+    [     3.000,   Infinity)   |
+    --------------------------------------------------------------------------------
+    Queue lengths for Queue_04_01:
+    N       97  Mean   0.6702  StdDev   0.4936  Variance   0.2436  Skewness  -0.4400  Kurtosis   -1.116
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
     [     0.000,      1.000)   |##########################-
     [     1.000,      2.000)   |##################################################
-    [     2.000,  Infinity )   |-
-    --------------------------------------------------------------------------------
-    Queue lengths for Queue_04_01:
-    N       87  Mean   0.6489  StdDev    1.839  Variance    3.383  Skewness -0.05056  Kurtosis   -2.938
-    --------------------------------------------------------------------------------
-    ( -Infinity,      0.000)   |
-    [     0.000,      1.000)   |##############################=
-    [     1.000,      2.000)   |##################################################
-    [     2.000,  Infinity )   |#=
+    [     2.000,      3.000)   |=
+    [     3.000,   Infinity)   |
     --------------------------------------------------------------------------------
     Queue lengths for Queue_04_02:
-    N       42  Mean   0.5169  StdDev    2.566  Variance    6.586  Skewness -0.01380  Kurtosis   -3.189
+    N       47  Mean   0.6594  StdDev   0.6268  Variance   0.3929  Skewness   0.4075  Kurtosis  -0.6762
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
-    [     0.000,      1.000)   |##############################################=
-    [     1.000,  Infinity )   |##################################################
+    [     0.000,      1.000)   |###########################################-
+    [     1.000,      2.000)   |##################################################
+    [     2.000,      3.000)   |########=
+    [     3.000,   Infinity)   |
     --------------------------------------------------------------------------------
     Queue lengths for Queue_05_00:
-    N      228  Mean   0.6369  StdDev    1.959  Variance    3.836  Skewness   0.6569  Kurtosis   -2.050
+    N      230  Mean   0.5964  StdDev   0.9796  Variance   0.9596  Skewness    1.978  Kurtosis    4.189
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
     [     0.000,      1.000)   |##################################################
-    [     1.000,      2.000)   |#####################=
-    [     2.000,      3.000)   |##########-
-    [     3.000,      4.000)   |##=
+    [     1.000,      2.000)   |################=
+    [     2.000,      3.000)   |#######-
+    [     3.000,      4.000)   |###-
     [     4.000,      5.000)   |=
-    [     5.000,  Infinity )   |-
+    [     5.000,      6.000)   |=
+    [     6.000,   Infinity)   |
     --------------------------------------------------------------------------------
     Queue lengths for Queue_06_00:
-    N      203  Mean   0.2927  StdDev    1.465  Variance    2.147  Skewness   0.9759  Kurtosis   -1.616
+    N      202  Mean   0.2753  StdDev   0.5940  Variance   0.3529  Skewness    2.572  Kurtosis    7.949
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
     [     0.000,      1.000)   |##################################################
-    [     1.000,      2.000)   |########-
-    [     2.000,      3.000)   |###=
-    [     3.000,  Infinity )   |=
+    [     1.000,      2.000)   |##########=
+    [     2.000,      3.000)   |##-
+    [     3.000,      4.000)   |-
+    [     4.000,      5.000)   |-
+    [     5.000,   Infinity)   |
     --------------------------------------------------------------------------------
     Queue lengths for Queue_07_00:
-    N      200  Mean   0.2457  StdDev    1.284  Variance    1.649  Skewness   0.9909  Kurtosis   -1.588
-    --------------------------------------------------------------------------------
-    ( -Infinity,      0.000)   |
-    [     0.000,      1.000)   |#################################################=
-    [     1.000,      2.000)   |########=
-    [     2.000,      3.000)   |###-
-    [     3.000,  Infinity )   |-
-    --------------------------------------------------------------------------------
-    Queue lengths for Queue_08_00:
-    N      178  Mean   0.4554  StdDev    1.750  Variance    3.062  Skewness   0.5572  Kurtosis   -2.401
+    N      214  Mean   0.2654  StdDev   0.5742  Variance   0.3297  Skewness    2.359  Kurtosis    5.642
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
     [     0.000,      1.000)   |##################################################
-    [     1.000,      2.000)   |#################-
-    [     2.000,      3.000)   |#######=
-    [     3.000,  Infinity )   |=
+    [     1.000,      2.000)   |##########-
+    [     2.000,      3.000)   |##-
+    [     3.000,      4.000)   |=
+    [     4.000,   Infinity)   |
     --------------------------------------------------------------------------------
-    Queue lengths for Queue_09_00:
-    N      198  Mean   0.2153  StdDev    1.199  Variance    1.438  Skewness    1.078  Kurtosis   -1.344
+    Queue lengths for Queue_08_00:
+    N      145  Mean   0.3593  StdDev   0.6692  Variance   0.4478  Skewness    2.041  Kurtosis    4.269
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
-    [     0.000,      1.000)   |#################################################=
-    [     1.000,      2.000)   |#######=
-    [     2.000,      3.000)   |##-
-    [     3.000,  Infinity )   |-
+    [     0.000,      1.000)   |##################################################
+    [     1.000,      2.000)   |#############=
+    [     2.000,      3.000)   |###=
+    [     3.000,      4.000)   |=
+    [     4.000,      5.000)   |-
+    [     5.000,   Infinity)   |
+    --------------------------------------------------------------------------------
+    Queue lengths for Queue_09_00:
+    N      188  Mean   0.2708  StdDev   0.6848  Variance   0.4689  Skewness    3.649  Kurtosis    17.04
+    --------------------------------------------------------------------------------
+    ( -Infinity,      0.000)   |
+    [     0.000,      1.000)   |##################################################-
+    [     1.000,      2.000)   |########=
+    [     2.000,      3.000)   |#=
+    [     3.000,      4.000)   |-
+    [     4.000,      5.000)   |-
+    [     5.000,      6.000)   |-
+    [     6.000,      7.000)   |-
+    [     7.000,   Infinity)   |
     --------------------------------------------------------------------------------
 
 ...and finally, it reports the trial outcomes that would be passed on to the experiment
-array if we parallelized this simulation in the same way as the first (and next) example:
+array if we parallelized this simulation in the same way as the first example:
 
 .. code-block:: none
 
     Trial outcomes:
     ---------------
-    Average number of rides: 2.66
-    Average time in park: 57.29
-    Average time in rides: 18.25
-    Average time in queues: 5.13
-    Average time walking: 32.36
+    Average number of rides: 2.70
+    Average time in park: 58.68
+    Average time in rides: 18.75
+    Average time in queues: 4.88
+    Average time walking: 33.30
 
-We will skip parallelizing this example, since it would be the same as
-:ref:`parallelizing the first tutorial <tut_1_parallel>`, and will instead move
-to the final tutorial.
+We will skip parallelizing this example, and will instead move to the next tutorial.
 
 .. _tut_4:
 
-A LNG tanker harbor with complex resources and conditions
----------------------------------------------------------
+More complex resources and conditions
+-------------------------------------
 
 Once upon a time, a harbor simulation with tugs puttering about was the author's
 first exposure to Simula67, coroutines, and object-oriented programming. The
 essential *rightness* made a lasting impression. Building a beefed-up 21st century
 version will be our next Cimba tutorial.
 
-We will use the occasion to introduce the extremely powerful :c:struct:`cmb_condition`
+We will use the occasion to introduce the powerful :c:struct:`cmb_condition`
 that allows our processes to make arbitrarily complex ``wait`` calls. We will also show
 how to use some of the Cimba internal building blocks, like the ``cmi_slist`` singly
 linked list and the ``cmi_hashheap`` for various collections of simulation objects.
+
+Moreover, we will introduce the mechanisms for abandoning a trial in progress, safely
+recovering the memory allocated in the trial, marking the abandoned trial as incomplete in
+the experiment array, and moving on to the next trial.
 
 Since a simulation model only should be built in order to answer some specific
 question or set of questions, we will assume that our customer, the Simulated Port
@@ -2220,8 +2440,8 @@ time unit in our simulation will be hours.
 An empty simulation template
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Our starting point will be an empty shell from :ref:`the first tutorial <tut_1>`,
-giving the correct initial structure to the model. You will find it in
+Our starting point will be an empty shell giving the correct initial structure to
+the model. You will find it in
 `tutorial/tut_4_0.c <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_4_0.c>`__.
 It does not do anything, so there is no point in compiling it as it is, but you
 can use it as a starting template for your own models as well.
@@ -2235,9 +2455,11 @@ Processes, resources, and conditions
 
 The simulated world is described in ``struct simulation``. Again, there is an
 arrival and a departure process generating and removing ships, and the ships
-themselves are again active processes. We have two pools of resources, the
-tugs and the berths (of two different sizes), and one single resource, the
-communication channel used to announce that a ship is moving.
+themselves are again active processes.
+
+We have two pools of resources, the tugs and the berths (of two different sizes),
+and one single resource, the communication channel used to announce that a ship is
+moving.
 
 There are also two condition variables. One, the harbormaster, ensures that all
 necessary conditions (including tides and wind) are met and resources are available
@@ -2245,7 +2467,7 @@ before it permits a ship to start acquiring resources and proceed towards dockin
 The other one, Davy Jones, just watches for ships leaving harbor and triggers the
 departure process.
 
-There is no guarantee that ships will be leaving in first in first out order, so
+There is no guarantee that ships will be leaving in first-in, first-out order, so
 we use a ``cmi_hashheap`` as a fast data set for active ships. Departed ships can be
 handled by simpler means, so a simple linked list with LIFO (stack) ordering will
 be sufficient. These two classes are not considered part of the external Cimba
@@ -2371,8 +2593,7 @@ function is a predicate returning a ``bool``, either ``true`` or ``false``, esse
 saying to the guard "wake me up when this becomes true".
 
 For a :c:struct:`cmb_resource`, the demand function is internal and pre-defined,
-evaluating
-to ``true`` if the resource is available. When a process releases the
+evaluating to ``true`` if the resource is available. When a process releases the
 resource, the guard is signaled, the predicate evaluates to ``true``, and the
 highest priority waiting process gets the resource and returns successfully from
 its :c:func:`cmb_resource_acquire()` (or :c:func:`cmb_resource_preempt()`) call as the
@@ -2382,7 +2603,8 @@ Similarly, the :c:struct:`cmb_resourcepool` is a counting semaphore, where there
 certain number of resource items and a process can acquire and release more
 than one unit at a time. Again, if not enough is available, the process files its
 demand with the guard and waits. This demand function is also internal and
-pre-defined.
+pre-defined. It evaluates to true if *some* amount of the resource is available, since
+a waiting process may collect its request piecewise.
 
 The :c:struct:`cmb_condition` exposes the resource guard and demand mechanism to the user
 application. It does not provide any particular resource object, but lets a
@@ -2402,9 +2624,8 @@ for the :c:struct:`cmb_condition` to provide complex combinations of "wait for a
 resource guard gets signaled, the :c:struct:`cmb_condition` will also be signaled.
 
 The :c:struct:`cmb_condition` is still a passive object, not an active process. It only
-responds to calls like :c:struct:`cmb_condition_wait` and
-:c:func:`cmb_condition_signal` from some active :c:struct:`cmb_process`. If not signaled
-from a process, it does nothing.
+responds to calls like :c:struct:`cmb_condition_wait` and :c:func:`cmb_condition_signal`
+from some active :c:struct:`cmb_process`. If not signaled from a process, it does nothing.
 
 Armed with this knowledge, we can now define the demand predicate function for
 a ship requesting permission from the harbormaster to dock:
@@ -2666,9 +2887,9 @@ We next write the arrival process generating ships:
         }
     }
 
-As we see, Cimba processes can create other processes as needed. These simply become
+As we see, Cimba processes can create other processes as needed. These become
 additional asymmetric coroutines executing on their own stacks with no special handling
-needed. There are no "function coloring" issues involved. The processes switch
+needed. There are no "function coloring" issues. The processes switch
 seamlessly between being active agents and passive objects as needed. For the programmer,
 mentally placing oneself in a process and just focusing on what that process does is a
 very powerful encapsulation of complexity.
@@ -2834,7 +3055,6 @@ Building and running our new harbor simulation, we get output similar to this:
 
 .. code-block:: none
 
-    [ambonvik@Threadripper tutorial]$ ./tut_2_1 | more
     1.5696	Arrivals	arrival_proc (335):  Ship_000001_large started
     1.5696	Ship_000001_large	ship_proc (227):  Ship_000001_large arrives
     1.5696	Ship_000001_large	is_ready_to_dock (209):  All good for Ship_000001_large
@@ -2914,103 +3134,109 @@ Building and running our new harbor simulation, we get output similar to this:
 
 .. code-block:: none
 
-    /home/ambonvik/github/cimba/build/tutorial/tut_2_1
-
     System times for small ships:
-    N     3278  Mean    10.81  StdDev    2.408  Variance    5.798  Skewness    1.346  Kurtosis    3.049
+    Min    7.126  First_Q    9.097  Median    10.39  Third_Q    12.11  Max    32.92
+    N     3298  Mean    10.89  StdDev    2.552  Variance    6.512  Skewness    1.775  Kurtosis    6.340
     --------------------------------------------------------------------------------
-    ( -Infinity,      7.051)   |
-    [     7.051,      7.989)   |###################=
-    [     7.989,      8.927)   |##############################################=
-    [     8.927,      9.865)   |##################################################
-    [     9.865,      10.80)   |################################################=
-    [     10.80,      11.74)   |########################################-
-    [     11.74,      12.68)   |############################-
-    [     12.68,      13.62)   |#####################-
-    [     13.62,      14.55)   |#############-
-    [     14.55,      15.49)   |#######-
-    [     15.49,      16.43)   |#####-
-    [     16.43,      17.37)   |#=
-    [     17.37,      18.31)   |#-
-    [     18.31,      19.24)   |#=
-    [     19.24,      20.18)   |=
-    [     20.18,      21.12)   |=
-    [     21.12,      22.06)   |=
-    [     22.06,      22.99)   |-
-    [     22.99,      23.93)   |-
-    [     23.93,      24.87)   |-
-    [     24.87,      25.81)   |
-    [     25.81,  Infinity )   |-
+    ( -Infinity,      7.126)   |
+    [     7.126,      8.416)   |##########################-
+    [     8.416,      9.706)   |##################################################
+    [     9.706,      11.00)   |#################################################=
+    [     11.00,      12.29)   |##################################-
+    [     12.29,      13.58)   |#####################=
+    [     13.58,      14.87)   |############=
+    [     14.87,      16.16)   |#####-
+    [     16.16,      17.44)   |##=
+    [     17.44,      18.73)   |#=
+    [     18.73,      20.02)   |#-
+    [     20.02,      21.31)   |=
+    [     21.31,      22.60)   |-
+    [     22.60,      23.89)   |-
+    [     23.89,      25.18)   |-
+    [     25.18,      26.47)   |-
+    [     26.47,      27.76)   |-
+    [     27.76,      29.05)   |
+    [     29.05,      30.34)   |-
+    [     30.34,      31.63)   |
+    [     31.63,      32.92)   |
+    [     32.92,   Infinity)   |-
     --------------------------------------------------------------------------------
 
     System times for large ships:
-    N     1060  Mean    17.34  StdDev    5.548  Variance    30.78  Skewness    2.024  Kurtosis    7.243
+    Min    10.30  First_Q    13.21  Median    15.37  Third_Q    18.31  Max    48.60
+    N     1081  Mean    16.49  StdDev    4.832  Variance    23.35  Skewness    2.000  Kurtosis    6.453
     --------------------------------------------------------------------------------
-    ( -Infinity,      10.38)   |
-    [     10.38,      12.67)   |###################################=
-    [     12.67,      14.96)   |##################################################
-    [     14.96,      17.25)   |#########################################-
-    [     17.25,      19.54)   |##############################=
-    [     19.54,      21.83)   |#################-
-    [     21.83,      24.12)   |##############-
-    [     24.12,      26.41)   |#####=
-    [     26.41,      28.70)   |#####=
-    [     28.70,      30.99)   |####-
-    [     30.99,      33.28)   |##=
-    [     33.28,      35.56)   |-
-    [     35.56,      37.85)   |-
-    [     37.85,      40.14)   |-
-    [     40.14,      42.43)   |-
-    [     42.43,      44.72)   |-
-    [     44.72,      47.01)   |
-    [     47.01,      49.30)   |
-    [     49.30,      51.59)   |-
-    [     51.59,      53.88)   |-
-    [     53.88,      56.17)   |
-    [     56.17,  Infinity )   |-
+    ( -Infinity,      10.30)   |
+    [     10.30,      12.22)   |###################################-
+    [     12.22,      14.13)   |#################################################=
+    [     14.13,      16.05)   |##################################################
+    [     16.05,      17.96)   |######################################=
+    [     17.96,      19.88)   |########################-
+    [     19.88,      21.79)   |############-
+    [     21.79,      23.71)   |##########-
+    [     23.71,      25.62)   |####=
+    [     25.62,      27.54)   |#####-
+    [     27.54,      29.45)   |##-
+    [     29.45,      31.36)   |=
+    [     31.36,      33.28)   |=
+    [     33.28,      35.19)   |-
+    [     35.19,      37.11)   |#-
+    [     37.11,      39.02)   |=
+    [     39.02,      40.94)   |-
+    [     40.94,      42.85)   |
+    [     42.85,      44.77)   |-
+    [     44.77,      46.68)   |
+    [     46.68,      48.60)   |
+    [     48.60,   Infinity)   |-
     --------------------------------------------------------------------------------
 
     Utilization of small berths:
-    N     5890  Mean    3.809  StdDev    2.069  Variance    4.280  Skewness  -0.2231  Kurtosis   -1.621
+    Min    0.000  First_Q    3.000  Median    4.000  Third_Q    5.000  Max    6.000
+    N     5859  Mean    3.839  StdDev    1.671  Variance    2.792  Skewness  -0.2813  Kurtosis  -0.9255
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
-    [     0.000,      1.000)   |#####-
-    [     1.000,      2.000)   |#################-
+    [     0.000,      1.000)   |####-
+    [     1.000,      2.000)   |################-
     [     2.000,      3.000)   |################################=
     [     3.000,      4.000)   |#######################################-
-    [     4.000,      5.000)   |########################################-
-    [     5.000,      6.000)   |##################################=
-    [     6.000,  Infinity )   |##################################################
+    [     4.000,      5.000)   |##########################################=
+    [     5.000,      6.000)   |###################################-
+    [     6.000,      7.000)   |##################################################
+    [     7.000,   Infinity)   |
     --------------------------------------------------------------------------------
 
     Utilization of large berths:
-    N     1766  Mean    1.797  StdDev    2.347  Variance    5.509  Skewness  -0.1321  Kurtosis   -2.636
+    Min    0.000  First_Q    1.000  Median    2.000  Third_Q    3.000  Max    3.000
+    N     1853  Mean    1.816  StdDev    1.031  Variance    1.063  Skewness  -0.3223  Kurtosis   -1.102
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
-    [     0.000,      1.000)   |####################-
+    [     0.000,      1.000)   |###################-
     [     1.000,      2.000)   |#######################################-
-    [     2.000,      3.000)   |######################################=
-    [     3.000,  Infinity )   |##################################################
+    [     2.000,      3.000)   |###########################################-
+    [     3.000,      4.000)   |##################################################
+    [     4.000,   Infinity)   |
     --------------------------------------------------------------------------------
 
     Utilization of tugs:
-    N    16311  Mean   0.8651  StdDev   0.9467  Variance   0.8962  Skewness    2.449  Kurtosis    8.635
+    Min    0.000  First_Q    0.000  Median    0.000  Third_Q    1.000  Max    10.00
+    N    16456  Mean   0.8756  StdDev    1.305  Variance    1.703  Skewness    1.815  Kurtosis    3.444
     --------------------------------------------------------------------------------
     ( -Infinity,      0.000)   |
     [     0.000,      1.000)   |##################################################
-    [     1.000,      2.000)   |######################-
+    [     1.000,      2.000)   |######################=
     [     2.000,      3.000)   |####=
-    [     3.000,      4.000)   |#######=
+    [     3.000,      4.000)   |########-
     [     4.000,      5.000)   |###-
     [     5.000,      6.000)   |=
     [     6.000,      7.000)   |=
     [     7.000,      8.000)   |-
     [     8.000,      9.000)   |-
     [     9.000,      10.00)   |-
-    [     10.00,  Infinity )   |-
+    [     10.00,      11.00)   |-
+    [     11.00,   Infinity)   |
     --------------------------------------------------------------------------------
-    Avg time in system, small ships: 10.812688
-    Avg time in system, large ships: 17.341350
+    Avg time in system, small ships: 10.890823
+    Avg time in system, large ships: 16.488005
 
 You can find the code for this single-threaded stage in
 `tutorial/tut_4_1.c <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_4_1.c>`__.
@@ -3026,23 +3252,32 @@ scenarios where traffic increases by 10 % and 25 % above today's baseline levels
 
 Time to fire up more computing power.
 
-Setting up our experiment, we believe that the factors dredging depth, number of tugs,
-and number
-of small and large berths are largely independent. We can probably vary one at a time
-rather than setting up a factorial experiment (which may still be computationally more
-efficient to do). To ensure that the SPA also has numbers it can use beyond next
-year's budget, we try five levels of each parameter, dredging in steps of 0.5 meters
-and adding tugs and berths in steps of one. We again run ten replications of each
+Setting up our experiment, we have the factors dredging depth, number of tugs,
+and number of small and large berths. To ensure that the SPA also has numbers it can use
+beyond next year's budget, we try five levels of each parameter, dredging in steps of 0.5
+meters and adding tugs and berths in steps of one. We again run ten replications of each
 parameter set. This gives us 4 * 5 * 3 = 60 parameter combinations and 60 * 10 = 600 trials.
-We will run each trial for 10 years of simulated time, i.e. 10 * 365 * 24 = 87360 time units,
-allowing 30 days' warmup time before we start collecting data.
+We will run each trial for one year of simulated time, i.e. 365 * 24 = 8760 time
+units, allowing 30 days' warmup time before we start collecting data.
 
-Writing the ``main()`` function is straightforward, albeit somewhat tedious. It does
-the same as in :ref:`the previous tutorial <tut_3>`: Sets up the experiment as an array
-of trials, executes it in parallel on the available CPU cores, assembles the output as a data
-file, and plots it in a separate gnuplot window.
+Writing the ``main()`` function is straightforward, albeit somewhat tedious. As in
+:ref:`the previous tutorial <tut_3>`, it sets up the experiment as an array
+of trials, consisting of parameter variations and replications.
 
-We compile and run, and 4.1 seconds later, this chart appears, showing our 60
+.. note::
+
+    In
+    `a recent review article <https://www.tandfonline.com/doi/full/10.1080/17477778.2025.2527151#abstract>`_,
+    Gjærløv & al argued that Design of Experiments methods could and should be more used by
+    the simulation community. One of the explanations for the current under-utilization is
+    that typical simulation frameworks are stand-alone tools that run a single trial, not
+    well integrated with a programming language. As we have seen, Cimba puts the
+    experimental design front and center. When structuring the experiment array, the user
+    will *have* to think through the design. What parameters, how many levels, what values, how many
+    replications for each? Implementing it is then just a simple piece of code, and
+    unpåacking the results its mirror image.
+
+We compile and run, and this chart appears, showing our 60
 parameter combinations, the average time in the system for small (blue) and large ships
 (red) under each set of parameters, and tight 95 % confidence intervals based
 on our 10 replications of each parameter combination:
@@ -3055,27 +3290,239 @@ berth, especially if traffic is expected to increase. However, building more tha
 one does not make much sense even at the highest traffic scenario. The SPA should
 rather consider building another one or two small berths next.
 
-This concludes our fourth tutorial. The code is in
+The code for this stage is in
 `tutorial/tut_4_2.c <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_4_2.c>`_.
-We have demonstrated the very powerful
-:c:struct:`cmb_condition` allowing processes to wait for arbitrary combinations of
-conditions in the simulated world. We also used the internal :c:struct:`cmi_slist` and
-:c:struct:`cmi_hashheap` as
-handy building blocks for other purposes, and leave it to you to discover additional
-possibilities.
 
-For a more in-depth discussion of how various parts of Cimba work and why they were
-built that way, consider reading :ref:`the background section <background>` next.
+.. _tutorial_abandoning:
+
+Abandoning a trial
+^^^^^^^^^^^^^^^^^^
+
+Before we leave the harbor example, we will also demonstrate Cimba's mechanism to
+abandon a trial midway and have it automatically reclaim any allocated memory. The use
+case for this is either some kind of rejection sampling from some scenario, where the
+model determines that it is outside the relevant distribution and skips to the next
+trial, or an error condition in the model that invalidates the results (but does not
+corrupt the program).
+
+In the first case, rejection sampling or similar, one would probably call
+``cimba_trial_abandon()``, which does exactly what it says. In the second case, one
+would rather call ``cmb_logger_error()`` with its ``printf``-style formatted message.
+It will call ``cimba_trial_abandon()`` internally after printing the log entry.
+
+Either way, Cimba will call the necessary destructors on all abandoned ``cmb_ ``objects
+in the trial. Any memory that is directly allocated in user code is its own
+responsibility to free. Cimba also provides a callback hook to register a
+clanup-handler for this, avoiding the need to add code for memory cleanup just before
+each call to ``cmb_logger_error()``.
+
+We modify our ``tut_4_2.c`` slightly. First, we change the local stack-allocated
+objects ``env``, ``sim``, and ``ctx`` in ``run_trial()`` to heap-allocated with
+``malloc()``. Unless freed by a matching call to ``free``, this memory will be
+leaked in an abandoned call. Over a long experiment with may trials, several of them
+abandoned, that leakage may add up to an out-of-memory crash. We will ensure that this
+does not occur.
+
+.. code-block:: c
+
+    /* Heap allocated for this tutorial */
+    struct environment *envp = malloc(sizeof(*envp));
+    cmb_assert_always(envp != NULL);
+    memset(envp, 0, sizeof(*envp));
+    struct simulation *simp = malloc(sizeof(*simp));
+    cmb_assert_always(simp != NULL);
+    memset(simp, 0, sizeof(*simp));
+    struct context *ctxp = malloc(sizeof(*ctxp));
+    cmb_assert_always(ctxp != NULL);
+    memset(ctxp, 0, sizeof(*ctxp));
+    ctxp->env = envp;
+    ctxp->sim = simp;
+    ctxp->trl = trlp;
+
+We also clean it up at the normal end of a trial run:
+
+.. code-block:: c
+
+    free(ctxp->env);
+    free(ctxp->sim);
+    free(ctxp);
+
+We define a separate trial cleanup function to be called if needed:
+
+.. code-block:: c
+
+    void trial_cleanup(void *vctx)
+    {
+        cmb_assert_always(vctx != NULL);
+
+        struct context *ctxp = (struct context *)vctx;
+        struct simulation *simp = ctxp->sim;
+        struct environment *envp = ctxp->env;
+
+        /* Stop and recycle any still active ships */
+        while (cmi_hashheap_count(&(simp->active_ships)) > 0u) {
+            void **item = cmi_hashheap_dequeue(&(simp->active_ships));
+            struct ship *shpp = item[0];
+            cmb_process_stop((struct cmb_process *)shpp, NULL);
+            ship_terminate(shpp);
+            ship_destroy(shpp);
+        }
+
+        /* Any departed ships waiting? */
+        struct cmi_slist_node *dep_head = &(simp->departed_ships);
+        while (!cmi_slist_is_empty(dep_head)) {
+            struct cmi_slist_node *snode = cmi_slist_pop(dep_head);
+            struct ship *shp = cmi_slist_entry(snode, struct ship, listnode);
+            double *t_sys_p = cmb_process_exit_value((struct cmb_process *)shp);
+            ship_terminate(shp);
+            ship_destroy(shp);
+            free(t_sys_p);
+        }
+
+        cmi_hashheap_terminate(&(simp->active_ships));
+        cmi_slist_terminate(&(simp->departed_ships));
+
+        free(envp);
+        free(simp);
+        free(ctxp);
+    }
+
+We need to take responsibility for all our ``malloc`` calls, including those in our
+derived classes such as ``ship``, and for any direct use of Cimba internal ``cmi_``
+objects like the ``cmi_hashheap`` and ``cmi_slist`` here.
+
+We register ``trial_cleanup` as the trial cleanup handler in ``run_trial``, just after
+allocating the context struct:
+
+.. code-block:: c
+
+    cimba_trial_cleanup_set(trial_cleanup, ctxp);
+
+We can then make trial-ending error calls from anywhere, for example in the middle of a
+``ship_proc``, a derived class object itself created by another process:
+
+.. code-block:: c
+
+    /* Simulate a trial-abandoning error condition */
+    if (cmb_random_bernoulli(1e-5)) {
+        cmb_logger_error(stdout, "Randomly abandoning trial");
+    }
+
+If it had called ``cmb_logger_fatal()`` instead, it would have aborted the
+entire run right there, and if it had called ``cmb_logger_warning()``, execution would
+just have continued in the same trial. If we wanted to just abandon the trial without a
+logger message, it could have called ``cimba_trial_abandon()`` and done just that.
+
+To make sure we calculate the statistics correctly even with missing samples, we
+initiate the trial result fields to a known out-of-band value, e.g.:
+
+.. code-block:: c
+
+    experiment[ui_trl].avg_time_in_system[SMALL] = -1.0;
+    experiment[ui_trl].avg_time_in_system[LARGE] = -1.0;
+
+``cimba_run()`` will return the number of failed trials, i.e., return value zero means
+"all trials good".
+
+.. code-block:: c
+
+    printf("Configured %u trials\n", ui_trl);
+    printf("Executing experiment\n");
+    const uint64_t nfailed = cimba_run(experiment, n_trials, sizeof(*experiment), run_trial);
+    printf("Experiment finished, %" PRIu64 " failed trials, %" PRIu64 " successful\n",
+            nfailed, ui_trl - nfailed);
+
+We can then check for valid result or not in each trial when assembling the statistics:
+
+.. code-block:: c
+
+    for (unsigned ui_rep = 0u; ui_rep < N_REPS; ui_rep++) {
+        if (experiment[ui_trl].avg_time_in_system[SMALL] != -1.0) {
+            cmb_datasummary_add(&ds_small, experiment[ui_trl].avg_time_in_system[SMALL]);
+            cmb_datasummary_add(&ds_large, experiment[ui_trl].avg_time_in_system[LARGE]);
+        }
+        ui_trl++;
+    }
+
+For extra credit, we also calculate the confidence intervals from the actual number of
+samples in each case:
+
+.. code-block:: c
+
+            const double smpl_cnt_small = cmb_datasummary_count(&ds_small);
+            const double smpl_avg_small = cmb_datasummary_mean(&ds_small);
+            const double smpl_sd_small = cmb_datasummary_stddev(&ds_small);
+            const double t_crit_small = t_crit_95(smpl_cnt_small);
+
+            const double smpl_cnt_large = cmb_datasummary_count(&ds_large);
+            const double smpl_avg_large = cmb_datasummary_mean(&ds_large);
+            const double smpl_sd_large = cmb_datasummary_stddev(&ds_large);
+            const double t_crit_large = t_crit_95(smpl_cnt_large);
+
+We compile and run, and get output similar to this:
+
+.. code-block:: none
+
+    [ambonvik@Threadripper cimba]$ ./build/tutorial/tut_4_3
+    Cimba version 3.0.0-RC1
+    Setting up experiment
+    Configured 600 trials
+    Executing experiment
+    2	    0.0000	dispatcher	run_trial (568):  Started, seed 0x2b91dbf7402c1b90
+    0	    0.0000	dispatcher	run_trial (568):  Started, seed 0x93ceaf7eb880eb72
+    4	    0.0000	dispatcher	run_trial (568):  Started, seed 0xf02d686e82beeece
+    1	    0.0000	dispatcher	run_trial (568):  Started, seed 0xb2d60cb0046eba9c
+    5	    0.0000	dispatcher	run_trial (568):  Started, seed 0x1dbf274139c09c4d
+    3	    0.0000	dispatcher	run_trial (568):  Started, seed 0xe6fa5d8c2560411b
+
+    ...
+
+    61	    0.0000	dispatcher	run_trial (568):  Started, seed 0x1015f31088cbb8a3
+    63	    0.0000	dispatcher	run_trial (568):  Started, seed 0x655c64dfbd5c0928
+    20	    1628.1	Ship_000810_small	ship_proc (324):  Error: Randomly abandoning trial, seed 0x147f3521cef44265
+    64	    0.0000	dispatcher	run_trial (568):  Started, seed 0x3c34ef2bc108cc5c
+    40	    5763.8	Ship_002874_small	ship_proc (324):  Error: Randomly abandoning trial, seed 0xe80a62c2948f8967
+    65	    0.0000	dispatcher	run_trial (568):  Started, seed 0x4e935c39f1b027e8
+    48	    8298.5	Ship_004027_small	ship_proc (324):  Error: Randomly abandoning trial, seed 0xa8f207449132e876
+    66	    0.0000	dispatcher	run_trial (568):  Started, seed 0xf779b502f70bc2a8
+    11	    0.0000	dispatcher	run_trial (677):  Finished normally, seed 0x35acdf8c1e61ba55
+
+    ...
+
+    595	    0.0000	dispatcher	run_trial (677):  Finished normally, seed 0xe70596fed33211a3
+    596	    0.0000	dispatcher	run_trial (677):  Finished normally, seed 0x992d7262b2523d7e
+    594	    0.0000	dispatcher	run_trial (677):  Finished normally, seed 0x13c0d23b8fde680b
+    597	    0.0000	dispatcher	run_trial (677):  Finished normally, seed 0x22fff7f8b6f8960a
+    598	    0.0000	dispatcher	run_trial (677):  Finished normally, seed 0x37793f26aa3074f6
+    599	    0.0000	dispatcher	run_trial (677):  Finished normally, seed 0x720e51ce0924f645
+    Experiment finished, 29 failed trials, 571 successful
+
+Some of our confidence intervals in the gnuplot diagram may also become noticeably
+wider. We may also notice that the Leak Sanitizer does not report any leaked memory;
+every single allocated object in the entire simulation run has been taken care of.
+
+This concludes our fourth tutorial. We have demonstrated the very powerful
+:c:struct:`cmb_condition` allowing processes to wait for arbitrary combinations of
+conditions in the simulated world.
+
+We used the internal :c:struct:`cmi_slist` and :c:struct:`cmi_hashheap` as handy building
+blocks for other purposes, and leave it to you to discover additional possibilities.
+
+We also demonstrated the trial-abandoning error handling, available from anywhere in a
+simulation with automatic memory recovery for all ``cmb_`` objects and a callback hook
+for pre-registering a handler for any directly allocated memory that needs to be
+cleaned up before continuing to the next trial.
 
 Adding CUDA GPU power for simulation physics
 --------------------------------------------
 
-[Work in progress]
+So far, our models have mostly used simple math and have run on the CPU only.
+Important simulation tasks may require even more computing power than what we have
+used so far.
 
-So far, our models have mostly used simple math. Important simulation tasks may
-require even more computing power than what we have used so far. For example, there might
-be complex physical and/or geometrical calculations, optimization algorithms to guide
-the actions of active agents in the simulated world, or even AI/ML capabilities. Or we
+For example, there might be complex physical and/or geometrical calculations,
+optimization algorithms to guide the actions of active agents in the simulated world,
+or even artificial intelligence and machine learning capabilities. Or we
 might want to have a hybrid simulation with hardware-in-the-loop for special cases.
 
 Cimba does not include direct support for all possible combinations of GPUs and
@@ -3090,6 +3537,9 @@ Cimba processes (asymmetric coroutines) that are the active entities inside each
 and the CUDA cores providing massively parallel physics numbercrunching within our
 simulated processes.
 
+By the end of this tutorial, we will be utilizing all the considerable compute power on
+a modern workstation for our simulation purposes.
+
 The AWACS scenario on a single CPU
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -3100,39 +3550,446 @@ radar, if it is hidden by terrain or earth curvature, and if the reflected signa
 strong enough to be detected among atmospheric attenuation and ground clutter. We want
 to analyze some aspect of the AWACS operation. For the purposes of this tutorial, we
 assume that the relevant measure of outcome is target detection as a function of AWACS
-altitude. We will use a highly simplified model of terrain, sensor, and targets. We use
-`ParaView <https://www.paraview.org>`_ for visualization:
+altitude. We use `ParaView <https://www.paraview.org>`_ for visualization:
 
-.. image:: ../images/tut_5_1.png
+.. image:: ../images/tut_5_1c.png
 
-In this snapshot, we see our simulated AWACS flying a racetrack pattern over a
-simulated terrain. The terrain is a 1000x1000 nautical mile patch generated by Perlin
-noise. There are 1000 targets spread out randomly over the landscape. Each target is an
-active process looping through four distinct states: Hiding (low detectability),
-staging (medium detectability), firing (high detectability), and driving (medium
-detectability). This represents some kind of mobile missile launcher operating in a
-shoot-and-scoot pattern.
+In this snapshot, we see our simulated AWACS (red) flying a racetrack pattern over a
+simulated terrain. The terrain model is a synthetic 1000 x 1000 nautical mile patch
+generated by Perlin noise with 1 arcsecond resolution. The map consists of 59993 x
+59993 = 3.6 billion grid points with about 30 meter intervals, about 13.6 GB large. The
+altitude for any particular coordinates in the model is calculated by bi-directional
+linear interpolation between the nearest terrain grid points.
 
-In the image above, the target sizes represent the current radar cross
-section (on a logarithmic scale). The smallest target spheres are hiding targets. The
-large red ball just right of the racetrack is one that is firing.
+The terrain is further divided in three altitude-dependent biomes with different clutter
+and reflectivity parameters, representing farmland and urban areas in the valleys,
+forested hill slopes in middle altitudes, and bare mountain at high altitude.
 
-The target color represents the detection state, where the dark purple targets are
-beyond the radar horizon due to Earth's curvature, the red ones are shielded by
-terrain, the orange are too weak to be detected in elevation-dependent ground clutter,
-and the light yellow ones are successful detections.
+Our visualization program `ParaView <https://www.paraview.org>`_ is not able
+to handle a data set this large without crashing. For that reason, we decimate the
+terrain by a factor of 32 before writing it to a
+`HDF5 file <https://www.hdfgroup.org/solutions/hdf5/>`_.
 
-We will not go through the code in detail here. It can be found in `tutorial/tut_5_1.c
-<https://github.com/ambonvik/cimba/blob/main/tutorial/tut_5_1.c>`_. Suffice it to say
-that there is a lot of floating point math going on.
+The airborne sensor, indicated by the *red* sphere with an arrow indicating the current
+beam direction, is a scanning, horizon-limited surveillance radar evaluated
+per dwell. The dwell interval is 0.04 seconds, aggregated to one-second updates for
+the animation via
+`HDF5 files <https://en.wikipedia.org/wiki/Hierarchical_Data_Format>`_.
 
-The metric of interest is the percentage of all targets that is detected while not in
-the firing state. This simulation runs for 24 hours of simulated time in about 5000
-seconds on a single CPU core.
+The AWACS sensor is modelled as a scanning, horizon-limited surveillance radar evaluated
+per dwell with a 0.04 second dwell time. The model includes 3D geometry, line-of-sight
+terrain masking, tropospheric diffraction, specular reflection, surface clutter,
+Doppler processing, target RCS, and probabilistic per-dwell CA-CFAR detection.
 
-Instead of parallelizing trials, we will first corral available CUDA power to speed up
-the physics calculations.
+The sensor model does *not* include a detailed antenna beam pattern, waveform detail,
+target RCS fluctuations (i.e., a 3D model of each moving target), target tracking, etc
+etc.
 
-[...to be continued]
+Adding these features would improve the realism of the model, but the chosen level of detail
+leaves a sufficiently realistic radar model to give reasonable physics. Our aim here is
+to provide a somewhat realistic geometry and detection model for demonstrating
+compute-heavy physics modelling with Cimba and CUDA, not to build a complete radar model
+for actual military operations research.
 
+There are also 1000 targets distributed randomly over the landscape. Each target is an
+active ``cmb_process`` (coroutine) looping through four distinct states: *Hiding* (low
+detectability), *staging* (medium detectability), *firing* (high detectability), and
+*driving* (medium detectability).
 
+This represents some kind of mobile missile launcher operating in a shoot-and-scoot
+pattern. After firing, it selects a random direction, speed, and distance; and drives
+there before hiding, stationary at the new location. Target coordinates are
+recalculated on each sensor update. The target sizes in the visualization represent
+the current radar cross section (on a logarithmic scale).
+
+The target color in the visualization represents the detection state, where the *blue*
+targets are beyond the radar horizon due to Earth's curvature, the *orange* ones are
+shielded by terrain, the *yellow* ones are too weak to be detected in elevation-dependent
+ground clutter, and the *white* ones are successful detections. Just underneath the red
+AWACS indicator with its sensor lobe pointing towards the right, there are a handful of
+*purple* targets. These are in the "nadir hole" under the sensor platform,
+demonstrating the three-dimensional nature of this simulation example.
+
+The code can be found in
+`tutorial/tut_5_1.c <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_5_1.c>`_.
+
+Note that the model output is written by a separate ``cmb_process`` that takes a
+snapshot every second and appends it to the output file for off-line animation.
+This decouples the output intervals (here 1 second) from the simulation events
+(e.g., sensor dwells every 0.04 s) and avoids cluttering simulation entities (like
+the sensor or targets) with unrelated output code.
+
+Similarily, there is a separate ``cmb_process`` that only updates a progress bar and
+an estimated completion time to keep the user informed during a long-running program.
+The Cimba coroutines are computationally very efficient, so this is a logical way to
+do any model housekeeping tasks that need to happen in simulation time.
+
+The important characteristic of this version of the model is that it is
+written single-threaded, for sequential execution on a single processor core. In
+this case, the processor happens to be an AMD Threadripper 3970x with 128 GB RAM, but the
+program only uses one of the 64 logical cores.
+
+Still, the model is relatively fast, and finishes each run of 6 hours simulated time in
+about 640 seconds. Of this, the terrain generation takes about 530 seconds,
+while the simulation itself takes about 100 seconds.
+
+CUDA to the rescue
+^^^^^^^^^^^^^^^^^^
+
+CUDA can be described as a C++ based programming interface to the massively parallel
+computing capabilities of modern graphics processing units (GPUs). This is not intended
+to be a tutorial in CUDA programming, only an illustration of how to harness this
+computing power in a Cimba discrete event simulation. For more detail about CUDA
+programming, see, e.g.,
+`the Nvidia CUDA Toolkit <https://developer.nvidia.com/cuda/toolkit>`_.
+
+For our purposes, the most important CUDA concept is the *kernel*. This is a function
+that can be launched on a large number of GPU cores in parallel, all running the same
+code but acting on different data. A modern GPU can have 10000 or more cores.
+Structuring the program to use this efficiently without too much branching and
+serializing interdepency is one important concern in writing an efficient CUDA program.
+
+Another concern is memory usage. The GPU has onboard VRAM with caches at several levels.
+The proessing cores may be faster than the memory, and certainly much faster than the
+data bus connecting CPU and GPU. Minimizing the need to copy large amounts of memory
+back and forth between CPU and GPU will be an important determinant for the resulting
+performance.
+
+Looking at our simulation in `tut_5_1.c`, there are two clear opportunities for CUDA use:
+
+1.  *The synthetic terrain generation.* This calculates the terrain altitudes for each of
+    nearly 3.6 billion points, about 13.4 GB. (If your GPU has less memory, you may
+    want to reduce the terrain size before building this tutorial.) Importantly, the
+    altitude of each point is calculated independently and does not depend on
+    the values of neighboring points. This is what is called an *embarassingly
+    parallel* problem. In principle, we can just throw all the points to the GPU, ask
+    it to calculate the map, and let the GPU scheduler do the load balancing.
+
+2.  *The sensor detection logic.* For each time step (radar dwell, here every 0.04 s), the
+    sensor needs to check each of the 1000 targets for beam coverage, radar horizon,
+    terrain shielding, clutter masking, and so forth. This is not quite as embarassingly
+    parallel as the terrain generation, since the logic also contains a fair amount of
+    branching, but still a clear candidate for parallelization.
+
+As one might expect, there is a bit more to it. A naïve implementation - take the C
+code and rebrand it as CUDA - will most likely run slower than the CPU-only program. We
+will address the terrain first.
+
+We do not want to shuffle a 13.4 GB data object back and forth between the GPU and CPU.
+Once generated on the GPU, the terrain map stays there, in the VRAM of the GPU that
+generated it. Code that needs to access the terrain map must run on the GPU.
+
+For visualization output, we also decimate the map on the GPU and only pass back the exact
+data that need to be written to file, nothing more.
+
+Moreover, it turns out that CUDA has a specialized type of memory object, a *texture*,
+that happens to be optimized for the kind of ray marching we will be doing to check for
+intersections between the radar beam and terrain. So, the terrain map is represented as a
+CUDA texture in VRAM.
+
+Getting the best out of the detection logic also requires some thought. At each sensor
+update, we can run a first triage kernel to check each target against the
+easy conditions, such as in beam, in horizon, etc. The surviving candidates can then be
+fed to a second kernel to do the actual ray-marching from target to sensor to check for
+line-of-sight (suitably accounting for atmospheric diffraction), and finally the
+probabilistic detection attempt for the potentially visible candidates.
+
+Again, we want to reduce the amount of data that goes to the visualization, so we let the
+output process take snapshots of the targets array once per second and append those to the
+events file.
+
+This version of the program consists of the three files
+`tut_5_2.c <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_5_2.c>`_,
+`tut_5_2.h <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_5_2.h>`_, and
+`tut_5_2.cu <https://github.com/ambonvik/cimba/blob/main/tutorial/tut_5_2.cu>`_.
+
+It runs in about 12 seconds, 50 times faster than the CPU-only version. The
+most time-consuming part of the CPU-only version, terrain generation, now only takes
+0.7 seconds (about 750 times faster), while the simulation itself takes 11 seconds
+(9.4 times faster). The output looks the same as before.
+
+But we are still running on just one CPU core, and there is actually another GPU in the
+rig, so we are far from firing on all cylinders here. Let's put them all to work.
+
+Pthreads, coroutines, and CUDA kernels
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+We will in principle do the same as in our first tutorial: Set up an
+experiment array of trial structs, each one initialized with the relevant simulation
+parameters, where the Cimba worker threads can help themselves to the next trial and
+store the results.
+
+The only complication is handling the terrain map between trials. Since generating it
+is so fast on CUDA, we could just generate a new one for each trial at very little cost.
+
+However, for the purposes of this tutorial, we will not do that. Instead, we will
+count up how many GPUs we have available, generate one terrain map per GPU, and let
+the terrain map become a parameter for the simulation. We can do this from ``main()``
+like this:
+
+.. code-block:: C
+
+    /* What compute horsepower do we have available? */
+    int n_gpus = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&n_gpus));
+    if (n_gpus < 1) {
+        fprintf(stderr, "No CUDA devices found\n");
+        return EXIT_FAILURE;
+    }
+
+    const uint32_t n_terrains = (uint32_t)n_gpus;   /* one terrain per GPU */
+    struct terrain **terrains = cmi_calloc(n_terrains, sizeof(*terrains));
+
+    for (uint32_t t = 0u; t < n_terrains; t++) {
+        CUDA_CHECK(cudaSetDevice((int)t));
+        terrains[t] = terrain_create();
+
+        /* Deterministic, distinct seed per terrain */
+        const uint64_t terr_seed = cmb_random_fmix64(master_seed, SEED_TERRAIN + t);
+        terrain_initialize(terrains[t], fwidth_nm, fheight_nm, ref_lat, ref_lon, terr_seed);
+
+        /* Set biome tables per GPU stream */
+        sensor_gpu_load();
+     }
+
+``CUDA_CHECK`` is a macro to check the outcome of the CUDA calls, see ``tut_5_3.h``. The
+last function call ``sensor_gpu_load()`` creates a lookup-table for the GPUs to use,
+defined as C-callable CUDA code in ``tut_5_3.cu``. It saves a few compute cycles on each
+trial since these lookup values are unchanged across trials.
+
+We want to find out the effect of AWACS altitude on the detection ability. We will set
+up our experiment as a series of trials for flight levels from FL100 (feet x 100, about
+3000 m) up to FL400 (about 12100 m) in 15 steps of 25 each. We have two GPU's
+available, so we will try each flight level on two different terrain maps. And we want
+10 replications for each combination of flight level and map, in total 300 trials.
+We can then create the experiment in the usual way:
+
+.. code-block:: C
+
+    printf("Setting up experiment\n");
+    const double fl_start = 100.0;
+    const double fl_step = 25.0;
+    const uint32_t n_levels = 15u;
+    const uint32_t n_trials = n_levels * n_terrains * n_replications;
+
+    struct trial *experiment = cmi_calloc(n_trials, sizeof(*experiment));
+
+    uint32_t ui_trl = 0u;
+    double flt_lvl = fl_start;
+    for (uint32_t ul = 0u; ul < n_levels; ul++) {
+        for (uint32_t ut = 0u; ut < n_terrains; ut++) {
+            for (uint32_t ur = 0u; ur < n_replications; ur++) {
+                experiment[ui_trl].flight_level = flt_lvl;
+                experiment[ui_trl].terrain = terrains[ut];
+                experiment[ui_trl].seed = cmb_random_fmix64(master_seed, SEED_TRIAL + ui_trl);
+                experiment[ui_trl].dur_s = dur_h * 3600.0;
+
+                /* Sentinel value to detect aborted trials */
+                experiment[ui_trl].num_found = -1;
+
+                ui_trl++;
+            }
+        }
+
+        flt_lvl += fl_step;
+    }
+
+Note that we use ``cmb_random_fmix64()`` to generate unique-but-deterministic seeds for
+each trial. We could simply call ``cmb_random_hwseed()`` to obtain unique seeds from
+CPU entropy, but it would not be reproducible. Instead, ``cmb_random_fmix64()`` hashes
+the master seed (from CPU entropy or command line argument) with a per-trial value
+to set the seed to use per trial.
+
+Only one thing remains: The worker threads need to know what CUDA streams to use. Cimba
+provides this critical connection with the function ``cimba_thread_hooks_set()``. It
+takes three arguments. First a pointer to an initializing function, second an argument
+to be passed to that function when called, and third a pointer to an exit function.
+
+For our AWACS model, the init function could look like this:
+
+.. code-block:: C
+
+    static void *gpu_thread_init(uint64_t tid, void *usrarg)
+    {
+        cmb_unused(tid);
+
+        const int n_gpus = (int)(intptr_t)usrarg;
+        struct gpu_thread_ctx *ctx = cmi_malloc(sizeof(*ctx));
+        ctx->n_gpus  = n_gpus;
+        ctx->streams = cmi_malloc((size_t)n_gpus * sizeof(cudaStream_t));
+        for (int d = 0; d < n_gpus; d++) {
+            CUDA_CHECK(cudaSetDevice(d));
+            CUDA_CHECK(cudaStreamCreate(&ctx->streams[d]));
+        }
+
+        return ctx;
+    }
+
+The first argument, ``tid``, is the thread identifier, not used here. The second
+argument is a ``void *`` that can point to anything the application needs to pass to a
+worker thread. In this case, we simply pass the number of GPUs in the system. We could
+also obtain that number directly by calling ``CUDA_CHECK(cudaGetDeviceCount(&n_gpus))``
+from here, but we already did it, and we wanted to show how to pass an argument to this
+thread initializing function.
+
+The function creates a thread context for the worker thread's use. Here, it is a lookup
+table of CUDA streams, one per GPU. Each worker thread running this will set up a CUDA
+stream per GPU in the system.
+
+It then returns a ``void *``, again basically anything the application wants to store
+as a thread context. The return value will be stored in thread local memory once the
+thread starts running, and can be obtained from user code by calling
+``cimba_thread_context()``.
+
+Internally in ``cimba.c`` the following happens:
+
+.. code-block:: C
+
+    /* User-defined context per thread */
+    CMB_THREAD_LOCAL void *cmi_thread_context = NULL;
+
+.. code-block:: C
+
+    /* Any user-defined initialization needed? */
+    if (cmg_thread_init_func != NULL) {
+        cmi_thread_context = cmg_thread_init_func(tid, cmg_thread_init_usrarg);
+    }
+
+One example of using this is in ``tut_5_3.c``'s ``run_trial()`` function. The first thing
+it does is to look up what device the terrain map to use is on, and then to look up its
+CUDA stream for that device:
+
+.. code-block:: C
+
+    void run_trial(void *vtrl)
+    {
+        cmb_assert_release(vtrl != NULL);
+        struct trial *trl = vtrl;
+        struct terrain *terp = trl->terrain;
+
+        const int dev = terp->device;
+        CUDA_CHECK(cudaSetDevice(dev));
+        const struct gpu_thread_ctx *ctx = cimba_thread_context();
+        cudaStream_t stream = ctx->streams[dev];
+
+        /* ... */
+
+The corresponding exit function cleans up the memory allocations before exiting
+the worker thread, receiving the stored ``cmi_thread_context`` as its argument.
+Whatever the return value from the init function is, the exit function will receive it
+as its argument.
+
+.. code-block:: C
+
+    static void gpu_thread_exit(void *vctx)
+    {
+        struct gpu_thread_ctx *ctx = vctx;
+        if (ctx == NULL) return;
+        for (int d = 0; d < ctx->n_gpus; d++) {
+            cudaSetDevice(d);
+            cudaStreamDestroy(ctx->streams[d]);
+        }
+
+        cmi_free(ctx->streams);
+        cmi_free(ctx);
+    }
+
+Our ``main()`` can then run the experiment, ensuring that the Cimba worker thread
+associates each trial with its correct terrain map:
+
+.. code-block:: C
+
+    printf("Baiting the hooks\n");
+    cimba_thread_hooks_set(gpu_thread_init, (void *)(intptr_t)n_gpus, gpu_thread_exit);
+    printf("Running the simulation ...\n");
+    cimba_run(experiment, n_trials, sizeof(*experiment), run_trial);
+
+This mechanism to set callback functions that execute at the beginning and end of each
+worker thread and store an application-defined thread local state is a very flexible
+(and somewhat abstract) tool. Here, we use it as the only real integration point
+between the Cimba worker threads and the CUDA streams. That is why it was created.
+However, it is not CUDA specific, and can also be used for other purposes such as
+integration to other GPGPU APIs or even hardware-in-the-loop purposes.
+
+We also remove the per-trial visualization output and add a Gnuplot chart, compile and
+run, and get output like this:
+
+.. code-block:: none
+
+    [ambonvik@Threadripper cimba]$ time build/tutorial/tut_5_3
+    Setting up experiment
+    Using 64 threads
+    Baiting the hooks
+    Running the simulation ...
+    0	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0xaabc464bf835ba01
+    1	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0x0187615b9b563892
+    2	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0xfdf3e1d69dc021f1
+    3	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0x166396ef78583e12
+    4	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0xbe4c7beb66bfa52d
+    5	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0x53665865db06f479
+    6	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0x4e7eaff0ecc53516
+    7	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0x4836e23a98da025c
+    8	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0xc7fcca2edd7e7672
+    9	00:00:00.0	dispatcher	run_trial (755):  Start trial: Flight level: 100 GPU: 0 Seed: 0x4f08ba1ab652f797
+
+    ...
+
+    283	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 215
+    289	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 244
+    281	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 213
+    284	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 205
+    280	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 248
+    287	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 220
+    286	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 227
+    282	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 221
+    288	06:00:00.0	dispatcher	run_trial (834):  End trial: Flight level: 450 Found: 232
+    Finished, calculating stats
+
+    real	1m13.137s
+    user	34m35.338s
+    sys	7m0.024s
+
+*We just ran 300 trials of our AWACS simulation in 73 seconds of wall clock time on a
+desktop PC.*
+
+Each trial ran for 6 simulated hours, involved 1000 active targets on a
+1000 x 1000 nautical mile map with 1 arcsecond resolution, and an active radar with
+dwell time of 0.04 seconds doing raymarching against the terrain map for each dwell. The
+experiment produced this chart for the number of targets detected as a function of
+the AWACS flight level:
+
+.. image:: ../images/tut_5_3.png
+
+By default, Cimba will put one worker thread per logical CPU core reported by the
+operating system. That is often twice the number of physical CPU cores.
+
+Cimba also provides functions to manage this. One can get the number of Cimba threads
+by calling ``uint32_t cimba_threads_num()`` and set the number of threads to be used by
+calling ``uint32_t cimba_threads_use(uint32_t n_threads)``. The argument ``0`` means
+"use default". It will return the number of threads actually used used, i.e., the
+number of CPU cores if given the argument 0.
+
+The optimal number of threads to use will depend on the task. In general, using a number
+of threads between 1.5 to 2.5 times the number of physical CPU cores is close to optimal,
+with a rather flat curve through that region and random run-to-run variation swamping
+any meaningful differences. The Cimba default number of threads is a reasonable choice.
+
+This completes our fifth tutorial. We have shown how to harness GPU power for model
+physics, running at three separate levels of concurrency at the same time: The trials
+on CPU cores, the coroutines inside a trial, and the massively GPU CUDA kernels for
+model physics. The desktop PC we ran this on, a used AMD Threadripper 3970X from around
+2020 with dual consumer-grade Nvidia GeForce RTX 3090 GPUs, each able to do 35.58
+TFLOPS of single precision math, has a combined compute power equivalent to almost
+90,000 old Cray X-MP/48's (each 800 MFLOPS peak). We just used all of it - for 73 seconds.
+
+Summary
+-------
+
+In these five tutorials, we have gone from a basic M/M/1 queue simulation to a near
+military grade AWACS scenario running on 64 CPU cores and two GPUs (10496 cores each) in
+parallel, efficiently utilizing all the compute power available on a recent
+multi-core, multi-GPU desktop PC for discrete event simulation.
+
+For more detailed information about the various features of Cimba, please see
+the in-depth :ref:`the background section <background>` and
+the detailed :doc:`API reference pages </api/library_root>`.

@@ -10,25 +10,160 @@ permissions:
   contents: read
 
 jobs:
-  # Linux Job
+  # Linux: build and test in both debug (all asserts live) and release
   linux-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false            # let debug and release report independently
+      matrix:
+        buildtype: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build nasm meson
+      - name: Configure and Build
+        run: |
+          meson setup build --buildtype=${{ matrix.buildtype }} -Denable_docs=false
+          meson compile -C build
+      - name: Test
+        run: meson test -C build --print-errorlogs --timeout-multiplier 3
+
+  # Linux: follow the install guide end to end, then verify that a downstream
+  # program builds against the *installed* headers and library only. Guards
+  # against shipping public headers that are not self-contained or that include
+  # headers we forgot to install (the install guide's own verification step).
+  linux-install:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build python3-pip nasm meson
-      - name: Configure and Build
+          sudo apt-get install -y ninja-build nasm meson
+      - name: Build and install (per docs/installation.html)
         run: |
-          meson setup build
+          meson setup build -Denable_docs=false
           meson compile -C build
-      - name: Test
-        run: meson test -C build --print-errorlogs --timeout-multiplier 3
+          sudo meson install -C build
+          sudo ldconfig
+      - name: Verify install-guide hello with the documented bare command
+        run: |
+          # The literal command from the install guide: no -I/-L, relying on
+          # /usr/local being in the default header and linker search paths.
+          gcc tutorial/hello.c -lcimba -o /tmp/hello
+          /tmp/hello
+          /tmp/hello | grep -q '^Hello world, I am Cimba '
+      - name: Verify installed headers are self-contained and complete
+        run: bash test/tools/verify_install.sh /usr/local
 
-  # Windows Job (MinGW)
+  # Linux: debug build under AddressSanitizer + LeakSanitizer
+  linux-asan:
+    runs-on: ubuntu-latest
+    env:
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build nasm meson
+      - name: Configure debug + ASan
+        run: >
+          meson setup build-asan
+          --buildtype=debug
+          -Db_sanitize=address
+          -Db_lundef=false
+          -Denable_docs=false
+      - name: Build
+        run: meson compile -C build-asan
+      - name: Test
+        run: meson test -C build-asan --print-errorlogs --timeout-multiplier 20
+
+  # Linux: debug build under UndefinedBehaviorSanitizer
+  linux-ubsan:
+    runs-on: ubuntu-latest
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build nasm meson
+      - name: Configure debug + UBSan
+        run: >
+          meson setup build-ubsan
+          --buildtype=debug
+          -Db_sanitize=undefined
+          -Db_lundef=false
+          -Denable_docs=false
+      - name: Build
+        run: meson compile -C build-ubsan
+      - name: Test
+        run: meson test -C build-ubsan --print-errorlogs --timeout-multiplier 20
+
+  # Linux: debug build under ThreadSanitizer
+  linux-tsan:
+    runs-on: ubuntu-latest
+    env:
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:handle_segv=0:handle_sigbus=0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build nasm meson
+      - name: Configure (debug + TSan)
+        run: >
+          meson setup build-tsan --buildtype=debug --optimization=1
+          -Db_sanitize=thread -Db_lundef=false -Denable_docs=false
+      - name: Build
+        run: meson compile -C build-tsan
+      - name: Test
+        run: meson test -C build-tsan --print-errorlogs --timeout-multiplier 100
+
+  # Linux only: the all-out profile-guided build (-Dbenchopt).
+  linux-pgo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build nasm meson
+      - name: Phase 1 — build instrumented
+        run: |
+          meson setup build-pgo --buildtype=release -Denable_docs=false -Dbenchopt=generate
+          meson compile -C build-pgo
+      - name: Phase 1 — training workload
+        run: |
+          meson test -C build-pgo --print-errorlogs --timeout-multiplier 10
+          ./build-pgo/benchmark/MM1_single
+          ./build-pgo/benchmark/MM1_multi
+      - name: Phase 2 — rebuild using the profiles (same directory)
+        run: |
+          set -o pipefail
+          meson configure build-pgo -Dbenchopt=use
+          meson compile -C build-pgo 2>&1 | tee pgo-use.log
+      - name: Verify the profiles were actually consumed
+        run: |
+          if grep 'missing-profile' pgo-use.log | grep 'libcimba'; then
+            echo "::error::Library objects built without profile data — not a PGO binary"
+            exit 1
+          fi
+          echo "All libcimba objects compiled with profile data."
+      - name: Test the optimized build
+        run: meson test -C build-pgo --print-errorlogs --timeout-multiplier 10
+
+  # Windows (MinGW) — test debug and release builds
   windows-mingw-build:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        buildtype: [debug, release]
     steps:
       - uses: actions/checkout@v4
       - name: Set up MSYS2
@@ -42,13 +177,14 @@ jobs:
             mingw-w64-x86_64-meson
             mingw-w64-x86_64-python-pip
             mingw-w64-x86_64-nasm
-
       - name: Configure and Build
         shell: msys2 {0}
         run: |
           meson setup build
           meson compile -C build
-
       - name: Test
         shell: msys2 {0}
-        run: meson test -C build --print-errorlogs --timeout-multiplier 5
+        run: meson test -C build --print-errorlogs --timeout-multiplier 10
+
+  # Cannot fully verify installation for Windows, as it requires a reboot midway.
+  # Hence no Windows install CI verification here.

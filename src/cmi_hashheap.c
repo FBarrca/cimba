@@ -35,6 +35,13 @@
 #include "cmi_hashheap.h"
 #include "cmi_memutils.h"
 
+/* The initial capacity of the heap is 2^QUEUE_INIT_EXP items, resizing as needed */
+#define QUEUE_INIT_EXP 3
+
+/* Temporary index buffer for pattern matches, static thread local for efficiency */
+static CMB_THREAD_LOCAL uint64_t *match_buf = NULL;
+static CMB_THREAD_LOCAL uint64_t match_buf_size = UINT64_C(0);
+
 /*
  * cmi_hashheap_create - Allocate memory for a new hashheap struct.
  */
@@ -96,7 +103,7 @@ void cmi_hashheap_initialize(struct cmi_hashheap *hp,
     /* Initialize the powers-of-two growth parameters */
     hp->heap_exp_init = hexp;
     hp->heap_exp_cur = hexp;
-    hp->heap_size = 1u << hp->heap_exp_cur;
+    hp->heap_size = UINT64_C(1) << hp->heap_exp_cur;
 
     const size_t heap_bts = (hp->heap_size + 1u) * sizeof(struct cmi_heap_tag);
     const size_t hash_bts = (hp->heap_size << 1u) * sizeof(struct cmi_hash_tag);
@@ -114,6 +121,7 @@ void cmi_hashheap_initialize(struct cmi_hashheap *hp,
 
     hp->heap_count = 0u;
     hp->item_counter = 0u;
+    hp->tombstones = 0u;
     hp->heap_compare = (cmp == NULL) ? default_compare : cmp;
 
     /* Lazy initialization of hashmap, only at first actual need for it */
@@ -155,12 +163,14 @@ void cmi_hashheap_clear(struct cmi_hashheap *hp)
     cmb_assert_release(hp != NULL);
 
     if (hp->heap != NULL) {
-        const size_t heap_bts = (hp->heap_size + 2u) * sizeof(struct cmi_heap_tag);
+        /* Adding one for the working space at the end */
+        const size_t heap_bts = (hp->heap_size + 1u) * sizeof(struct cmi_heap_tag);
         const size_t hash_bts = (hp->heap_size << 1u) * sizeof(struct cmi_hash_tag);
         const size_t total_bts = heap_bts + hash_bts;
         cmi_memset(hp->heap, 0u, total_bts);
 
         hp->heap_count = 0u;
+        hp->tombstones = 0u;
         hp->map_active = false;
     }
 }
@@ -387,7 +397,7 @@ cmb_assert_debug(hp != NULL);
     const uint64_t old_heapsz = hp->heap_size;
 
     hp->heap_exp_cur++;
-    hp->heap_size = 1u << hp->heap_exp_cur;
+    hp->heap_size = UINT64_C(1) << hp->heap_exp_cur;
 
     const size_t heap_bts = (hp->heap_size + 1u) * sizeof(struct cmi_heap_tag);
     const size_t hash_bts = (hp->heap_size << 1u) * sizeof(struct cmi_hash_tag);
@@ -417,9 +427,32 @@ cmb_assert_debug(hp != NULL);
         hash_rehash(hp, hash_old, old_hashsz);
     }
 
+    /* The rehash dropped every tombstone */
+    hp->tombstones = 0u;
     cmi_aligned_free(heap_old_block);
 }
 
+/*
+* hashheap_compact - Reclaim tombstones without growing. Rebuilds the hash map
+* at its current size from the live heap entries, restoring empty slots that
+* had bled into tombstones. Needed because the grow-triggered rehash only fires
+* when the heap fills; a workload that holds the live count below that
+* threshold while churning heavily would otherwise accumulate tombstones
+* indefinitely, lengthening every lookup (which only terminates on a genuinely
+* empty slot, never on a tombstone).
+*/
+static void hashheap_compact(struct cmi_hashheap *hp)
+{
+    cmb_assert_debug(hp != NULL);
+    cmb_assert_debug(hp->heap != NULL);
+    cmb_assert_debug(hp->hash_map != NULL);
+    cmb_assert_debug(hp->map_active);
+
+    const size_t hash_bts = (hp->heap_size << 1u) * sizeof(struct cmi_hash_tag);
+    cmi_memset(hp->hash_map, 0u, hash_bts);
+    hash_init(hp);
+    hp->tombstones = 0u;
+}
 
 /*
  * cmi_hashheap_enqueue - Insert item in queue, return unique event hash_key.
@@ -443,8 +476,12 @@ uint64_t cmi_hashheap_enqueue(struct cmi_hashheap *hp,
     if (hp->heap_count == hp->heap_size) {
        hashheap_grow(hp);
     }
+    else if (hp->map_active &&
+            (hp->heap_count + hp->tombstones >= (3 * (hp->heap_size << 1)) / 4)) {
+        hashheap_compact(hp);
+    }
 
-    /* Now we have, put the new entry at the end */
+    /* Now we have space, put the new entry at the end */
     cmb_assert_debug(hp->heap_count < hp->heap_size);
     const uint64_t hc = ++hp->heap_count;
     hp->item_counter += 1u;
@@ -465,6 +502,12 @@ uint64_t cmi_hashheap_enqueue(struct cmi_hashheap *hp,
 
     if (hp->map_active) {
         const uint64_t idx = hash_find_slot(hp, hashkey);
+        if (hash[idx].hash_key != 0u) {
+            /* Reclaiming a tombstone. */
+            cmb_assert_debug(hp->tombstones > 0u);
+            hp->tombstones--;
+        }
+
         hash[idx].hash_key = hashkey;
         hash[idx].heap_index = hc;
         heap[hc].hash_index = idx;
@@ -501,6 +544,7 @@ void **cmi_hashheap_dequeue(struct cmi_hashheap *hp)
         /* Mark it as deleted (a tombstone) in the hash map */
         const uint64_t idx = heap[0u].hash_index;
         hp->hash_map[idx].heap_index = 0u;
+        hp->tombstones++;
     }
 
     /* Reshuffle the heap */
@@ -550,6 +594,7 @@ bool cmi_hashheap_remove(struct cmi_hashheap *hp, const uint64_t hashkey)
     cmb_assert_debug(hp->heap[heapidx].hash_key == hashkey);
     uint64_t hashidx = hp->heap[heapidx].hash_index;
     hp->hash_map[hashidx].heap_index = 0u;
+    hp->tombstones++;
 
     /* Remove entry from heap */
     if (heapidx == hp->heap_count) {
@@ -808,17 +853,21 @@ uint64_t cmi_hashheap_pattern_cancel(struct cmi_hashheap *hp,
         return 0u;
     }
 
-    /* Allocate space enough to match everything in the heap */
-    uint64_t *tmp = cmi_malloc(hp->heap_count * sizeof(*tmp));
-
+    /* Make sure the buffer is large enough to match everything in the heap */
+    const uint64_t hsz = hp->heap_size;
+    if (hsz > match_buf_size) {
+        /* Safe also for initial call, since realloc reverts to malloc if target
+         * is NULL, and our cmb_calloc wrapper includes the return value test */
+        match_buf = (uint64_t*)cmi_realloc(match_buf, hsz * sizeof(*match_buf));
+        match_buf_size = hsz;
+    }
     /* First pass, recording the matches */
     uint64_t cnt = 0u;
-
     for (uint64_t ui = 1; ui <= hp->heap_count; ui++) {
         const struct cmi_heap_tag *htp = &(hp->heap[ui]);
         if (item_match(htp, val1, val2, val3, val4)) {
             /* Matched, note it on the list */
-            tmp[cnt++] = hp->heap[ui].hash_key;
+            match_buf[cnt++] = hp->heap[ui].hash_key;
         }
     }
 
@@ -827,10 +876,9 @@ uint64_t cmi_hashheap_pattern_cancel(struct cmi_hashheap *hp,
      * heap reshuffling underneath us for each cancellation.
      */
     for (uint64_t ui = 0u; ui < cnt; ui++) {
-        cmi_hashheap_remove(hp, tmp[ui]);
+        cmi_hashheap_remove(hp, match_buf[ui]);
     }
 
-    cmi_free(tmp);
     return cnt;
 }
 
@@ -889,11 +937,24 @@ void cmi_hashheap_hash_print(const struct cmi_hashheap *hp, FILE *fp)
     fprintf(fp, "Hash map %s\n", hp->map_active ? "active" : "inactive");
     fprintf(fp, "------------------------------------- Hash -------------------------------------\n");
     fprintf(fp, "Hash idx\tHash key\tHeap idx\n");
-    for (uint64_t ui = 1u; ui <= 2 * hp->heap_size; ui++) {
+    for (uint64_t ui = 0u; ui < 2 * hp->heap_size; ui++) {
         const struct cmi_hash_tag *htp = &(hp->hash_map[ui]);
         fprintf(fp, "%8" PRIu64 "\t%8" PRIu64 "\t%8" PRIu64 "\n", ui, htp->hash_key, htp->heap_index);
     }
 
     fprintf(fp, "--------------------------------------------------------------------------------\n");
     fflush(fp);
+}
+
+/*
+ * cmi_hashheap_thread_cleanup - Function to deallocate any allocated memory in the
+ * thread local match buffer. Call when exiting a pthread.
+ */
+void cmi_hashheap_thread_cleanup(void)
+{
+    if (match_buf != NULL) {
+        cmi_free(match_buf);
+        match_buf = NULL;
+        match_buf_size = UINT64_C(0);
+    }
 }

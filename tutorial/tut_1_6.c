@@ -16,8 +16,8 @@ struct trial {
     /* Parameters */
     double arr_rate;
     double srv_rate;
-    double warmup_time;
-    double duration;
+    double warmup_s;
+    double duration_h;
     /* Results */
     uint64_t seed_used;
     double avg_queue_length;
@@ -31,6 +31,7 @@ struct context {
 void end_sim(void *subject, void *object)
 {
     cmb_unused(subject);
+    cmb_assert_debug(object != NULL);
 
     const struct context *ctx = object;
     const struct simulation *sim = ctx->sim;
@@ -42,6 +43,7 @@ void end_sim(void *subject, void *object)
 static void start_rec(void *subject, void *object)
 {
     cmb_unused(subject);
+    cmb_assert_debug(object != NULL);
 
     const struct context *ctx = object;
     const struct simulation *sim = ctx->sim;
@@ -51,6 +53,7 @@ static void start_rec(void *subject, void *object)
 static void stop_rec(void *subject, void *object)
 {
     cmb_unused(subject);
+    cmb_assert_debug(object != NULL);
 
     const struct context *ctx = object;
     const struct simulation *sim = ctx->sim;
@@ -58,9 +61,10 @@ static void stop_rec(void *subject, void *object)
 }
 
 
-void *arrival(struct cmb_process *me, void *vctx)
+void *arrival_proc(struct cmb_process *me, void *vctx)
 {
     cmb_unused(me);
+    cmb_assert_debug(vctx != NULL);
 
     const struct context *ctx = vctx;
     const struct simulation *sim = ctx->sim;
@@ -80,9 +84,10 @@ void *arrival(struct cmb_process *me, void *vctx)
     }
 }
 
-void *service(struct cmb_process *me, void *vctx)
+void *service_proc(struct cmb_process *me, void *vctx)
 {
     cmb_unused(me);
+    cmb_assert_debug(vctx != NULL);
 
     const struct context *ctx = vctx;
     const struct simulation *sim = ctx->sim;
@@ -104,7 +109,7 @@ void *service(struct cmb_process *me, void *vctx)
 
 void run_MM1_trial(void *vtrl)
 {
-    cmb_assert_release(vtrl != NULL);
+    cmb_assert_debug(vtrl != NULL);
     struct trial *trl = vtrl;
 
     struct context ctx = {};
@@ -112,8 +117,7 @@ void run_MM1_trial(void *vtrl)
     ctx.sim = &sim;
     ctx.trl = trl;
 
-    cmb_logger_flags_off(CMB_LOGGER_INFO);
-    cmb_logger_flags_off(USERFLAG1);
+    cmb_logger_flags_off(CMB_LOGGER_INFO | USERFLAG1);
     cmb_event_queue_initialize(0.0);
     trl->seed_used = cmb_random_hwseed();
     cmb_random_initialize(trl->seed_used);
@@ -125,25 +129,28 @@ void run_MM1_trial(void *vtrl)
     cmb_buffer_initialize(ctx.sim->que, "Queue", CMB_UNLIMITED);
 
     ctx.sim->arr = cmb_process_create();
-    cmb_process_initialize(ctx.sim->arr, "Arrival", arrival, &ctx, 0);
+    cmb_process_initialize(ctx.sim->arr, "Arrival", arrival_proc, &ctx, 0);
     cmb_process_start(ctx.sim->arr);
 
     ctx.sim->srv = cmb_process_create();
-    cmb_process_initialize(ctx.sim->srv, "Service", service, &ctx, 0);
+    cmb_process_initialize(ctx.sim->srv, "Server", service_proc, &ctx, 0);
     cmb_process_start(ctx.sim->srv);
 
-    double t = trl->warmup_time;
+    double t = trl->warmup_s;
     cmb_event_schedule(start_rec, NULL, &ctx, t, 0);
-    t += trl->duration;
+    t += trl->duration_h;
     cmb_event_schedule(stop_rec, NULL, &ctx, t, 0);
     cmb_event_schedule(end_sim, NULL, &ctx, t, -100);
 
     cmb_event_queue_execute();
 
-    struct cmb_wtdsummary wtdsum;
+    /* Make sure to initialize and terminate the wtdsummary */
+    struct cmb_wtdsummary wtdsum = { 0 };
+    cmb_wtdsummary_initialize(&wtdsum);
     const struct cmb_timeseries *ts = cmb_buffer_history(ctx.sim->que);
     cmb_timeseries_summarize(ts, &wtdsum);
     ctx.trl->avg_queue_length = cmb_wtdsummary_mean(&wtdsum);
+    cmb_wtdsummary_terminate(&wtdsum);
 
     cmb_process_terminate(ctx.sim->srv);
     cmb_process_destroy(ctx.sim->srv);
@@ -163,8 +170,6 @@ void write_gnuplot_commands(void);
 int main(void)
 {
     printf("Cimba version %s\n", cimba_version());
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
 
     const unsigned n_rhos = 39;
     const double rho_start = 0.025;
@@ -178,6 +183,7 @@ int main(void)
     printf("Setting up experiment\n");
     const unsigned n_trials = n_rhos * n_reps;
     struct trial *experiment = calloc(n_trials, sizeof(*experiment));
+    cmb_assert_always(experiment != NULL);
 
     uint64_t ui_exp = 0u;
     double rho = rho_start;
@@ -185,8 +191,8 @@ int main(void)
         for (unsigned ui_rep = 0u; ui_rep < n_reps; ui_rep++) {
             experiment[ui_exp].arr_rate = rho * srv_rate;
             experiment[ui_exp].srv_rate = srv_rate;
-            experiment[ui_exp].warmup_time = warmup_time;
-            experiment[ui_exp].duration = duration;
+            experiment[ui_exp].warmup_s = warmup_time;
+            experiment[ui_exp].duration_h = duration;
             experiment[ui_exp].seed_used = 0u;
             experiment[ui_exp].avg_queue_length = 0.0;
 
@@ -197,7 +203,7 @@ int main(void)
     }
 
     printf("Executing experiment\n");
-    cimba_run_experiment(experiment, n_trials, sizeof(*experiment), run_MM1_trial);
+    cimba_run(experiment, n_trials, sizeof(*experiment), run_MM1_trial);
 
     printf("Finished experiment, writing results to file\n");
     ui_exp = 0u;
@@ -226,14 +232,10 @@ int main(void)
     fclose(datafp);
     free(experiment);
 
-    struct timespec end_time;
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    double elapsed = (double)(end_time.tv_sec - start_time.tv_sec);
-    elapsed += (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000.0;
-    printf("It took %g sec\n", elapsed);
-
     write_gnuplot_commands();
-    (void)system("gnuplot -persistent tut_1_6.gp");
+    if (system("gnuplot -persistent tut_1_6.gp") != 0) {
+        cmb_logger_warning(stderr, "gnuplot launch failed");
+    }
 
     return 0;
 }

@@ -5,7 +5,7 @@
  *
  * The main generator gives 64-bit pseudo-random numbers with 256 bits of state
  * and a cycle of at least 2^64 samples. It is seeded by a 64-bit value but
- * amplifies that to a 265-bit state by using an auxiliary generator with a 64-bit
+ * amplifies that to a 256-bit state by using an auxiliary generator with a 64-bit
  * state to bootstrap the initial 256-bit state for the main generator. All
  * later pseudo-random numbers come from the same stream.
  *
@@ -64,8 +64,11 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "cmb_assert.h"
+
+#include "cmi_memregistry.h"
 
 /**
  * @brief Initiate pseudo-random number distribution using a 64-bit seed. Call
@@ -138,21 +141,25 @@ extern uint64_t cmb_random_sfc64(void);
 extern uint64_t cmb_random_fmix64(uint64_t seed, uint64_t nonce);
 
 /**
- * @brief Continuous uniform distribution on the interval [0, 1].
+ * @brief Continuous uniform distribution on the interval [0, 1).
  *
  * A 64-bit double has a 53-bit significand. We discard the bottom 11 bits and
- * scale the result by 2^(-53) to get a number in [0.0, 1.0].
+ * scale the result by 2^(-53) to get a number in [0.0, 1.0).
  *
  * See also https://en.wikipedia.org/wiki/Continuous_uniform_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random(void)
 {
-    return ldexp((double)(cmb_random_sfc64() >> 11), -53);
+    const uint64_t x = cmb_random_sfc64();
+    const double r = (double)(x >> 11) * 0x1.0p-53;
+
+    cmb_assert_debug((r >= 0.0) && (r < 1.0));
+    return r;
 }
 
 /**
- * @brief Continuous uniform distribution on the interval `[min, max]`.
+ * @brief Continuous uniform distribution on the interval `[min, max)`.
  *
  * Often used in lack of any other information about a distribution than
  * the endpoints. Assuming a uniform distribution between may then be
@@ -161,20 +168,20 @@ static inline double cmb_random(void)
  *
  * See also https://en.wikipedia.org/wiki/Continuous_uniform_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_uniform(const double min, const double max)
 {
     cmb_assert_release(min < max);
 
     const double r = min + (max - min) * cmb_random();
-    cmb_assert_debug((r >= min) && (r <= max));
+    cmb_assert_debug((r >= min) && (r < max));
 
     return r;
 }
 
 /**
- * @brief Triangular distribution on the interval `[min, max]` with peak at
- *        `mode`, where `min < mode < max`.
+ * @brief Triangular distribution on the interval `[min, max)` with peak at
+ *        `mode`, where `min <= mode <= max` and `min < max`.
  *
  * The probability density function is zero at `min` and `max`, and reaches a
  * maximum of `2 / (max - min)` at `mode`. The mean is `(min + mode + max) / 3`.
@@ -196,13 +203,13 @@ extern double cmi_random_nor_not_hot(int64_t i_cand_x);
 
 /**
  * @brief Standard normal distribution on (-oo, oo) with mean 0 and standard
- *        deviation 0.
+ *        deviation 1.
  *
  * Uses an implementation of McFarland's improved ziggurat method.
  *
  * See also https://en.wikipedia.org/wiki/Normal_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_std_normal(void)
 {
     uint64_t bits = cmb_random_sfc64();
@@ -226,7 +233,7 @@ static inline double cmb_random_std_normal(void)
  *
  * See also https://en.wikipedia.org/wiki/Normal_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_normal(const double mu, const double sigma)
 {
     cmb_assert_release(sigma > 0.0);
@@ -245,7 +252,7 @@ static inline double cmb_random_normal(const double mu, const double sigma)
  *
  * See also https://en.wikipedia.org/wiki/Log-normal_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_lognormal(const double m, const double s)
 {
     cmb_assert_release(s > 0.0);
@@ -263,11 +270,16 @@ static inline double cmb_random_lognormal(const double m, const double s)
  *
  * See also https://en.wikipedia.org/wiki/Logistic_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_logistic(const double m, const double s)
 {
     cmb_assert_release(s > 0.0);
-    const double x = cmb_random();
+
+    /* Loop to protect against the extremely unlikely case of drawing 0.0 */
+    double x = 0.0;
+    while (x == 0.0) {
+        x = cmb_random();
+    }
 
     return m + s * log(x / (1.0 - x));
 }
@@ -286,7 +298,7 @@ static inline double cmb_random_logistic(const double m, const double s)
  *
  * See also https://en.wikipedia.org/wiki/Cauchy_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_cauchy(const double mode, const double scale)
 {
     cmb_assert_release(scale > 0.0);
@@ -301,7 +313,7 @@ static inline double cmb_random_cauchy(const double mode, const double scale)
 /** @cond */
 extern const uint8_t cmi_random_exp_zig_max;
 extern const double cmi_random_exp_zig_pdf_x[];
-extern double cmi_random_exp_not_hot(uint64_t u_cand_x);
+extern double cmi_random_exp_not_hot(int64_t i_cand_x);
 /** @endcond */
 
 /**
@@ -315,14 +327,16 @@ extern double cmi_random_exp_not_hot(uint64_t u_cand_x);
  *
  * See also https://en.wikipedia.org/wiki/Exponential_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_std_exponential(void)
 {
-    const uint64_t u_cand_x = cmb_random_sfc64();
-    const uint8_t idx = u_cand_x & 0xff;
-    double r = (idx <= cmi_random_exp_zig_max) ?
-        cmi_random_exp_zig_pdf_x[idx] * (double) u_cand_x :
-        cmi_random_exp_not_hot(u_cand_x);
+    uint64_t bits = cmb_random_sfc64();
+    /* Clear the sign bit for 63 useful bits */
+    const int64_t i_cand_x = (*(int64_t *) &bits) & INT64_MAX;
+    const uint8_t idx = i_cand_x & 0xFF;
+    const double r = (idx <= cmi_random_exp_zig_max) ?
+                        cmi_random_exp_zig_pdf_x[idx] * (double) i_cand_x :
+                        cmi_random_exp_not_hot(i_cand_x);
 
     cmb_assert_debug(r >= 0.0);
     return r;
@@ -340,12 +354,12 @@ static inline double cmb_random_std_exponential(void)
  *
  * See also https://en.wikipedia.org/wiki/Exponential_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_exponential(const double mean)
 {
     cmb_assert_release(mean > 0.0);
 
-    double r = mean * cmb_random_std_exponential();
+    const double r = mean * cmb_random_std_exponential();
 
     cmb_assert_debug(r >= 0.0);
     return r;
@@ -362,20 +376,7 @@ static inline double cmb_random_exponential(const double mean)
  *
  * See also https://en.wikipedia.org/wiki/Erlang_distribution
  */
-CMI_MAYBE_UNUSED
-static inline double cmb_random_erlang(const unsigned k, const double m)
-{
-    cmb_assert_release(k > 0u);
-    cmb_assert_release(m > 0.0);
-
-    double x = 0.0;
-    for (unsigned i = 0u; i < k; i++) {
-        x += cmb_random_exponential(m);
-    }
-
-    cmb_assert_debug(x >= 0.0);
-    return x;
-}
+extern double cmb_random_erlang(const unsigned k, const double m);
 
 /**
  * @brief Hypoexponential on `[0, oo)`, a sum of `n` exponentially distributed
@@ -390,7 +391,7 @@ static inline double cmb_random_erlang(const unsigned k, const double m)
  *
  * See also https://en.wikipedia.org/wiki/Hypoexponential_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_hypoexponential(const unsigned n, const double *ma)
 {
     cmb_assert_release(n > 0);
@@ -420,13 +421,13 @@ static inline double cmb_random_hypoexponential(const unsigned n, const double *
  *
  * See also https://en.wikipedia.org/wiki/Hyperexponential_distribution
  */
-extern double cmb_random_hyperexponential(unsigned n,
+extern double cmb_random_hyperexponential(uint64_t n,
                                           const double *ma,
                                           const double *pa);
 
 /**
  * @brief Gamma distribution on `[0, oo)` with shape parameter `shape`, where
- *        `shape > 0`. Equal to `cmb_random_std_gamma(shape, 1.0)`.
+ *        `shape > 0`. Equal to `cmb_random_gamma(shape, 1.0)`.
  *
  * Generalizes the Erlang distribution to noninteger `n` (shape).
  * The mean and variance equal `shape`.
@@ -447,16 +448,13 @@ extern double cmb_random_std_gamma(double shape);
  *
  * See also https://en.wikipedia.org/wiki/Gamma_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_gamma(const double shape, const double scale)
 {
     cmb_assert_release(shape > 0.0);
     cmb_assert_release(scale > 0.0);
 
-    const double r = (shape >= 1.0) ?
-        scale * cmb_random_std_gamma(shape) :
-        scale * (cmb_random_std_gamma(shape + 1.0)
-                 * pow(cmb_random(), 1.0 / shape));
+    const double r = scale * cmb_random_std_gamma(shape);
 
     cmb_assert_debug(r >= 0.0);
     return r;
@@ -472,7 +470,7 @@ static inline double cmb_random_gamma(const double shape, const double scale)
  *
  * See also  https://en.wikipedia.org/wiki/Beta_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_std_beta(const double a, const double b)
 {
     cmb_assert_release(a > 0.0);
@@ -496,7 +494,7 @@ static inline double cmb_random_std_beta(const double a, const double b)
  *
  * See also https://en.wikipedia.org/wiki/Beta_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_beta(const double a, const double b,
                                      const double min, const double max)
 {
@@ -537,7 +535,7 @@ extern double cmb_random_PERT_mod(double min,
  *
  * See also https://en.wikipedia.org/wiki/PERT_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_PERT(const double min,
                                      const double mode,
                                      const double max)
@@ -567,7 +565,7 @@ static inline double cmb_random_PERT(const double min,
  *
  * See also https://en.wikipedia.org/wiki/Weibull_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_weibull(const double shape, const double scale)
 {
     cmb_assert_release(shape > 0.0);
@@ -591,7 +589,7 @@ static inline double cmb_random_weibull(const double shape, const double scale)
  *
  * See also https://en.wikipedia.org/wiki/Pareto_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_pareto(const double shape, const double mode)
 {
     cmb_assert_release(shape > 0.0);
@@ -614,7 +612,7 @@ static inline double cmb_random_pareto(const double shape, const double mode)
  *
  * See also https://en.wikipedia.org/wiki/Chi-squared_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_chisquared(const double k)
 {
     cmb_assert_release(k > 0.0);
@@ -635,7 +633,7 @@ static inline double cmb_random_chisquared(const double k)
  *
  * See also https://en.wikipedia.org/wiki/F-distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_F_dist(const double a, const double b)
 {
     cmb_assert_release(a > 0.0);
@@ -664,7 +662,7 @@ static inline double cmb_random_F_dist(const double a, const double b)
  *
  * See also https://en.wikipedia.org/wiki/Student%27s_t-distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_std_t_dist(const double v)
 {
     cmb_assert_release(v > 0.0);
@@ -689,7 +687,7 @@ static inline double cmb_random_std_t_dist(const double v)
  *
  * See also https://en.wikipedia.org/wiki/Student%27s_t-distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_t_dist(const double m,
                                 const double s,
                                 const double v)
@@ -710,7 +708,7 @@ static inline double cmb_random_t_dist(const double m,
  *
  * See also https://en.wikipedia.org/wiki/Rayleigh_distribution
  */
-CMI_MAYBE_UNUSED
+CMB_MAYBE_UNUSED
 static inline double cmb_random_rayleigh(const double s)
 {
     cmb_assert_release(s > 0.0);
@@ -745,42 +743,38 @@ extern int cmb_random_flip(void);
  *
  * See also https://en.wikipedia.org/wiki/Bernoulli_distribution
  */
-CMI_MAYBE_UNUSED
-static inline unsigned cmb_random_bernoulli(const double p)
+CMB_MAYBE_UNUSED
+static inline unsigned int cmb_random_bernoulli(const double p)
 {
     cmb_assert_release((p >= 0.0) && (p <= 1.0));
 
-    return (cmb_random() <= p) ? 1 : 0;
+    return (cmb_random() < p) ? 1 : 0;
 }
 
 /**
  * @brief Geometric distribution, a discrete parallel to the exponential
- *        distribution, returns an integer value in `[1, oo)`.
+ *        distribution, returns an integer value in `[1, UINT64_MAX]`.
  *
  * Models the number of trials up to and including the first success in a
  * series of consecutive Bernoulli trials each with probability `p` of success.
  *
  * Mean `1/p`, variance `(1-p)/p^2`.
  *
- * Performs the calculation by simulating the experiment.
- *
  * See also https://en.wikipedia.org/wiki/Geometric_distribution
  */
-extern unsigned cmb_random_geometric(double p);
+extern uint64_t cmb_random_geometric(double p);
 
 /**
  * @brief Binomial distribution, number of successes in n independent Bernoulli
  *        trials each with probability `p`.
  *
- * Models a drawing process with replacement (or from an infinite pool).
+ * Models a drawing process with replacement (or drawing from an infinite pool).
  *
  * Mean `np`, variance `np(1-p)`.
  *
- * Performs the calculation by simulating the experiment.
- *
  * See also https://en.wikipedia.org/wiki/Geometric_distribution
  */
-extern unsigned cmb_random_binomial(unsigned n, double p);
+extern uint64_t cmb_random_binomial(uint64_t n, double p);
 
 /**
  * @brief Negative binomial distribution, the number of failures before the
@@ -794,29 +788,33 @@ extern unsigned cmb_random_binomial(unsigned n, double p);
  * successfully transmit an m-bit (or -packet) message. Also known as the Pascal
  * distribution.
  *
- * Performs the calculation by simulating the experiment.
- *
  * See also https://en.wikipedia.org/wiki/Negative_binomial_distribution
  */
-extern unsigned cmb_random_negative_binomial(unsigned m, double p);
+extern uint64_t cmb_random_negative_binomial(uint64_t m, double p);
 
 /**
- * @brief Pascal distribution an alias for the negative binomial distribution,
+ * @brief Pascal distribution, an alias for the negative binomial distribution,
  *        `cmb_random_negative_binomial()`, the number of failures before the
  *        `m`th success in independent Bernoulli trials each with probability
  *        `p`, sampled with replacement (or equivalently from an infinite pool).
  *
  * See also https://en.wikipedia.org/wiki/Negative_binomial_distribution
  */
-CMI_MAYBE_UNUSED
-static inline unsigned cmb_random_pascal(const unsigned m, const double p)
+CMB_MAYBE_UNUSED
+static inline uint64_t cmb_random_pascal(const uint64_t m, const double p)
 {
     return cmb_random_negative_binomial(m, p);
 }
 
+/** @cond */
+extern uint64_t cmi_random_poisson_chopdown(double r);
+extern uint64_t cmi_random_poisson_ptrd(double r);
+/** @endcond */
+
 /**
  * @brief Poisson distribution, number of arrivals per unit time in a Poisson
- *        process with arrival rate `r`, where `r > 0`.
+ *        process with arrival rate `r > 0`. Rates higher than 1e18 are not
+ *        numerically representable, so `r < 1e18`.
  *
  * Mean `r`, variance `r`, interarrival times exponentially distributed with
  * mean `1/r`.
@@ -824,33 +822,43 @@ static inline unsigned cmb_random_pascal(const unsigned m, const double p)
  * Models the number of shot noise pulses, customer arrivals, incoming calls,
  * Geiger counter clicks, etc., per unit of time.
  *
- * Performs the calculation by simulating the experiment.
- *
  * See also https://en.wikipedia.org/wiki/Poisson_distribution
  */
-extern unsigned cmb_random_poisson(double r);
+extern uint64_t cmb_random_poisson(double r);
+
+/**
+ * @brief A discrete uniform distribution on `[0, 1, ..., n-1]` for `n > 0`.
+ *
+ * See also https://en.wikipedia.org/wiki/Discrete_uniform_distribution
+ */
+extern uint64_t cmb_random_discrete_uniform(uint64_t n);
 
 /**
  * @brief A discrete uniform distribution on `[a, a+1, a+2, ..., b]` for
  *        `a < b`. The function name reflects what happens for `a = 1`, `b = 6`.
  *
  * See also https://en.wikipedia.org/wiki/Discrete_uniform_distribution
+ *
+ * @param a Lower end of range, x >= a
+ * @param b Upper end of range, x <= b
  */
-CMI_MAYBE_UNUSED
-static inline long cmb_random_dice(const long a, const long b)
+CMB_MAYBE_UNUSED
+static inline int64_t cmb_random_dice(const int64_t a, const int64_t b)
 {
-    cmb_assert (a < b);
+    cmb_assert_release(a < b);
 
-    const double x = (double)(b - a + 1) * cmb_random();
-    return (long)(floor((double)a + x));
+    const uint64_t span = (uint64_t)b - (uint64_t)a;
+    cmb_assert_release(span != UINT64_MAX);
+    const uint64_t x = cmb_random_discrete_uniform(span + 1u);
+    const int64_t r = (int64_t)((uint64_t)a + x);
+
+    cmb_assert_debug((r >= a) && (r <= b));
+    return r;
 }
 
 /**
  * @brief A non-uniform discrete distribution among `n` alternatives. It returns
  *        the selected array index `i` on `[0, n-1]` with a probability `pa[i]`.
- *
- * The probabilities in `pa[]` should sum to 1.0, i.e., mutually exclusive,
- * collectively exhaustive.
  *
  * This function uses a very simple O(n) implementation. For anything larger
  * than ~15 values, use the alias sampling method below instead.
@@ -862,19 +870,48 @@ static inline long cmb_random_dice(const long a, const long b)
  * `cmb_random.c` for an example of alias sampling from a table of values.
  *
  * @param n Number of entries
- * @param pa The probabilities for each of the entries, array size ``n``
- *
+ * @param pa The probabilities for each of the entries, array size ``n``. The
+ *           probabilities in `pa[]` should sum to 1.0, i.e., mutually exclusive,
+ *           collectively exhaustive.
  */
-extern unsigned cmb_random_loaded_dice(unsigned n, const double *pa);
+extern uint64_t cmb_random_discrete_nonuniform(uint64_t n, const double *pa);
+
+/**
+* @brief A discrete non-uniform distribution on `[a, a+1, a+2, ..., b]` for
+ *        integer `a < b`. The function name reflects what happens for `a = 1`, `b = 6`.
+ *
+ * @param a Lower end of range, x >= a
+ * @param b Upper end of range, x <= b
+ * @param pa Array of probabilities for outcome a, a+1, ..., b-1, b. The array
+ *           must be size `n = b -a + 1`. The array must sum to 1.0.
+ */
+CMB_MAYBE_UNUSED
+static inline int64_t cmb_random_loaded_dice(const int64_t a, const int64_t b,
+                                             const double *pa)
+{
+    cmb_assert_release(a < b);
+    cmb_assert_release(pa != NULL);
+
+    /* Avoid potential overflow in edge cases, assuming a two's complement machine */
+    const uint64_t span = (uint64_t)b - (uint64_t)a;
+    cmb_assert_release(span < UINT64_MAX);
+    const uint64_t n = span + 1u;
+    const uint64_t offset = cmb_random_discrete_nonuniform(n, pa);
+    const int64_t r = (int64_t)((uint64_t)a + offset);
+
+    cmb_assert_debug((r >= a) && (r <= b));
+    return r;
+}
 
 /**
  * @brief Alias table using integer encoding of the probabilities for fast
  *        look-up
  */
 struct cmb_random_alias {
-    unsigned n;         /**< The number of entries */
-    uint64_t *uprob;    /**< Probabilities encoded as unsigned 64-bit integers */
-    unsigned *alias;    /**< Alias indexes */
+    uint64_t n;         /**< The number of entries */
+    uint64_t *uprob;    /**< Probabilities encoded as uint64_t 64-bit integers */
+    uint64_t *alias;    /**< Alias indexes */
+    struct cmi_memregistry_item destroy;     /**< Internal use */
 };
 
 /**
@@ -893,7 +930,7 @@ struct cmb_random_alias {
  *         table.
  */
 
-extern struct cmb_random_alias *cmb_random_alias_create(unsigned n,
+extern struct cmb_random_alias *cmb_random_alias_create(uint64_t n,
                                                         const double *pa);
 
 /**
@@ -918,18 +955,7 @@ extern struct cmb_random_alias *cmb_random_alias_create(unsigned n,
  *        `pa[i]`
 
  */
-CMI_MAYBE_UNUSED
-static inline unsigned cmb_random_alias_sample(const struct cmb_random_alias *ap)
-{
-    cmb_assert_release(ap != NULL);
-
-    const unsigned idx = (unsigned) (floor(ap->n * cmb_random()));
-    const bool c = (cmb_random_sfc64() >= ap->uprob[idx]);
-    const unsigned r = (c) ? ap->alias[idx] : idx;
-
-    cmb_assert_debug(r < ap->n);
-    return r;
-}
+extern uint64_t cmb_random_alias_sample(const struct cmb_random_alias *ap);
 
 /**
  * @brief Destroy alias lookup table created by `cmb_random_alias_create()`
