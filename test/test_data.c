@@ -34,7 +34,7 @@
 #include "cmb_timeseries.h"
 #include "cmb_wtdsummary.h"
 
-#include "test.h"
+#include "testutils.h"
 
 /* Test macros */
 #define MAX_SAMPLES 10000u
@@ -83,8 +83,6 @@ static void test_summary(const uint64_t nsamples)
 
     printf("\nSummary: cmb_datasummary_print\n");
     cmb_datasummary_print(&ds, stdout, true);
-    printf("Summary without lead-ins:\n");
-    cmb_datasummary_print(&ds, stdout, false);
 
     cmi_test_print_line("-");
     printf("\nOnce more, now on the heap: cmb_datasummary_create()\n");
@@ -848,8 +846,10 @@ void test_empties(void)
     cmb_dataset_histogram_print(dsp, stdout, 20, 0.0, 0.0);
 
     double acf[21];
+    double pacf[21];
     cmb_dataset_ACF(dsp, 20, acf);
-    cmb_dataset_PACF(dsp, 20, acf, acf);
+    cmb_dataset_PACF(dsp, 20, pacf, NULL);
+    cmb_dataset_PACF(dsp, 20, pacf, acf);
     cmb_dataset_correlogram_print(dsp, stdout, 20, acf);
 
     struct cmb_datasummary dsu = { 0 };
@@ -893,6 +893,7 @@ void test_empties(void)
     cmb_wtdsummary_initialize(wsp);
     cmb_wtdsummary_merge(wsp, &ws, wsp);
     cmb_timeseries_summarize(tsp, wsp);
+    cmb_wtdsummary_merge(&ws, wsp, &ws);
     cmb_wtdsummary_print(wsp, stdout, true);
 
     cmb_wtdsummary_terminate(wsp);
@@ -916,7 +917,7 @@ int main(const int argc, char *argv[])
             case 'n':
                 errno = 0;
                 nsamples = (uint64_t)strtoull(optarg, NULL, 0);
-                if (errno != 0 || seed == 0u) {
+                if (errno != 0 || nsamples == 0u) {
                     fprintf(stderr, "Invalid argument %s\n", optarg);
                     abort();
                 }
@@ -924,7 +925,7 @@ int main(const int argc, char *argv[])
             case 's':
                 errno = 0;
                 seed = (uint64_t)strtoull(optarg, NULL, 0);
-                if (errno != 0 || seed == 0u) {
+                if (errno != 0) {
                     fprintf(stderr, "Invalid argument %s\n", optarg);
                     abort();
                 }

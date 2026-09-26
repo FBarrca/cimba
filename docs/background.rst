@@ -111,8 +111,8 @@ Coroutines received significant academic interest in the early years, but were t
 overshadowed by the object-oriented inheritance mechanisms. It seems that current
 trends are turning away from the more complex inheritance mechanisms, in many cases
 using composition instead of (multiple) inheritance, and also reviving the interest in
-coroutines. One fairly recent article is
-https://www.cs.tufts.edu/~nr/cs257/archive/roberto-ierusalimschy/revisiting-coroutines.pdf
+coroutines. One fairly recent article is `Moura & Ierusalemsky (2009) "Revisiting Coroutines"
+<https://www.cs.tufts.edu/~nr/cs257/archive/roberto-ierusalimschy/revisiting-coroutines.pdf>`_.
 
 Unfortunately, when C++ finally got "coroutines" as a part of the language in 2020,
 these turned out to be both less powerful and less efficient than expected. (See
@@ -595,204 +595,13 @@ pre-packaged for the common resource types and exposed for the
 There may also be a weak pun here somewhere on the C++ ``promise`` keyword: Cimba
 processes do not promise. They *demand*.
 
-.. _background_random:
-
-Pseudo-random number generators and distributions
--------------------------------------------------
-
-Cimba has a few specific requirements to its pseudo-random number generators as well. For
-any discrete event simulation framework, the PRNG's need to be fast and have high
-statistical quality. In addition, we need them to be thread-safe, since it must be
-possible to reproduce the exact sequence of random numbers in a trial when given the
-same seed. We cannot have the outcome depend on other trials that may or may not be
-running in parallel. This is not very difficult to do, but it needs to be considered
-from the beginning, since the obvious way to code a PRNG is to keep its state in static
-variables between calls.
-
-The PRNG in Cimba is an implementation of Chris Doty-Humphrey's ``sfc64``. It
-provides 64-bit output and maintains a 256-bit state. It is certain to have a cycle
-period of at least 2^64, and is both faster and higher statistical quality than
-better-known generators such as the Mersenne Twister. It is in public domain, see
-https://pracrand.sourceforge.net
-for the details. In our implementation, the PRNG state is thread local, giving each trial
-its own stream of random numbers, independent from any other trials.
-
-We initialize the PRNG in a three-stage bootstrapping process:
-
-* First, a truly random 64-bit seed can be obtained from a suitable hardware source of
-  entropy by calling :c:func:`cmb_random_hwseed`. It will query the CPU for its best
-  source of randomness. On the x86-64 architecture, the preferred source is the
-  ``RDSEED`` instruction that is available on Intel CPUs since 2014 and AMD CPUs since
-  2016. This instruction uses thermal noise from the CPU itself to create a 64-bit
-  random value. If not available, we will negotiate alternatives with the CPU and
-  return the best entropy that is available, if necessary by doing a mashup of the clock
-  value, thread identifier, and CPU cycle counter.
-
-* Second, the seed is used to initialize the PRNG by calling :c:func:`cmb_random_initialize`.
-  It needs to create 256 bits of state from a 64-bit seed. We use a dedicated 64-bit state
-  PRNG for this. We initialize it with the 64-bit seed, and then draw four samples from it
-  to initialize the state of our main PRNG. This auxiliary PRNG is *splitmix64*, also
-  public domain, see https://rosettacode.org/wiki/Pseudo-random_numbers/Splitmix64#C
-
-* Finally, :c:func:`cmb_random_initialize` draws and discards 20 samples from the main PRNG
-  to make sure that any initial transient is gone before returning and allowing
-  :c:func:`cmb_random_sfc64` to provide pseudo-random numbers to the user application.
-
-The result is a pseudo-random number sequence that cannot be distinguished from true
-randomness by any available statistical methods. In particular, successive values
-appear to be totally uncorrelated, so it is not necessary or recommended to use
-multiple streams of pseudo-random numbers in the same trial. It would do more harm than
-good. For this reason, the PRNG is not implemented as an object in the simulated world,
-where various entities can carry around their own sources of randomness, but more like
-a property of the simulated world. It just *is*. The simulated entities can obtain
-sample values from it according to whatever distribution is needed.
-
-The basic :c:func:`cmb_random_sfc64()` returns an unsigned 64-bit bit pattern from the PRNG.
-This is a bit spartan for most purposes. The function :c:func:`cmb_random()` instead returns
-the sample as a ``double`` between zero and one. The first unit test in
-``test/test_random.c`` checks the output of :c:func:`cmb_random()` against its expected values:
-
-.. code-block:: none
-
-    Quality testing basic random number generator cmb_random(), uniform on [0,1)
-    Drawing 100000000 samples...
-
-    Expected: N 100000000  Mean   0.5000  StdDev   0.2887  Variance  0.08333  Skewness    0.000  Kurtosis   -1.200
-    Actual:   N 100000000  Mean   0.5000  StdDev   0.2887  Variance  0.08333  Skewness -1.537e-05  Kurtosis   -1.200
-    --------------------------------------------------------------------------------
-    ( -Infinity,  8.569e-09)   |
-    [ 8.569e-09,    0.05000)   |#################################################=
-    [   0.05000,     0.1000)   |#################################################=
-    [    0.1000,     0.1500)   |#################################################=
-    [    0.1500,     0.2000)   |#################################################=
-    [    0.2000,     0.2500)   |#################################################=
-    [    0.2500,     0.3000)   |#################################################=
-    [    0.3000,     0.3500)   |#################################################=
-    [    0.3500,     0.4000)   |#################################################=
-    [    0.4000,     0.4500)   |#################################################=
-    [    0.4500,     0.5000)   |#################################################=
-    [    0.5000,     0.5500)   |#################################################=
-    [    0.5500,     0.6000)   |#################################################=
-    [    0.6000,     0.6500)   |#################################################=
-    [    0.6500,     0.7000)   |#################################################=
-    [    0.7000,     0.7500)   |#################################################=
-    [    0.7500,     0.8000)   |#################################################=
-    [    0.8000,     0.8500)   |#################################################=
-    [    0.8500,     0.9000)   |#################################################=
-    [    0.9000,     0.9500)   |##################################################
-    [    0.9500,      1.000)   |#################################################=
-    [     1.000,  Infinity )   |-
-    --------------------------------------------------------------------------------
-
-    Autocorrelation factors (expected 0.0):
-               -1.0                              0.0                              1.0
-    --------------------------------------------------------------------------------
-       1  -0.000                                 -|
-       2  -0.000                                 -|
-       3   0.000                                  |-
-       4   0.000                                  |-
-       5   0.000                                  |-
-       6   0.000                                  |-
-       7   0.000                                  |-
-       8  -0.000                                 -|
-       9  -0.000                                 -|
-      10  -0.000                                 -|
-      11  -0.000                                 -|
-      12  -0.000                                 -|
-      13   0.000                                  |-
-      14  -0.000                                 -|
-      15  -0.000                                 -|
-    --------------------------------------------------------------------------------
-
-    Partial autocorrelation factors (expected 0.0):
-               -1.0                              0.0                              1.0
-    --------------------------------------------------------------------------------
-       1  -0.000                                 -|
-       2  -0.000                                 -|
-       3   0.000                                  |-
-       4   0.000                                  |-
-       5   0.000                                  |-
-       6   0.000                                  |-
-       7   0.000                                  |-
-       8  -0.000                                 -|
-       9  -0.000                                 -|
-      10  -0.000                                 -|
-      11  -0.000                                 -|
-      12  -0.000                                 -|
-      13   0.000                                  |-
-      14  -0.000                                 -|
-      15  -0.000                                 -|
-    --------------------------------------------------------------------------------
-
-    Raw moment:   Expected:   Actual:   Error:
-    --------------------------------------------------------------------------------
-        1             0.5     0.50002    0.004 %
-        2         0.33333     0.33335    0.006 %
-        3            0.25     0.25002    0.008 %
-        4             0.2     0.20002    0.010 %
-        5         0.16667     0.16669    0.012 %
-        6         0.14286     0.14288    0.013 %
-        7           0.125     0.12502    0.015 %
-        8         0.11111     0.11113    0.016 %
-        9             0.1     0.10002    0.018 %
-       10        0.090909    0.090926    0.019 %
-       11        0.083333    0.083349    0.019 %
-       12        0.076923    0.076938    0.020 %
-       13        0.071429    0.071443    0.020 %
-       14        0.066667     0.06668    0.021 %
-       15          0.0625    0.062513    0.021 %
-    --------------------------------------------------------------------------------
-
-Another way to check the quality is to generate a million successive (x, y) pairs from
-:c:func:`cmb_random()` and plot them. The human eye is pretty good at detecting correlations
-and patterns, sometimes even where no pattern exists, so this is a quite sensitive (but
-informal) test:
-
-.. image:: ../images/crossplot_random.png
-
-The various pseudo-random number distributions build on this generator, shaping its
-output to match the required probability density functions. The algorithms used are
-selected for speed and accuracy. Please run
-`the unit test <https://github.com/ambonvik/cimba/blob/main/test/test_random.c>`_
-for verification of the individual distributions versus expected values.
-
-The exponential and normal distributions are implementations of Chris McFarland's
-improved Ziggurat algorithms, see https://github.com/cd-mcfarland/fast_prng
-or https://arxiv.org/pdf/1403.6870
-
-The gamma distribution uses an algorithm due to Marsaglia and Tsang. It uses a similar
-rejection sampling approach as the Ziggurat algorithm, but with a continuous function
-instead of the stepped rectangles of the Ziggurat. See https://dl.acm.org/doi/10.1145/358407.358414
-
-Many other distributions are built on top of these, as sums, products, or ratios of
-samples. For example, the infamous Cauchy distribution is simply the ratio of two normal
-variates, suitably scaled and shifted.
-
-Cimba also provides a collection of discrete-valued distributions, starting from the
-simple unbiased coin flip in :c:func:`cmb_random_flip`. It also provides Bernoulli trials
-(biased coin flips, if such a thing exists), fair and loaded dice, geometric, Poisson and
-Pascal distributions, and so forth.
-
-In some cases, a model needs to sample based on some empirical, discrete-valued set of
-probabilities. The probabilities can be given as an array *p[n]*, where *p[i]* is the
-probability of outcome *i*, for *0 <= i < n*. A clever algorithm for this is the
-Vose alias method, see https://www.keithschwarz.com/darts-dice-coins/
-
-The alias method requires an initial step of setting up an alias table, but provides fast
-O(1) sampling thereafter. This is worthwhile for *n* larger than seven or so, and about
-three times faster than the basic O(n) method for *n = 30*. In Cimba, the alias table
-is created by calling :c:func:`cmb_random_alias_create()`, sampled with
-:c:func:`cmb_random_alias_sample()`,
-and destroyed with :c:func:`cmb_random_alias_destroy()`. (In this case, we have bundled
-the allocation and initialization steps into a single ``_create()`` function, and the
-termination and deallocation steps into the ``_destroy()`` function.)
 
 .. _background_data:
 
 Data sets and summaries
 -----------------------
 
-As we saw in the previous section, Cimba provides a simple set of statistics utilities
+Cimba provides a limited set of statistics utilities
 for debugging and simple reporting. The most basic class is the :c:struct:`cmb_dataset`,
 simply a conveniently resizing array of sample values. It provides methods that require
 the individual values, such as calculating the median, quartiles, autocorrelation factors,
@@ -808,9 +617,9 @@ and Meng (https://arxiv.org/pdf/1510.04923).
 The reason for this is that we do not always need to keep all individual sample values,
 so we do not want to take the memory penalty of storing them if a simple summary is
 enough. In those cases, just adding the successive samples to a
-:c:struct:`cmb_datasummary` is more efficient. If we need both, collect the samples in
+:c:struct:`cmb_datasummary` is more efficient. If both are needed, collect the samples in
 a :c:struct:`cmb_dataset` and use the function :c:func:`cmb_dataset_summarize` to
-calculate a data summary object from the complete data set.
+calculate a data summary object from the complete data set in a single pass.
 
 The basic dataset is extended to a time series by the :c:struct:`cmb_timeseries` class.
 It adds a second ``double`` to make each sample an ``(x, t)`` pair. In addition, it
@@ -845,6 +654,679 @@ anything more than a simple sum and average is needed.
 And, of course, if more statistical power is needed, use the :c:func:`cmb_dataset_print`
 and :c:func:`cmb_timeseries_print` functions to write the raw data values to file, and
 use dedicated software such as *R* or *Gnuplot* to analyze and present the data.
+
+
+.. _background_random:
+
+Pseudo-random number generators and distributions
+-------------------------------------------------
+
+Cimba has a few specific requirements to its pseudo-random number generators as well. For
+any discrete event simulation framework, the PRNG's need to be fast and have high
+statistical quality. In addition, we need them to be thread-safe, since it must be
+possible to reproduce the exact sequence of random numbers in a trial when given the
+same seed. We cannot have the outcome depend on other trials that may or may not be
+running in parallel. This is not very difficult to do, but it needs to be considered
+from the beginning, since the obvious way to code a PRNG is to keep its state in static
+variables between calls. To be able to guarantee this property, Cimba contains its own
+PRNG and distributions.
+
+The core pseudo-random number generator `sfc64`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The PRNG in Cimba is an implementation of Chris Doty-Humphrey's `sfc64`. It
+provides 64-bit output and maintains a 256-bit state. It is certain to have a cycle
+period of at least :math:`2^{64}`, and is both faster and higher statistical quality than
+better-known generators such as the Mersenne Twister. It is in public domain, see
+https://pracrand.sourceforge.net
+for the details. In our implementation, the PRNG state is thread local, giving each trial
+its own sequence of random numbers, independent from any other trials.
+
+We initialize the PRNG in a three-stage bootstrapping process:
+
+* First, a high-entropy 64-bit seed can be obtained from a suitable hardware source
+  by calling :c:func:`cmb_random_hwseed`. It will query the CPU for its best
+  source of randomness. On the x86-64 architecture, the preferred source is the
+  ``RDSEED`` instruction that is available on Intel CPUs since 2014 and AMD CPUs since
+  2016. This instruction uses thermal noise from the CPU itself to create a 64-bit
+  random value. If not available, we will negotiate alternatives with the CPU and
+  return the best entropy that is available, if necessary by doing a mashup of the clock
+  value, thread identifier, and CPU cycle counter.
+
+  Of course, the user code can choose to provide its own seed value instead for
+  reproducibility.
+
+* Second, the 64-bit master seed is used to initialize the PRNG by calling
+  :c:func:`cmb_random_initialize`.
+  It creates 256 bits of state from a 64-bit seed. We use a dedicated 64-bit-state
+  PRNG for this. We initialize it with the 64-bit seed, and then draw four samples from it
+  to initialize the state of our main PRNG. This auxiliary PRNG is
+  `splitmix64 <https://rosettacode.org/wiki/Pseudo-random_numbers/Splitmix64#C>`_,
+  also in the public domain.
+
+  In cases where we need to create many deterministic seeds from a single master seed,
+  e.g., for a large number of independent trials, we use the `MurmurHash3` function
+  :c:func:`cmb_fmix64()` to generate the trial seeds from a master seed and a counter
+  used as a hash nonce value. The 64-bit trial seeds are then passed to
+  :c:func:`cmb_random_initialize()` where `splitmix64` amplifies them to 256-bit initial
+  states.
+
+  Note that this is slightly different from the published `sfc64`, which initializes
+  three 64-bit state variables to the same seed value and the fourth, the counter, to
+  zero in every case. By randomizing also the counter, we start the generator at a
+  random point along its cycle. This starting point is one that is also reachable
+  if starting the counter from zero, just with an offset.
+
+  This implies that published `sfc64` results in PractRand and BigCrush tests will carry
+  over, and that the cycle length stays the same, at least :math:`2^{64}`. However, if
+  each trial consumes :math:`L` `sfc64` samples, where :math:`L \ll 2^{64}`,
+  randomizing the counter starting point reduces the (already low) probability of
+  getting overlapping sample sequences between trials or threads by about
+  :math:`2^{64} / L` compared to starting all counters from zero.
+
+* Finally, :c:func:`cmb_random_initialize` draws and discards 20 samples from the main PRNG
+  to make sure that any initial transient is gone before returning and allowing
+  :c:func:`cmb_random_sfc64` to provide pseudo-random numbers to the user application.
+
+The result is a pseudo-random number sequence that cannot be distinguished from true
+randomness by any currently available statistical methods.
+
+Validating `sfc64`
+^^^^^^^^^^^^^^^^^^
+
+As evidence for the above statement, we built a small test program to feed
+:c:func:`cmb_random_sfc64` output to the test suite
+`PractRand <https://pracrand.sourceforge.net>`_,
+including periodic reinitializations with `splitmix64` like what would happen in a
+multi-trial experiment:
+
+.. code-block:: c
+
+    int main(const int argc, char *argv[])
+    {
+        uint64_t master_seed = cmb_random_hwseed();
+        size_t words_per_seed = 64;
+
+        /* Print info to stderr since PractRand will read from our stdout */
+        fprintf(stderr, "test_practrand, Cimba version %s\n", cimba_version());
+        fprintf(stderr, "master_seed = 0x%016" PRIx64 ", words_per_seed = %zu\n\n",
+                master_seed, words_per_seed);
+
+        static uint64_t buf[16384];           /* 128 KiB per write */
+        size_t   n = 0;                       /* Words currently in buf */
+        uint64_t i = 0;                       /* Trial index */
+
+        for (;;) {
+            /* A new batch representing a Cimba trial */
+            const uint64_t trial_seed = cmb_random_fmix64(master_seed, i++);
+            cmb_random_initialize(trial_seed);
+
+            for (size_t j = 0; j < words_per_seed; j++) {
+                /* Generate sample to buffer */
+                buf[n++] = cmb_random_sfc64();
+                if (n == sizeof buf / sizeof buf[0]) {
+                    /* Write the buffered samples */
+                    if (fwrite(buf, sizeof buf, 1, stdout) != 1) {
+                        /* PractRand closed the pipe */
+                        cmb_random_terminate();
+                        return 0;
+                    }
+
+                    /* Restart buffer */
+                    n = 0;
+                }
+            }
+
+            cmb_random_terminate();
+        }
+
+        /* Not reached */
+    }
+
+We can then run it from the command line as:
+
+.. code-block:: none
+
+    [ambonvik@Threadripper PractRand]$ ../cimba/build/test/test_practrand | ./RNG_test stdin64 -tlmax 1TB -multithreaded
+    test_practrand, Cimba version 3.0.0-RC2
+    master_seed = 0x3611a744ee599a82, words_per_seed = 64
+
+    RNG_test using PractRand version 0.96
+    RNG = RNG_stdin64, seed = unknown
+    test set = core, folding = standard (64 bit)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 1 gigabyte (2^30 bytes), time= 3.2 seconds
+      no anomalies in 227 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 2 gigabytes (2^31 bytes), time= 6.6 seconds
+      no anomalies in 242 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 4 gigabytes (2^32 bytes), time= 13.4 seconds
+      no anomalies in 256 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 8 gigabytes (2^33 bytes), time= 26.1 seconds
+      no anomalies in 270 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 16 gigabytes (2^34 bytes), time= 51.9 seconds
+      no anomalies in 283 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 32 gigabytes (2^35 bytes), time= 101 seconds
+      no anomalies in 296 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 64 gigabytes (2^36 bytes), time= 200 seconds
+      no anomalies in 308 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 128 gigabytes (2^37 bytes), time= 392 seconds
+      no anomalies in 320 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 256 gigabytes (2^38 bytes), time= 776 seconds
+      no anomalies in 332 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 512 gigabytes (2^39 bytes), time= 1536 seconds
+      no anomalies in 343 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 1 terabyte (2^40 bytes), time= 3050 seconds
+      no anomalies in 354 test result(s)
+
+This is a clean bill of health for :c:func:`cmb_random_sfc64()`, also when it is being
+periodically reinitialized like it would be in a simulation model. We can vary the
+number of samples between reinitializations, here 64, and get equally clean results
+even for just drawing a single `sfc64` sample for every `fmix64` hash and
+`splitmix64` state initialization. There is no detectable statistical pattern in the
+output from the periodic reinitializations.
+
+The tests above each pulled 137.4 billion samples without finding any non-random
+patterns in the data. In an attempt to find its limit, we let one run continue to
+32 terabytes, using one million samples per reseeding to represent the expected usage
+pattern:
+
+.. code-block:: none
+
+    [ambonvik@Threadripper PractRand]$ ../cimba/build/test/test_practrand -n 1000000 | ./RNG_test stdin64 -tlmax 32TB -multithreaded
+    test_practrand, Cimba version 3.0.0-RC2
+    master_seed = 0xabecdc337e946ade, words_per_seed = 1000000
+
+    RNG_test using PractRand version 0.96
+    RNG = RNG_stdin64, seed = unknown
+    test set = core, folding = standard (64 bit)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 1 gigabyte (2^30 bytes), time= 3.3 seconds
+      no anomalies in 227 test result(s)
+
+    ...
+
+    rng=RNG_stdin64, seed=unknown
+    length= 16 terabytes (2^44 bytes), time= 49077 seconds
+      no anomalies in 392 test result(s)
+
+    rng=RNG_stdin64, seed=unknown
+    length= 32 terabytes (2^45 bytes), time= 97867 seconds
+      no anomalies in 400 test result(s)
+
+This was *4.4 trillion* (:math:`2^{42}`) samples without seeing any signs of
+statistically detectable patterns, matching previously known results for `sfc64`. It
+confirms that our implementation, including the periodic reinitialization, maintains
+the expected quality.
+
+For comparison, the well-known 64-bit
+`Mersenne Twister <https://en.wikipedia.org/wiki/Mersenne_Twister>`_
+`fails PractRand already at 512 GB <https://www.pcg-random.org/posts/how-to-test-with-practrand.html>`_,
+about 68.7 billion samples, or just 26 minutes into this run.
+
+With this high PRNG quality, it is not necessary to use multiple streams of pseudo-random
+numbers in the same trial to avoid overlapping cycles. That problem does not exist.
+Accordingly, the Cimba PRNG is not implemented as an object in the simulated world,
+where various entities can carry around their own streams of randomness, but more like
+a property of the simulated world. It just *is*. The simulated entities can obtain
+sample values from it as needed according to whatever distribution is needed.
+
+Validating the basic `cmb_random()` U[0,1) distribution
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The basic :c:func:`cmb_random_sfc64()` returns an unsigned 64-bit bit pattern from the PRNG.
+This is a bit spartan for most purposes. The function :c:func:`cmb_random()` instead returns
+the sample as a ``double`` between zero and one, strictly :math:`[0,1)`. The first unit
+test in ``test/test_random.c`` checks the output of :c:func:`cmb_random()` against its
+expected values:
+
+.. code-block:: none
+
+    ********************************************************************************
+    ************** Testing random number generators and distributions **************
+    ********************************************************************************
+    Using seed: 0x6aa1da69c441b03f
+
+    Quality testing basic random number generator cmb_random(), uniform on [0,1)
+    Drawing 1000000 samples...
+    Expected vs actual:
+    Count   	Mean    	StdDev  	Variance	Skewness	Excess kurtosis
+    1.000e+06	  0.5000	  0.2887	 0.08333	   0.000	  -1.200
+    1.000e+06	  0.4999	  0.2887	 0.08334	0.0003149	  -1.200
+    --------------------------------------------------------------------------------
+    ( -Infinity,      0.000)   |
+    [     0.000,    0.05000)   |#################################################=
+    [   0.05000,     0.1000)   |#################################################=
+    [    0.1000,     0.1500)   |#################################################=
+    [    0.1500,     0.2000)   |#################################################-
+    [    0.2000,     0.2500)   |#################################################=
+    [    0.2500,     0.3000)   |#################################################=
+    [    0.3000,     0.3500)   |#################################################=
+    [    0.3500,     0.4000)   |##################################################
+    [    0.4000,     0.4500)   |#################################################=
+    [    0.4500,     0.5000)   |#################################################=
+    [    0.5000,     0.5500)   |#################################################-
+    [    0.5500,     0.6000)   |#################################################=
+    [    0.6000,     0.6500)   |#################################################=
+    [    0.6500,     0.7000)   |#################################################=
+    [    0.7000,     0.7500)   |#################################################=
+    [    0.7500,     0.8000)   |#################################################=
+    [    0.8000,     0.8500)   |#################################################=
+    [    0.8500,     0.9000)   |#################################################=
+    [    0.9000,     0.9500)   |#################################################-
+    [    0.9500,      1.000)   |#################################################=
+    [     1.000,   Infinity)   |
+    --------------------------------------------------------------------------------
+
+    Autocorrelation factors (expected 0.0):
+               -1.0                              0.0                              1.0
+    --------------------------------------------------------------------------------
+       1   0.001                                  |-
+       2  -0.001                                 -|
+       3  -0.001                                 -|
+       4   0.002                                  |-
+       5   0.002                                  |-
+       6   0.000                                  |-
+       7  -0.000                                 -|
+       8   0.001                                  |-
+       9  -0.000                                 -|
+      10   0.001                                  |-
+      11  -0.001                                 -|
+      12   0.000                                  |-
+      13  -0.000                                 -|
+      14  -0.000                                 -|
+      15   0.000                                  |-
+    --------------------------------------------------------------------------------
+
+    Partial autocorrelation factors (expected 0.0):
+               -1.0                              0.0                              1.0
+    --------------------------------------------------------------------------------
+       1   0.001                                  |-
+       2  -0.001                                 -|
+       3  -0.001                                 -|
+       4   0.002                                  |-
+       5   0.002                                  |-
+       6   0.000                                  |-
+       7  -0.000                                 -|
+       8   0.001                                  |-
+       9  -0.000                                 -|
+      10   0.001                                  |-
+      11  -0.001                                 -|
+      12   0.000                                  |-
+      13  -0.000                                 -|
+      14  -0.000                                 -|
+      15   0.000                                  |-
+    --------------------------------------------------------------------------------
+
+    Raw moment:   Expected:   Actual:   Error:
+    --------------------------------------------------------------------------------
+        1             0.5     0.49992   -0.016 %
+        2         0.33333     0.33326   -0.021 %
+        3            0.25     0.24994   -0.024 %
+        4             0.2     0.19995   -0.026 %
+        5         0.16667     0.16662   -0.029 %
+        6         0.14286     0.14281   -0.032 %
+        7           0.125     0.12496   -0.035 %
+        8         0.11111     0.11107   -0.039 %
+        9             0.1    0.099958   -0.042 %
+       10        0.090909    0.090868   -0.045 %
+       11        0.083333    0.083294   -0.047 %
+       12        0.076923    0.076886   -0.048 %
+       13        0.071429    0.071394   -0.049 %
+       14        0.066667    0.066634   -0.049 %
+       15          0.0625     0.06247   -0.048 %
+    --------------------------------------------------------------------------------
+
+
+Another way to check the quality is to generate a million successive :math:`(x, y)` pairs
+from :c:func:`cmb_random()` and plot them. The human eye is pretty good at detecting
+correlations and patterns, sometimes even where no pattern exists, so this is a quite
+sensitive (but informal) test:
+
+.. image:: ../images/crossplot_random.png
+
+Even if it passes our informal eyeball tests, and the source code combined with the
+above results for the underlying `sfc64` generator conclusively proves that
+:c:func:`cmb_random()` in fact is uniformly distributed, we will need a way to
+quantifying our degree of certainty in this claim. For this purpose, we have built a
+battery of formal statistical test as part of the test suite.
+
+Feeding a million samples from `cmb_random()` through this test battery gives output
+similar to this:
+
+.. code:: none
+
+    ------------------------------------------------------------------------------------------------------------------------
+    Goodness-of-fit test:                    Actual:   Expected:    Interpretation:
+    ------------------------------------------------------------------------------------------------------------------------
+    Pearson's chi squared test                  10.4          15    Sigma: -0.8140  Odds: 1 in 2.41
+    Neyman's smooth test                        8.23          10    Sigma: -0.2691  Odds: 1 in 1.27
+        Neyman V1: mean                       -0.761           0    Sigma: -0.7612  Odds: 1 in 2.24
+        Neyman V2: variance                    0.989           0    Sigma: +0.9888  Odds: 1 in 3.10
+        Neyman V3: skewness                   0.0976           0    Sigma: +0.0976  Odds: 1 in 1.08
+        Neyman V4: kurtosis                    0.528           0    Sigma: +0.5283  Odds: 1 in 1.67
+        Neyman remainder: fine structure         223         251    Sigma: -1.2666  Odds: 1 in 4.87
+    Anderson-Darling EDF test                  0.692           1    Sigma: -0.1659  Odds: 1 in 1.15
+    Combined assessment, Bonferroni on Neyman + Anderson-Darling:   Sigma: -0.0000  Odds: 1 in 1.00    Unremarkable
+    ------------------------------------------------------------------------------------------------------------------------
+
+To demonstrate the sensitivity of the test battery, we can try feeding it data that
+instead is distributed according to a Beta distribution with :math:`\alpha = 0.99` and
+:math:`\beta = 0.99` instead. This data set is nearly uniform, but with a small
+tendency to "horns" at the top and bottom of the range. It is soundly rejected by our
+test battery in several different ways:
+
+.. code:: none
+
+    ------------------------------------------------------------------------------------------------------------------------
+    Goodness-of-fit test:                    Actual:   Expected:    Interpretation:
+    ------------------------------------------------------------------------------------------------------------------------
+    Pearson's chi squared test                  79.7          15    Sigma:  +6.40  Odds: 1 in 6.4e+09    Failed
+    Neyman's smooth test                          74          10    Sigma:  +6.75  Odds: 1 in 6.9e+10    Failed
+        Neyman V1: mean                       -0.506           0    Sigma:  -0.51  Odds: 1 in    1.6
+        Neyman V2: variance                     7.59           0    Sigma:  +7.59  Odds: 1 in 3.2e+13    Failed
+        Neyman V3: skewness                   -0.911           0    Sigma:  -0.91  Odds: 1 in    2.8
+        Neyman V4: kurtosis                     2.35           0    Sigma:  +2.35  Odds: 1 in    53.
+        Neyman remainder: fine structure         261         251    Sigma:  +0.46  Odds: 1 in    1.6
+    Anderson-Darling EDF test                   10.3           1    Sigma:  +4.27  Odds: 1 in 5.2e+04    Suspect
+    Combined assessment, Bonferroni on Neyman + Anderson-Darling:   Sigma:  +6.65  Odds: 1 in 3.4e+10    Failed
+    ------------------------------------------------------------------------------------------------------------------------
+
+As expected, it detects the bias towards high and low values most strongly as too-high
+variance, propagating to failing the combined Neyman smooth goodness-of-fit test, and
+from there to failing our combined assessment.
+
+Note that we deal in sigma values and odds here, not p-values, since most of the
+action will be within very narrow ranges of p-values near 1.0 and 0.0. The sigma (or
+Z-score), the number of standard deviations off the expected value, expresses that better.
+Note that the sigma is a signed quantity, where a negative sigma expresses that the
+statistic is below the expected value, e.g., that the data has less variability than
+expected.
+
+The verbal scale used for the interpretation is:
+
+.. code:: none
+
+    |Sigma|  Interpretation
+    ------------------------
+    < 3.0   Unremarkable (only shown for the overall assessment, otherwise blank)
+    > 3.0   Unusual
+    > 4.0   Suspect
+    > 5.0   Failed
+
+For comparison, a :math:`p = 0.05` level in a two-sided test corresponds
+to a sigma of 1.96. Our scale will first start declaring something "unusual" at two-sided
+:math:`p = 0.0027` and "failed" at two-sided :math:`p = 1.973e−09`. We run large numbers
+of automated tests, and at conventional thresholds a clean run would flag somewhere
+almost every time (probability about 0.9 for each clean CI run). Large sample sizes make
+this affordable: At :math:n = 10^6 a genuine defect typically registers at tens of
+sigma rather than at two, so raising the threshold from 1.96 to 6 sigma costs very little
+detection power while eliminating most false alarms. That lets us focus on any actual
+defects rather than chasing noise.
+
+Building and validating the other distributions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The various pseudo-random number distributions build on the `sfc64` generator, shaping its
+output to match the required probability density functions. The algorithms used are
+selected for speed and accuracy. We will only give a brief overview here, please
+refer to the linked articles below and the well-commented source code in ``cmb_random.c``
+for additional detail.
+
+The exponential and normal distributions are implementations of
+`Chris McFarland's improved Ziggurat algorithms <https://arxiv.org/pdf/1403.6870>`_.
+These are fast rejection sampling methods where the inner aprt of the distribution PDF is
+represented by an easily sampled "ziggurat" of rectangles, while the outside of the PDF is
+covered by a tightly fitting set of triangles. As a result, there are very few cases where
+the actual PDF function needs to be evaluated, and the sampling process becomes very fast.
+
+The gamma distribution uses
+`an algorithm due to Marsaglia and Tsang <https://dl.acm.org/doi/10.1145/358407.358414>`_.
+It uses a similar rejection sampling approach as the ziggurat algorithm, but with a
+continuous function instead of the stepped rectangles of the ziggurat.
+
+Many other distributions are in turn built on top of these three a special cases, sums,
+products, or ratios of samples. For example, the infamous Cauchy distribution is the ratio
+of two normal variates, suitably scaled and shifted.
+
+Cimba also provides a collection of discrete-valued distributions, starting from the
+simple unbiased coin flip in :c:func:`cmb_random_flip()`. It also provides Bernoulli
+trials (biased coin flips, if such a thing exists), fair and loaded dice, geometric,
+Poisson and Pascal distributions, and so forth.
+
+The binomial distribution is an implementation of `Wolfgang Hörmann's BTRD algorithm
+<https://research.wu.ac.at/en/publications/the-generation-of-binomial-random-variates-6/>`_
+and the Poisson algorithm his `PTRD algorithm
+<https://research.wu.ac.at/de/publications/the-transformed-rejection-method-for-generating-poisson-random-va-6/>`_.
+These are also fast rejection-type algorithms.
+
+In some cases, a model needs to sample based on some empirical, discrete-valued set of
+probabilities. The probabilities can be given as an array :math:`p[n]`, where
+:math:`p[i]` is the probability of outcome :math:`i`, for :math:`0 <= i < n`. A clever
+algorithm for this is the Vose alias method, see https://www.keithschwarz.com/darts-dice-coins/
+
+The alias method requires an initial step of setting up an alias table, but provides fast
+:math:`O(1)` sampling thereafter. This is worthwhile for *n* larger than seven or so, and
+about three times faster than the basic :math:`O(n)` method for :math:`n = 30`. In Cimba,
+the alias table is created by calling :c:func:`cmb_random_alias_create()`, sampled with
+:c:func:`cmb_random_alias_sample()`,
+and destroyed with :c:func:`cmb_random_alias_destroy()`. (In this case, we have bundled
+the allocation and initialization steps into a single ``_create()`` function, and the
+termination and deallocation steps into the ``_destroy()`` function.)
+
+We can use the same goodness-of-fit test against the uniform distribution on [0,1]
+also to test the other distributions, as long as we can compute the cumulative density
+function :math:`F(x)`. This transformation of the sample :math:`x` *is* distributed
+uniformly on [0,1]. To see why, note that :math:`y = F(x)` is a mapping from the real
+numbers to the range [0,1]. Many random number distributions use the same
+transformation in inverse to generate a variate :math:`x` according to some
+distribution by first generating a uniform variate :math:`u` on [0,1] and then
+transforming it as :math:`x = F^{-1}(u)`.
+
+As an example, this is the (wholly unremarkable) test report for a modified PERT
+distribution:
+
+.. code-block:: none
+
+    Drawing 1000000 samples...
+    Expected vs actual:
+    Count           Mean            StdDev          Variance        Skewness        Excess kurtosis
+    1.000e+06          5.333           1.491           2.222          0.2236         -0.6000
+    1.000e+06          5.335           1.491           2.222          0.2236         -0.5982
+    --------------------------------------------------------------------------------
+    ( -Infinity,      2.000)   |
+    [     2.000,      2.500)   |###=
+    [     2.500,      3.000)   |################-
+    [     3.000,      3.500)   |############################=
+    [     3.500,      4.000)   |######################################=
+    [     4.000,      4.500)   |##############################################=
+    [     4.500,      5.000)   |#################################################=
+    [     5.000,      5.500)   |##################################################
+    [     5.500,      6.000)   |##############################################=
+    [     6.000,      6.500)   |#########################################=
+    [     6.500,      7.000)   |##################################-
+    [     7.000,      7.500)   |##########################-
+    [     7.500,      8.000)   |##################-
+    [     8.000,      8.500)   |###########-
+    [     8.500,      9.000)   |#####-
+    [     9.000,      9.500)   |#=
+    [     9.500,      10.00)   |-
+    [     10.00,   Infinity)   |
+    --------------------------------------------------------------------------------
+    ------------------------------------------------------------------------------------------------------------------------
+    Goodness-of-fit test:                    Actual:   Expected:    Interpretation:
+    ------------------------------------------------------------------------------------------------------------------------
+    Pearson's chi squared test                    15          15    Sigma: +0.11  Odds: 1 in    1.1
+    Neyman's smooth test                        12.2          10    Sigma: +0.60  Odds: 1 in    1.8
+        Neyman V1: mean                         1.19           0    Sigma: +1.19  Odds: 1 in    4.3
+        Neyman V2: variance                   -0.725           0    Sigma: -0.73  Odds: 1 in    2.1
+        Neyman V3: skewness                    0.825           0    Sigma: +0.83  Odds: 1 in    2.4
+        Neyman V4: kurtosis                      1.1           0    Sigma: +1.10  Odds: 1 in    3.7
+        Neyman remainder: fine structure         222         251    Sigma: -1.31  Odds: 1 in    5.3
+    Anderson-Darling EDF test                   1.11           1    Sigma: +0.51  Odds: 1 in    1.6
+    Combined assessment, Bonferroni on Neyman + Anderson-Darling:   Sigma: -0.00  Odds: 1 in    1.0    Unremarkable
+    ------------------------------------------------------------------------------------------------------------------------
+
+
+The test battery performs this goodness-of-fit test for all distributions, all passing
+with no indications of trouble. You can run
+`the full unit test <https://github.com/ambonvik/cimba/blob/main/test/test_random.c>`_
+as ``build/test/test_random`` to verify.
+
+Validating a Cimba M/M/1 queueing model
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+We can take this validation even further: Our :ref:`first tutorial <tut_1>` built a
+simulation of a M/M/1 queue. Theory predicts that the number of customers in the system
+:math:`N` is exactly geometrically distributed with :math:`P(N = n) = (1-\rho) \rho^{n}`
+for :math:`n = { 0, 1, 2, 3, ... }`. We also know that the time spent in the system
+is exponentially distributed with rate :math:`\mu - \lambda`. We already know from the
+tutorial that the average queue length in this system seems to pass the eyeball
+test:
+
+.. image:: ../images/tut_1_7.png
+
+However, armed with the statistical Goodness-of-Fit machinery, we can construct a more
+rigorous test. We collect independent samples of the number of customers in the system
+by running the simulation to some multiple of the relaxation time and taking a single
+sample there. Similarly, we can pretermine that we sample the time in the system of the
+:math:`n`'th customer to pass through, where :math:`n` also is determined from a
+sufficent number of relaxation times. These are unbiased samples, independent of the
+situation in the system at the sampling point.
+
+Having built that model, we can run it, e.g., a million times, all with different
+pseudo-random number seeds to get a large data set of independent samples of each
+of the two distributions. One small twist is that the queuing theoretic geometric
+distribution has support from zero (empty queue), while ours has support from one (at
+least one trial before the first success), so we transform the samples by adding
+one to align the distributions. We feed those data sets separately to the Goodness-of-Fit
+machinery for discrete and continuous variates, respectively, and get results like these:
+
+.. code-block:: none
+
+    [ambonvik@Threadripper cimba]$ build/test/test_MM1 -n 1000000 -r 0.98
+    rho = 0.980000
+    Cimba version 3.0.0-RC3
+    Master seed: 0x68d213e472461351
+    Average inter-arrival time: 1.020408, average service time: 1.000000
+    Utilization: 0.980000
+    Relaxation time: 9899.75
+    Duration until collecting number of customers in system: 989974.746831
+    Target customer for collecting time in system ssn 970175
+    Running 1000000 trials...
+    --------------------------------------------------------------------------------
+    Queue lengths:
+    Count           Mean            StdDev          Variance        Skewness        Excess kurtosis
+    1.000e+06          49.04           49.54           2454.           2.006           6.121
+    --------------------------------------------------------------------------------
+    ( -Infinity,      0.000)   |
+    [     0.000,      42.00)   |##################################################
+    [     42.00,      84.00)   |#####################-
+    [     84.00,      126.0)   |#########-
+    [     126.0,      168.0)   |###=
+    [     168.0,      210.0)   |#=
+    [     210.0,      252.0)   |=
+    [     252.0,      294.0)   |-
+    [     294.0,      336.0)   |-
+    [     336.0,      378.0)   |-
+    [     378.0,      420.0)   |-
+    [     420.0,      462.0)   |-
+    [     462.0,      504.0)   |-
+    [     504.0,      546.0)   |-
+    [     546.0,      588.0)   |-
+    [     588.0,      630.0)   |-
+    [     630.0,      672.0)   |-
+    [     672.0,      714.0)   |-
+    [     714.0,      756.0)   |-
+    [     756.0,      798.0)   |
+    [     798.0,      840.0)   |-
+    [     840.0,   Infinity)   |
+    --------------------------------------------------------------------------------
+    Assumed shifted geometric distribution, p = 0.020000, testing...
+    ------------------------------------------------------------------------------------------------------------------------
+    Goodness-of-fit test:                    Actual:   Expected:    Interpretation:
+    ------------------------------------------------------------------------------------------------------------------------
+    Pearson's chi squared test                  11.7          20    Sigma:  -1.44  Odds: 1 in    6.7
+    Neyman's smooth test                        8.47          10    Sigma:  -0.21  Odds: 1 in    1.2
+        Neyman V1: mean                        0.967           0    Sigma:  +0.97  Odds: 1 in    3.0
+        Neyman V2: variance                   0.0803           0    Sigma:  +0.08  Odds: 1 in    1.1
+        Neyman V3: skewness                      1.1           0    Sigma:  +1.10  Odds: 1 in    3.7
+        Neyman V4: kurtosis                    0.279           0    Sigma:  +0.28  Odds: 1 in    1.3
+        Neyman remainder: fine structure         9.5          16    Sigma:  -1.23  Odds: 1 in    4.6
+    Combined assessment (Neyman only due to the discrete data):     Sigma:  -0.21  Odds: 1 in    1.2    Unremarkable
+    ------------------------------------------------------------------------------------------------------------------------
+    --------------------------------------------------------------------------------
+    Time in system:
+    Count           Mean            StdDev          Variance        Skewness        Excess kurtosis
+    1.000e+06          50.05           50.05           2505.           2.007           6.139
+    --------------------------------------------------------------------------------
+    ( -Infinity,      0.000)   |
+    [     0.000,      43.00)   |##################################################-
+    [     43.00,      86.00)   |#####################-
+    [     86.00,      129.0)   |#########-
+    [     129.0,      172.0)   |###=
+    [     172.0,      215.0)   |#=
+    [     215.0,      258.0)   |=
+    [     258.0,      301.0)   |-
+    [     301.0,      344.0)   |-
+    [     344.0,      387.0)   |-
+    [     387.0,      430.0)   |-
+    [     430.0,      473.0)   |-
+    [     473.0,      516.0)   |-
+    [     516.0,      559.0)   |-
+    [     559.0,      602.0)   |-
+    [     602.0,      645.0)   |-
+    [     645.0,      688.0)   |-
+    [     688.0,      731.0)   |-
+    [     731.0,      774.0)   |
+    [     774.0,      817.0)   |
+    [     817.0,      860.0)   |-
+    [     860.0,   Infinity)   |
+    --------------------------------------------------------------------------------
+    Assumed exponential distribution, m = 50.000000,  testing...
+    ------------------------------------------------------------------------------------------------------------------------
+    Goodness-of-fit test:                    Actual:   Expected:    Interpretation:
+    ------------------------------------------------------------------------------------------------------------------------
+    Pearson's chi squared test                  8.26          15    Sigma:  -1.36  Odds: 1 in    5.7
+    Neyman's smooth test                        6.47          10    Sigma:  -0.75  Odds: 1 in    2.2
+        Neyman V1: mean                        0.862           0    Sigma:  +0.86  Odds: 1 in    2.6
+        Neyman V2: variance                    0.439           0    Sigma:  +0.44  Odds: 1 in    1.5
+        Neyman V3: skewness                    0.704           0    Sigma:  +0.70  Odds: 1 in    2.1
+        Neyman V4: kurtosis                   -0.627           0    Sigma:  -0.63  Odds: 1 in    1.9
+        Neyman remainder: fine structure         239         251    Sigma:  -0.53  Odds: 1 in    1.7
+    Anderson-Darling EDF test                  0.672           1    Sigma:  -0.21  Odds: 1 in    1.2
+    Combined assessment, Bonferroni on Neyman + Anderson-Darling:   Sigma:  +0.12  Odds: 1 in    1.1    Unremarkable
+    ------------------------------------------------------------------------------------------------------------------------
+
+
+This exercises a very large part of Cimba, not just the pseudo-random number generators
+and distributions, but also the core discrete event processing engine, object queues,
+and memory pools. We are of course not able to prove correctness, and we are not giving
+any warranties anyway (see the
+`LICENSE <https://github.com/ambonvik/cimba/blob/main/LICENSE>`_),
+but we have been looking very hard to find any indications of non-correctness, with a
+notable lack of success in finding any.
 
 .. _background_trials:
 
@@ -1047,10 +1529,7 @@ model.
 *Release* asserts enforce preconditions, the things that need to be true for some
 function to work correctly. These remain in the code even with ``-DNDEBUG``, since they
 express the contracts towards surrounding code such as valid ranges for input values.
-These are typically simple and fast statements. If you are absolutely certain that your
-model is working correctly and that all your inputs are valid, you can squeeze out another
-slight speed improvement (about 10 %) by defining the preprocessor symbol ``NASSERT`` and
-making these vanish as well.
+These are typically simple and fast statements.
 
 As an illustration, consider the function :c:func:`cmb_random_uniform()`:
 
@@ -1061,7 +1540,7 @@ As an illustration, consider the function :c:func:`cmb_random_uniform()`:
         cmb_assert_release(min < max);
 
         const double r = min + (max - min) * cmb_random();
-        cmb_assert_debug((r >= min) && (r <= max));
+        cmb_assert_debug((r >= min) && (r < max));
 
         return r;
     }
@@ -1084,14 +1563,7 @@ without a single comment in the code. We are not about to prove total correctnes
 strict C.A.R. Hoare sense, but the function shown above does constitute a logical
 `Hoare triple <https://en.wikipedia.org/wiki/Hoare_logic#Hoare_triple>`_.
 
-There is also an ``cmb_assert_always()`` that remains even if ``NASSERT`` is defined. This
-is for use in test programs that need to demonstrate correctness independent of the
-compilation options. Internally in Cimba, this is only used in the ``cmi_memutils.h``
-wrappers for ``malloc()`` and his friends to test for out-of-memory conditions. These
-function calls are slow anyway, and the consequences of an invalid pointer could be
-hard to trace down, so they will be stopped immediately with very little performance cost.
-
-For empirical data on the relationship between assertions and code quality, see,
+For empirical data on the correlation between assert density and code quality, see,
 e.g., https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-2006-54.pdf
 or https://www.cs.ucdavis.edu/~filkov/papers/assert-main.pdf
 
@@ -1296,7 +1768,7 @@ It provides similar functionality to Cimba, only with Python as its base languag
 instead of C. SimPy emphasizes ease of use as a main design objective, following the
 overall Python philosophy, while Cimba (being a C library) has a natural emphasis on
 speed. SimPy processes are based on stackless generators, whereas Cimba has its
-stackful coroutine processes. The current SimPy version is 4.1.1.
+stackful coroutine processes.
 
 For comparable multithreading functionality, SimPy needs to be combined with the Python
 ``multiprocessing`` package. In the following, when referring to SimPy in a
@@ -1318,7 +1790,7 @@ A complete multithreaded M/M/1 queue simulation could look like this in SimPy,
     NUM_OBJECTS = 1000000
     ARRIVAL_RATE = 0.9
     SERVICE_RATE = 1.0
-    NUM_TRIALS = 100
+    NUM_TRIALS = 128
 
     def arrival_process(env, store, n_limit, arrival_rate):
         for _ in range(n_limit):
@@ -1368,6 +1840,7 @@ A complete multithreaded M/M/1 queue simulation could look like this in SimPy,
     if __name__ == "__main__":
         main()
 
+
 The same model would look like this in Cimba,
 `benchmark/MM1_multi.c <https://github.com/ambonvik/cimba/blob/main/benchmark/MM1_multi.c>`_:
 
@@ -1376,16 +1849,15 @@ The same model would look like this in Cimba,
     #include <inttypes.h>
     #include <stdio.h>
     #include <stdint.h>
-
     #include <cimba.h>
-
     #include "cmi_mempool.h"
 
     #define NUM_OBJECTS 1000000u
     #define ARRIVAL_RATE 0.9
     #define SERVICE_RATE 1.0
+    #define NUM_TRIALS 128
 
-    CMB_THREAD_LOCAL struct cmi_mempool objectpool = CMI_MEMPOOL_STATIC_INIT(sizeof(void *), 512u);
+    CMB_THREAD_LOCAL struct cmi_mempool objectpool = CMI_MEMPOOL_STATIC_INIT(8u, 512u);
 
     struct simulation {
         struct cmb_process *arrival;
@@ -1406,7 +1878,7 @@ The same model would look like this in Cimba,
         struct trial *trl;
     };
 
-    void *arrivalfunc(struct cmb_process *me, void *vctx)
+    void *arrival_proc(struct cmb_process *me, void *vctx)
     {
         cmb_unused(me);
         const struct context *ctx = vctx;
@@ -1424,7 +1896,7 @@ The same model would look like this in Cimba,
         return NULL;
     }
 
-    void *servicefunc(struct cmb_process *me, void *vctx)
+    void *service_proc(struct cmb_process *me, void *vctx)
     {
         cmb_unused(me);
         const struct context *ctx = vctx;
@@ -1438,7 +1910,8 @@ The same model would look like this in Cimba,
             const double *dblp = object;
             const double t_srv = cmb_random_exponential(mean_srv);
             cmb_process_hold(t_srv);
-            *sum += cmb_time() - *dblp;
+            const double t_sys = cmb_time() - *dblp;
+            *sum += t_sys;
             *cnt += 1u;
             cmi_mempool_free(&objectpool, object);
         }
@@ -1458,12 +1931,11 @@ The same model would look like this in Cimba,
 
         sim->queue = cmb_objectqueue_create();
         cmb_objectqueue_initialize(sim->queue, "Queue", CMB_UNLIMITED);
-
         sim->arrival = cmb_process_create();
-        cmb_process_initialize(sim->arrival, "Arrival", arrivalfunc, ctx, 0);
+        cmb_process_initialize(sim->arrival, "Arrival", arrival_proc, ctx, 0);
         cmb_process_start(sim->arrival);
         sim->service = cmb_process_create();
-        cmb_process_initialize(sim->service, "Service", servicefunc, ctx, 0);
+        cmb_process_initialize(sim->service, "Service", service_proc, ctx, 0);
         cmb_process_start(sim->service);
 
         cmb_event_queue_execute();
@@ -1475,101 +1947,156 @@ The same model would look like this in Cimba,
         cmb_process_destroy(sim->service);
         cmb_objectqueue_terminate(sim->queue);
         cmb_objectqueue_destroy(sim->queue);
-
         cmb_event_queue_terminate();
-        cmb_random_terminate();
-
         free(sim);
         free(ctx);
     }
 
     int main(void)
     {
-        struct trial *trl = malloc(sizeof(*trl));
-        trl->arr_mean = 1.0 / ARRIVAL_RATE;
-        trl->srv_mean = 1.0 / SERVICE_RATE;
-        trl->obj_cnt = 0u;
-        trl->sum_wait = 0.0;
-        run_trial(trl);
+        struct trial *experiment = calloc(NUM_TRIALS, sizeof(*experiment));
+        for (unsigned ui = 0; ui < NUM_TRIALS; ui++) {
+            struct trial *trl = &experiment[ui];
+            trl->arr_mean = 1.0 / ARRIVAL_RATE;
+            trl->srv_mean = 1.0 / SERVICE_RATE;
+            trl->obj_cnt = 0u;
+            trl->sum_wait = 0.0;
+        }
 
-        printf("Average system time %f (expected %f)\n",
-                trl->sum_wait / (double)trl->obj_cnt,
-                1.0 / (SERVICE_RATE - ARRIVAL_RATE));
+        cimba_run(experiment, NUM_TRIALS, sizeof(*experiment), run_trial);
 
-        free(trl);
+        struct cmb_datasummary summary;
+        cmb_datasummary_initialize(&summary);
+        for (unsigned ui = 0; ui < NUM_TRIALS; ui++) {
+            const double avg_tsys = experiment[ui].sum_wait / (double)(experiment[ui].obj_cnt);
+            cmb_datasummary_add(&summary, avg_tsys);
+        }
 
-        return 0;
+        free(experiment);
+
+        const unsigned un = cmb_datasummary_count(&summary);
+        if (un > 1) {
+            const double mean_tsys = cmb_datasummary_mean(&summary);
+            const double sdev_tsys = cmb_datasummary_stddev(&summary);
+            const double serr_tsys = sdev_tsys / sqrt((double)un);
+            const double ci_w = 1.96 * serr_tsys;
+            const double ci_l = mean_tsys - ci_w;
+            const double ci_u = mean_tsys + ci_w;
+
+            /* Note: We did not use a warm-up period, some undershoot bias will occur */
+            printf("Average system time %f (n %u, conf.int. %f - %f, expected %f)\n",
+                   mean_tsys, un, ci_l, ci_u, 1.0 / (SERVICE_RATE - ARRIVAL_RATE));
+
+            return 0;
+        }
     }
 
 
-The Cimba code is significantly longer for this simple example, 139 vs 60 lines. The C
+Both programs produce a one-liner output similar to this:
+
+.. code-block:: none
+
+    Average system time 9.990997 (n 128, conf.int. 9.960142 - 10.021853, expected 10.000000)
+
+The Cimba code is significantly longer for this simple example, 144 vs 59 lines. The C
 base language demands more careful declarations of object types, whereas Python will
 happily try to infer types from context. C requires explicit management of object creation
 and destruction, since it does not have Python's automatic garbage collection. This
 requires some additional code lines.
 
 For a larger model, where the process function could be large, complex, and
-call various other functions, the SimPy code could become much harder to follow. We
-leave it as an exercise for the interested reader to build our :ref:`entertainment park
-tutorial <tut_3>` or :ref:`LNG harbor tutorial <tut_4>` in SimPy for a similar
-benchmarking.
+call various other functions, the SimPy code could become larger and harder to follow.
+Cimba's stackful coroutines allow calls to context-switching functions like
+:c:func:`cmb_process_hold()` or :c:func:`cmb_resource_acquire()` from arbitrary deep
+within function call hierarchies. Control will leave the call stack where it is and
+pick up again from the same point when control is passed back into that
+``cmb_process``. This makes for a very natural way to express agentic behavior by
+simulated processes. The stackless Python ``generator`` that SimPy processes are based
+on cannot do this. We leave it as an exercise for the interested reader to build our
+:ref:`entertainment park tutorial <tut_3>` or :ref:`LNG harbor tutorial <tut_4>` in
+SimPy to compare code sizes there.
 
-Moreover, Cimba's stackful coroutines allow calls to context-switching functions (like
-:c:func:`cmb_process_hold()` or :c:func:`cmb_resource_acquire()`) from arbitrary deep within
-function call hierarchies. Control will leave the call stack where it is and pick up
-again from the same point when control is passed back into that ``cmb_process``. This
-makes for a very natural way to express agentic behavior by simulated processes. The
-stackless Python ``generator`` that SimPy processes are based on cannot do this.
-
-We compile the Cimba code for speed, using gcc v 15.2.1 with options ``-O3 -flto=auto
--fuse-linker-plugin -DNDEBUG -DNASSERT -DLOGINFO`` as appropriate for already well-tested
-code (i.e., everything uncommented in
-`the top level meson.build <https://github.com/ambonvik/cimba/blob/main/meson.build>`_).
-For SimPy, we use Python v 3.14.2. The host system is built around a ASRock TRX40
-Taichi motherboard with an AMD Threadripper 3970x CPU and 128 GB RAM. The OS is Arch
-Linux.
-
-Both programs produce a one-liner output similar to this:
+We compile the Cimba code with profile-guided optimization for maximal speed, like this:
 
 .. code-block:: none
 
-    Average system time 10.000026 (n 100, conf.int. 9.964877 - 10.035176, expected 10.000000)
+    cd cimba
+    mkdir build-pgo
+    meson setup build-pgo --buildtype=release
+    meson configure build-pgo -Dpgo=generate -Denable_docs=false
+    meson compile -C build-pgo              # Build instrumented executables
+    build-pgo/benchmark/MM1_single          # Learning run, will be slow
+    build-pgo/benchmark/MM1_multi           # Learning run, will be slow
+    meson configure build-pgo -Dpgo=use -Denable_docs=false
+    meson compile -C build-pgo              # Build the optimized executables
+    time build-pgo/benchmark/MM1_single     # Actual test run
+    time build-pgo/benchmark/MM1_multi      # Actual test run
 
-However, the Cimba experiment can run its 100 trials in 0.56 seconds, while the SimPy
-version takes 25.5 seconds to do the same thing with all available cores in use. Cimba
-runs this scenario about *45 times faster* than SimPy. Equivalently, the Cimba running
-time is *97.8 % less* than SimPy's for this simple model.
+The first run, using the `-Dpgo-generate` configuration, is a learning pass to collect
+profiler data to use in the second compilation. Here, we only run the two M/M/1
+benchmark executables in the learning pass, so the second compilation will issue
+many warnings that it does not have profiler data for all the other executables.
 
-Cimba processes twice as many simulated events per second *on a single core*
-(approx 32 million events / second) than what SimPy can do if it has all 64 logical cores
-to itself (approx 16 million events / second).
+Note that this build type turns off internal logging and function argument checking,
+so it should *only* be used for already well-tested code. It also turns off ``MXCSR``
+save and restore in context switches. Do not use this build type if you need to set
+individual rounding modes or other floating point control bits per simulated
+process. If in doubt, your model are probably OK with it, but see :ref:`our section on
+numerical reproducibility <welcome_reproducibility>` for more details.
+
+For our case here, a small, thoroughly tested model with no special floating point
+numerics, these restrictions are acceptable and a PGO build is warranted. For
+comparison, we will also show the performance of the default release build type in our
+results. In most cases, a PGO build will be overkill and the performance loss from not
+using it will be moderate.
+
+For the results below, we used gcc v 16.2.1 on Cimba v 3.0.1. SimPy is version
+python-simpy-4.1.2-1 from the Arch Linux package repository AUR
+(https://aur.archlinux.org/packages/python-simpy), executed with Python v 3.14.2.
+
+The host system is built around a ASRock TRX40 Taichi motherboard with an AMD
+Threadripper 3970x CPU and 128 GB RAM. The OS is Arch Linux 7.6.2, freshly updated
+with ``pacman -Syyu`` on Sep 21, 2026.
+
+The numbers are averaged over 10 runs for each model.
 
 .. image:: ../images/Speed_test_AMD_3970x.png
+
+Cimba can run its 128 trials in 0.47 seconds, while the SimPy version takes 33.1 seconds
+to do the same thing with all available cores in use. Cimba runs this scenario
+*70 times faster* than SimPy + multiprocessing. Equivalently, the Cimba running time is
+*98.6 % less* than SimPy's for this simple model.
+
+Cimba also runs 65 times faster than SimPy on a single core. Cimba executes
+nearly three times as many simulated events per second *on a single core* (43.1 M events
+/ second) than what SimPy + multiprocessing can do if it has all 64 logical cores to
+itself (15.5 M events / second).
 
 This speed difference is mostly due to the difference between Cimba's compiled C
 and assembly code vs SimPy's interpreted Python code, where a difference of around this
 magnitude should be expected. There exist other and more powerful Python simulation
 tools, such as `Salabim <https://www.salabim.org/manual/index.html>`_. We have not
-benchmarked Cimba vs Salabim yet, but expect to see similar speed diffences there for the
-same reason.
+benchmarked Cimba vs Salabim yet, but expect to see similar speed differences there for
+the same reason.
 
 Cimba vs Time Warp PDES
 ^^^^^^^^^^^^^^^^^^^^^^^
 
 Looking to the upper side of Cimba's intended usage, there are interesting reference
-points in the literatureon large-scale parallel discrete event simulation (PDES).
+points in the literature on large-scale parallel discrete event simulation (PDES).
 This has been an active research area since around 1980, originally spurred by the limited
 memory capacity of the computers of the day and the resulting need to divide a large
 simulation between several devices. In these frameworks, each simulation run (trial) is
 distributed across many physical cores, each representing some logical subsystem of the
-overall simulation. Events are executed by passing messages between the cores. The
-critical design question is how to ensure a strict time-ordering of events in simulated
-time and guarantee the same result as from a sequential simulation.
+overall simulation. Events on different cores are synchronized by passing messages
+between the cores. The critical design question is how to ensure a strict
+time-ordering of events in simulated time and guarantee the same result as from a
+sequential simulation.
 
 One approach is *optimistic synchronization*, where CPUs are allowed to run ahead, but
 anti-events are sent to initiate rollback if a violation of time sequence is detected.
 This may initiate sequences of cascading rollbacks until causality is re-established.
-The best know algorithm for this is Time Warp, e.g., used in
+The best known algorithm for this is Time Warp, e.g., used in
 `ROSS <https://ross-org.github.io/about.html>`_. Other approaches use *conservative
 synchronization*, not allowing any core to proceed unless the event timestamp is
 guaranteed valid.
@@ -1581,14 +2108,14 @@ cores have reached a clock rate limit. Further performance improvement comes fro
 the number of cores.
 
 Unfortunately, we do not have a massively parallel supercomputer available for direct
-benhmarking against Cimba, but to the nearest order of magnitude: The PC we used for
+benchmarking against Cimba, but to the nearest order of magnitude: The PC we used for
 the SimPy benchmark above has 32 physical cores, running two threads per physical core.
-Cimba runs about 32 M events/second on a single core and about 25 M events/second/core
-on 32 physical cores for a scaling efficiency of 76 %.
+Cimba runs 43.1 M events/second on a single core and 33.9 M events/second/core
+on 32 physical cores for a scaling efficiency of 78.7 %.
 
 If those numbers are anywhere near comparable to Fujimoto's, it means that *Cimba runs
-two orders of magnitude faster than Time Warp PDES measured in events/second/core*. The
-reason is that keeping our entire event queue in "hot" CPU cache memory is orders of
+about two orders of magnitude faster than Time Warp PDES measured in events/second/core*.
+The reason is that keeping our entire event queue in "hot" CPU cache memory is orders of
 magnitude faster than communicating the events across a link between separate devices,
 no matter how fast that link is.
 
@@ -1597,9 +2124,11 @@ distributing the model across many, is no longer valid. The PC referred to above
 128 GB of memory and can easily fit 64 complete trials in parallel, two per physical core,
 even with thousands of active processes in each trial. The remaining use case for Time Warp
 and similar PDES seems to be for extremely large simulations distributed across the nodes of
-`Beowulf clusters <https://en.wikipedia.org/wiki/Beowulf_cluster>`_, and then mostly
-for cases where the problem can be structured as nearly independent sub-systems
-limiting the amount of message passing between the nodes.
+supercomputer clusters, and then mostly for cases where the problem can be structured
+as nearly independent sub-systems limiting the amount of message passing between the nodes.
+
+(This section will be updated when we have been able to devise a benchmark against
+`ROSS <https://ross-org.github.io>`_.)
 
 .. _background_name:
 

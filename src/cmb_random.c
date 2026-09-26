@@ -35,6 +35,10 @@
 #include "cmi_config.h"
 #include "cmi_memutils.h"
 
+/* Just a hardware sanity check */
+static_assert(INT64_MIN == (-INT64_MAX - 1),
+              "Cimba requires two's-complement int64_t");
+
 /*
  * Thread-local pseudo-random generator state, i.e., each thread has its own
  * instance, but all coroutines within the thread share from the same stream
@@ -46,10 +50,14 @@
 
 static CMB_THREAD_LOCAL struct {
     uint64_t a, b, c, d;
-} prng_state = { DUMMY_SEED, DUMMY_SEED, DUMMY_SEED, DUMMY_SEED };
+} prng_state = {.a = DUMMY_SEED, .b = DUMMY_SEED, .c = DUMMY_SEED, .d = DUMMY_SEED};
 
 /* Storage for the seed used in this thread */
 static CMB_THREAD_LOCAL uint64_t initial_seed = DUMMY_SEED;
+
+/* Bit-buffer for cmb_random_flip */
+static CMB_THREAD_LOCAL uint64_t flip_bits = DUMMY_SEED;
+static CMB_THREAD_LOCAL uint8_t flip_bitpos = 0;
 
 /*******************************************************************************
  * Main pseudo-random number generator - 64-bit output, 256-bit state.
@@ -108,11 +116,20 @@ static uint64_t splitmix64(void)
 }
 
 /*
- * Initializer for pseudo-random number state.
- * Bootstraps one 64-bit seed to 256 bits of state using cmb_random_splitmix()
+ * Initializer for sfc64 pseudo-random number state.
+ * Bootstraps one 64-bit seed to 256 bits of state using cmb_random_splitmix().
+ *
  * Intentionally randomizes the counter (.d) to start at a random place in the
- * cycle. Pulls a few samples from the generator to get rid of any initial
- * transient.
+ * cycle. This starting point is one that is also reachable starting from
+ * zero, just with an offset. That implies that all published sfc64 results in
+ * PractRand and BigCrush tests carry over unchanged, and the cycle length stays
+ * the same "at least 2^64". However, if each trial consumes L sfc64 samples,
+ * where L << 2^64, this reduces the probability of getting overlapping sample
+ * sequences between trials or threads by about 2^64 / L compared to starting
+ * all counters from zero.
+ *
+ * Finally pulls a few samples from the generator to get rid of any initial
+ * transient, and pre-loads the cmb_random_flip() buffer.
  */
 void cmb_random_initialize(const uint64_t seed)
 {
@@ -126,6 +143,9 @@ void cmb_random_initialize(const uint64_t seed)
     for (int i = 0; i < 20; i++) {
         (void)cmb_random_sfc64();
     }
+
+    flip_bits = cmb_random_sfc64();
+    flip_bitpos = UINT64_C(64);
 }
 
 /*
@@ -139,10 +159,13 @@ void cmb_random_terminate(void) {
     prng_state.d = DUMMY_SEED;
 
     splitmix_state = DUMMY_SEED;
+
+    flip_bits = DUMMY_SEED;
+    flip_bitpos = 0u;
 }
 
 /*
- * Return The 64-bit seed that was used to initialize the generator.
+ * Return the 64-bit seed that was used to initialize the generator.
  * If it returns ´0x0000DEAD5EED0000`, the generator was never initialized.
  */
 uint64_t cmb_random_curseed(void)
@@ -219,7 +242,7 @@ static double zig_convert_y(const double *dpy, const int64_t iy)
 static int64_t zig_sample63(void)
 {
     const uint64_t bits = cmb_random_sfc64();
-    const int64_t r = (*(int64_t *)&bits) & INT64_MAX;
+    const int64_t r = (int64_t)(bits & INT64_MAX);
 
     return r;
 }
@@ -242,11 +265,11 @@ double cmi_random_exp_not_hot(int64_t i_cand_x)
         /* We are in one of the leftover pieces, alias sample for which one. */
         int64_t i_cand_y = zig_sample63();
         uint8_t jdx = i_cand_y & 0xff;
-        jdx = (i_cand_x >= exp_zig_i_prob[jdx]) ? exp_zig_alias[jdx] : jdx;
+        const int64_t i_coin = zig_sample63();
+        jdx = (i_coin >= exp_zig_i_prob[jdx]) ? exp_zig_alias[jdx] : jdx;
         if (jdx > 0) {
             /* Not in tail, rejection sample from within this right triangular
-             * overhang only.
-             */
+             * overhang only.       */
             for (;;) {
                 /* First time through we still have 56 bits of unused randomness
                  * in i_cand_x, now re-interpreted as an X value along the base
@@ -384,7 +407,8 @@ double cmi_random_nor_not_hot(int64_t i_cand_x)
     /* Alias sample to find out which overhang area */
     int64_t i_cand_y = zig_sample63();
     uint8_t jdx = i_cand_y & 0xff;
-    jdx = (i_cand_x >= nor_zig_i_prob[jdx]) ? nor_zig_alias[jdx] : jdx;
+    const int64_t i_coin = zig_sample63();
+    jdx = (i_coin >= nor_zig_i_prob[jdx]) ? nor_zig_alias[jdx] : jdx;
     if (jdx > nor_zig_inflection) {
         /* Convex overhang */
         for (;;) {
@@ -586,15 +610,12 @@ double cmb_random_PERT_mod(const double min,
  */
 int cmb_random_flip(void)
 {
-    static CMB_THREAD_LOCAL uint64_t bits;
-    static CMB_THREAD_LOCAL uint8_t bitpos = 0;
-
-    if (bitpos == 0) {
-        bits = cmb_random_sfc64();
-        bitpos = 64;
+    if (flip_bitpos == 0) {
+        flip_bits = cmb_random_sfc64();
+        flip_bitpos = 64;
     }
 
-    return ((bits >> --bitpos) & 1) ? 1 : 0;
+    return ((flip_bits >> --flip_bitpos) & 1) ? 1 : 0;
 }
 
 /*******************************************************************************
@@ -774,7 +795,7 @@ static uint64_t cmi_random_binomial_btrd(const uint64_t n, const double p)
     static CMB_THREAD_LOCAL double alpha = 0.0;
     static CMB_THREAD_LOCAL double r = 0.0;
     static CMB_THREAD_LOCAL double nr = 0.0;
-    static CMB_THREAD_LOCAL double m = 0.0;
+    static CMB_THREAD_LOCAL double dm = 0.0;
     static CMB_THREAD_LOCAL int64_t im = 0;
 
     if ((n != n_prev) || (p != p_prev)) {
@@ -782,8 +803,8 @@ static uint64_t cmi_random_binomial_btrd(const uint64_t n, const double p)
         n_prev = n;
         p_prev = p;
         dn = (double)n;
-        m = floor((dn + 1.0) * p);
-        im = (int64_t)m;
+        dm = floor((dn + 1.0) * p);
+        im = (int64_t)dm;
         const double q = 1.0 - p;
         r = p / q;
         nr = (dn + 1.0) * r;
@@ -813,7 +834,7 @@ static uint64_t cmi_random_binomial_btrd(const uint64_t n, const double p)
 
         /* 2. Generate candidate pair (u, v) */
         if (v >= vr) {
-            /* Range (0.0, 1.0) */
+            /* Range (-0.5, 0.5) */
             u = (1.0 - cmb_random()) - 0.5;
         }
         else {
@@ -824,15 +845,21 @@ static uint64_t cmi_random_binomial_btrd(const uint64_t n, const double p)
 
         /* 3.0 Can it be rejected? */
         const double us = 0.5 - fabs(u);
-        const double g = ((2.0 * a) / us) + b;
-        const int64_t k = (int64_t)floor(g * u + c);
-        if ((k < 0) || (k > dn)) {
-            /* Reject, try again */
+        if (us <= 0.0) {
+            /* Numerically intractable, will be rejected anyway */
             continue;
         }
 
-        v = v * alpha /(a / (us * us) + b);
-        const double km = fabs(k - m);
+        const double g = ((2.0 * a) / us) + b;
+        const double dk = floor(g * u + c);
+        if (dk < 0.0 || dk > dn) {
+            /* Reject */
+            continue;
+        }
+
+        const int64_t k = (int64_t)dk;
+        v = v * alpha / (a / (us * us) + b);
+        const double km = fabs(dk - dm);
 
         if (km <= 15.0) {
             /* 3.1 Evaluate f(k) iteratively */
@@ -841,14 +868,14 @@ static uint64_t cmi_random_binomial_btrd(const uint64_t n, const double p)
                 int64_t i = im;
                 while (i != k) {
                     i++;
-                    f *= nr/i - r;
+                    f *= nr / i - r;
                 }
             }
             else if (im > k) {
                 int64_t i = k;
                 while (i != im) {
                     i++;
-                    v *= nr/i - r;
+                    v *= nr / i - r;
                 }
             }
 
@@ -862,19 +889,21 @@ static uint64_t cmi_random_binomial_btrd(const uint64_t n, const double p)
 
         /* 3.2 Squeeze accept or reject */
         v = log(v);
-        const double rho = (km/npq) * (((km/3.0 + 0.625) * km + 1.0/6.0) / npq + 0.5);
-        const double t = -km * km /(2.0 * npq);
+        const double rho = (km / npq) * (((km / 3.0 + 0.625) * km + 1.0 / 6.0)
+                            / npq + 0.5);
+        const double t = -km * km / (2.0 * npq);
         if (v < t - rho) {
             return k;
         }
+
         if (v > t + rho) {
             continue;
         }
 
         /* 3.3 Setup for final check */
-        const double nm = n - m + 1.0;
-        const double h = (m + 0.5) * log((m + 1.0) / (r * nm))
-                    + stirling_tail(m) + stirling_tail(dn - m);
+        const double nm = n - dm + 1.0;
+        const double h = (dm + 0.5) * log((dm + 1.0) / (r * nm))
+                    + stirling_tail(dm) + stirling_tail(dn - dm);
 
         /* 3.4 Final acceptance-rejection test */
         const double nk = dn - k + 1.0;
@@ -1146,7 +1175,7 @@ uint64_t cmb_random_negative_binomial(const uint64_t m, const double p)
  */
 uint64_t cmb_random_discrete_uniform (const uint64_t s)
 {
-    cmb_assert_debug(s > 0u);
+    cmb_assert_release(s > 0u);
 
     uint64_t x = cmb_random_sfc64();
     __uint128_t m = (__uint128_t) x * (__uint128_t) s;
@@ -1163,12 +1192,20 @@ uint64_t cmb_random_discrete_uniform (const uint64_t s)
     return m >> 64u;
 }
 
-static const double sum_tolerance = 1.0e-3;
-static bool sums_to_one(const uint64_t n, const double p[n])
+static const double sum_tolerance = 1.0e-12;
+static bool valid_probability_vector(const uint64_t n, const double pa[n])
 {
+    cmb_assert_debug(n > 0u);
+    cmb_assert_debug(pa != NULL);
+
     double sum = 0.0;
     for (uint64_t ui = 0u; ui < n; ui++) {
-        sum += p[ui];
+        const double p = pa[ui];
+        if (!isfinite(p) || p < 0.0 || p > 1.0) {
+            return false;
+        }
+
+        sum += p;
     }
 
     return (fabs(sum - 1.0) <= sum_tolerance) ? true : false;
@@ -1182,7 +1219,7 @@ uint64_t cmb_random_discrete_nonuniform(const uint64_t n, const double *pa)
 {
     cmb_assert_release(n > 0);
     cmb_assert_release(pa != NULL);
-    cmb_assert_release(sums_to_one(n, pa));
+    cmb_assert_release(valid_probability_vector(n, pa));
 
     const double x = cmb_random();
 
@@ -1228,7 +1265,8 @@ static inline uint64_t alias_secure(const double p)
 struct cmb_random_alias *cmb_random_alias_create(const uint64_t n,
                                                  const double *pa) {
     cmb_assert_release(n > 0u);
-    cmb_assert_release(sums_to_one(n, pa));
+    cmb_assert_release(pa != NULL);
+    cmb_assert_release(valid_probability_vector(n, pa));
 
     struct cmb_random_alias *ap = NULL;
     double *work = cmi_calloc(n, sizeof(double));
@@ -1236,6 +1274,7 @@ struct cmb_random_alias *cmb_random_alias_create(const uint64_t n,
     for (uint64_t ai = 0; ai < n; ai++) {
         psum += pa[ai];
     }
+
     cmb_assert_debug(fabs(psum - 1.0) <= sum_tolerance);
 
     uint64_t *small = cmi_calloc(n, sizeof(uint64_t));

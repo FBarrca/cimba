@@ -837,7 +837,7 @@ the viewpoint, parallelizing a discrete event simulation is either terribly
 hard or trivially simple. The *hard* way to do it is to try to parallelize a
 single simulation run. This is difficult and inefficient, since the outcome of each event
 may influence all future events in complex and model-dependent ways. The discrete event
-simulation algorthm itself is heavily serializing.
+simulation algorithm itself is heavily serializing.
 
 The *easy* way is to realize that we rarely do a *single* simulation run. We want to
 run *many* to generate statistically significant answers to questions and/or to test
@@ -935,7 +935,7 @@ We can then run the experiment:
     printf("Executing experiment\n");
     cimba_run(experiment, n_trials, sizeof(*experiment), run_MM1_trial);
 
-The first argument to ``cimba_run()``is the experiment array, the last argument the
+The first argument to ``cimba_run()`` is the experiment array, the last argument the
 simulation driver function we have developed earlier. It will take a pointer to a trial as
 its argument, but the internals of :c:func:`cimba_run()` cannot know the
 detailed structure of your ``struct trial``, so it will be passed as a ``void *``.
@@ -1177,12 +1177,27 @@ Each trial can now use its pre-assigned seed:
 
         cmb_random_initialize(trl->seed_used);
 
+Moreover, if we look *very* carefully at the graph from the previous simulation, there
+may be a slight downward bias in the queue length for the highest utilization. This
+would not be unexpected, since the initial transient decays much more slowly at high
+utilization than at low, and no single fixed warmup period would fit all possible
+utilization levels. We know from the diffusion equations for the queuing system that
+the relaxation time is proportional to :math:`1 / (1 - \rho)^{2}`, i.e., as the square
+of the average queue length.
+
+To allow for this, we redefine our warmup and duration parameters as *multiples of the
+relaxation time calculated from the given service and arrival times* instead of as
+absolute values. This increases the warmup and data collection times by a factor of 100
+for :math:`\rho = 0.9` and 400 for :math:`\rho = 0.95`. We set the default warmup time
+to 1000 relaxation times and the default data collection duration to 10000 relaxation
+times.
+
 We can then type, e.g.:
 
 .. code-block:: none
 
-    [ambonvik@Threadripper tutorial]$ ./tut_1_7 -s 0x123456789abcd0 -d 1e7 -n 15 -w 1e6
-    Cimba version 3.0.0-RC1
+    [ambonvik@Threadripper tutorial]$ ./tut_1_7 -s 0x123456789abcd0 -n 15
+    Cimba version 3.0.0-RC3
     Setting up experiment
     Master seed: 0x123456789abcd0
     Executing experiment
@@ -1219,7 +1234,7 @@ We can then type, e.g.:
 The chart looks similar, but since we used longer run times and more replications, our
 confidence intervals are tighter:
 
-    .. image:: ../images/tut_1_7.png
+.. image:: ../images/tut_1_7.png
 
 This concludes our first tutorial. We have followed the development steps from a
 first minimal model with basic process interactions to a complete parallelized
@@ -1741,7 +1756,7 @@ adventures. Since the active entities in Cimba are the instances of
 :c:struct:`cmb_process`, this requires each customer to be represented as a process
 or derived class. We will make our customers a derived class from the
 :c:struct:`cmb_process`, inheriting its properties and methods, and adding some more
-specifics. By doing so, we will demonstate both object-oriented inheritance and that
+specifics. By doing so, we will demonstrate both object-oriented inheritance and that
 Cimba processes themselves can spawn other processes.
 
 The use case is to model an amusement park with guests wanting to use various
@@ -2959,9 +2974,8 @@ The departure process is reasonably straightforward, capturing the exit value fr
 the ship process and then recycling the entire ship. A :c:struct:`cmb_condition` is used
 to know that one or more ships have departed, triggering the departure process
 to do something. This actually does exactly the same as using the
-:c:struct:`cmb_objectqueue` in the previous
-example, but demonstrates a different way of doing it (effectively exposing the internal
-workings of a :c:struct:`cmb_objectqueue`).
+:c:struct:`cmb_objectqueue` in the previous example, but demonstrates a different way
+of doing it (effectively exposing the internal workings of a :c:struct:`cmb_objectqueue`).
 
 .. code-block:: c
 
@@ -3273,14 +3287,14 @@ of trials, consisting of parameter variations and replications.
     that typical simulation frameworks are stand-alone tools that run a single trial, not
     well integrated with a programming language. As we have seen, Cimba puts the
     experimental design front and center. When structuring the experiment array, the user
-    will *have* to think through the design. What parameters, how many levels, what values, how many
-    replications for each? Implementing it is then just a simple piece of code, and
-    unpåacking the results its mirror image.
+    will *have* to think through the design. What parameters, how many levels, what
+    values, how many replications for each? Implementing it is then just a simple
+    piece of code, and unpacking the results its mirror image.
 
-We compile and run, and this chart appears, showing our 60
-parameter combinations, the average time in the system for small (blue) and large ships
-(red) under each set of parameters, and tight 95 % confidence intervals based
-on our 10 replications of each parameter combination:
+We compile and run, and this chart appears, showing our 60  arameter combinations, the
+average time in the system for small (blue) and large ships (red) under each set of
+parameters, and tight 95 % confidence intervals based on our 10 replications of each
+parameter combination:
 
 .. image:: ../images/tut_4_2.png
 
@@ -3310,7 +3324,7 @@ In the first case, rejection sampling or similar, one would probably call
 would rather call ``cmb_logger_error()`` with its ``printf``-style formatted message.
 It will call ``cimba_trial_abandon()`` internally after printing the log entry.
 
-Either way, Cimba will call the necessary destructors on all abandoned ``cmb_ ``objects
+Either way, Cimba will call the necessary destructors on all abandoned ``cmb_`` objects
 in the trial. Any memory that is directly allocated in user code is its own
 responsibility to free. Cimba also provides a callback hook to register a
 clanup-handler for this, avoiding the need to add code for memory cleanup just before
@@ -3795,10 +3809,10 @@ We can then create the experiment in the usual way:
     }
 
 Note that we use ``cmb_random_fmix64()`` to generate unique-but-deterministic seeds for
-each trial. We could simply call ``cmb_random_hwseed()`` to obtain unique seeds from
-CPU entropy, but it would not be reproducible. Instead, ``cmb_random_fmix64()`` hashes
-the master seed (from CPU entropy or command line argument) with a per-trial value
-to set the seed to use per trial.
+each trial. We could simply call ``cmb_random_hwseed()`` to obtain independently
+generated high-entropy seeds from hardware, but it would not be reproducible. Instead,
+``cmb_random_fmix64()`` hashes the master seed (from CPU entropy or command line
+argument) with a per-trial value to set the seed to use per trial.
 
 Only one thing remains: The worker threads need to know what CUDA streams to use. Cimba
 provides this critical connection with the function ``cimba_thread_hooks_set()``. It
@@ -3991,5 +4005,5 @@ parallel, efficiently utilizing all the compute power available on a recent
 multi-core, multi-GPU desktop PC for discrete event simulation.
 
 For more detailed information about the various features of Cimba, please see
-the in-depth :ref:`the background section <background>` and
+the in-depth :ref:`background section <background>` and
 the detailed :doc:`API reference pages </api/library_root>`.

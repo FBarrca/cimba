@@ -12,26 +12,6 @@ a similar combination of powerful features and performance.
 It is currently implemented for both Linux and Windows on the x86-64 architecture, 
 with other platforms planned.
 
-#### Important status note for Release Candidate 1 (Aug 2026): 
-From 3.0.0 RC1, the Cimba object lifecycle Create - Initialize - Terminate - Destroy is
-enforced more strictly than in the Beta versions. This means that all objects in the 
-`cmb_ `namespace _must_ be initialized before they can be used, and that they _must_ be 
-terminated before going out of scope. This also goes for objects with automatic 
-storage duration, i.e., local objects declared on the stack. Also, every 
-`cmb_X_initialize()` for some class `X` _must_ be matched by a `cmb_X_terminate()`, and 
-every `cmb_X_create()` by a `cmb_X_destroy()`. 
-
-Previously, omitting `_terminate` or `_destroy` would be a silent memory leak. This 
-will naturally happen when a trial is abandoned midway by calling `cmb_logger_error()`. 
-Over a long experiment, this could accumulate to cause an out-of-memory crash. Cimba RC1 
-will now pass a Leak Sanitizer (LSan) test also with abandoned trials. To provide this 
-reliable memory leak detection and memory recovery from abandoned trials, tightened 
-enforcement of (already documented) lifecycle management was needed to avoid 
-corrupting the internal state. It may break existing models that appeared to work correctly 
-until now (including some of our own tutorials). If so, please check for missing 
-steps in the object lifecycles, with a missing `_initialize`or `_terminate` for a 
-`cmb_` object declared as a local variable on the stack as the prime suspect.
-
 ### Why should I use it?
 It is powerful, fast, reliable, and free.
 
@@ -76,30 +56,37 @@ It is powerful, fast, reliable, and free.
   variations.
 
   * A relevant benchmark is the Python simulation package SimPy. Cimba models run 
-    30-60 times faster than SimPy equivalents. The chart below shows the
-    number of simulated events processed per second of wall clock time on a simple M/M/1
-    queue implemented in SimPy and Cimba. _Cimba runs more than twice as fast (41.8M 
-    events/sec) on a single CPU core as SimPy does when using all 64 logical cores 
-  * (16M events/sec combined)._
+    much faster than SimPy equivalents. The chart below shows the number of simulated 
+    events processed per second of wall clock time on a simple M/M/1 queue 
+    implemented in SimPy and Cimba. Cimba is shown both with a default release build 
+    and a profiler-guided optimizer (PGO) maximum speed build.
 
     ![Speed_test_AMD_3970x.png](images/Speed_test_AMD_3970x.png)
+   
+    _Cimba runs this benchmark 70 times faster than SimPy._ In fact, the throughput for 
+    Cimba is nearly three times higher (43.1 M events/sec) _on a single CPU core_ than 
+    SimPy using all 64 logical cores (15.5 M events/sec combined).
 
-    In this benchmark, Cimba reduces the run time by 98 % compared to the
-    same model in SimPy using all CPU cores. This translates into doing your simulation
-    experiments in seconds instead of minutes, or in minutes instead of hours. The reason for
-    the performance advantage is simply that compiled C code and hand-rolled assembly will
-    always run much faster than Python code that needs to be interpreted at runtime.
+    Running multithreaded, Cimba reduces the run time by 98.6 % compared to the
+    same model in SimPy. This translates into doing your simulation experiments in 
+    seconds instead of minutes, or in minutes instead of hours. The main reason for 
+    the performance advantage is simply that compiled C code and hand-rolled assembly 
+    will always run much faster than Python code that needs to be interpreted at 
+    runtime. See [the documentation](https://cimba.readthedocs.io/en/latest/background.html#benchmarking-cimba-performance) 
+    for technical details on this benchmark. 
 
   * Another performance reference point is found in the literature on large-scale
     parallel discrete event simulation (PDES). In these models, each simulation run is
     distributed across many physical cores.
     [Fujimoto (2015)](https://informs-sim.org/wsc15papers/004.pdf) states that performance
-    for the PDES algorithms has leveled out at around 250 K events/second/core
-    on massively parallel supercomputers due to inherent clock speed limitations on each core. Further 
-    performance improvement in recent years only comes from increasing the number of cores. 
+    for the PDES algorithms has leveled out at around 250 k events/second/core
+    on massively parallel supercomputers due to the inherent clock speed limitations on 
+    each core, and that further performance improvement in recent years comes from 
+    increasing the number of cores. 
+  
     *Cimba runs two orders of magnitude faster than this on a per-core basis.* The CPU used 
     in the benchmark above has 32 _physical_ cores, running two threads per physical core.
-    Cimba runs about 42 M events/sec on a single core and about 28 M events/second/core on 32
+    Cimba executed 42 M events/sec on a single core and 34 M events/second/core on 32
     physical cores. The reason is that keeping our entire event queue in "hot" CPU cache memory
     is orders of magnitude faster than communicating the events across a link between separate devices.
 
@@ -115,21 +102,25 @@ It is powerful, fast, reliable, and free.
   * The code is written with liberal use of assertions 
     to enforce preconditions, invariants, and postconditions in each function. The 
     assertions act as self-enforcing documentation on expected inputs to and outputs from 
-    the Cimba functions. About 13 % of all code lines are assertions, a very high density.
+    the Cimba functions. 
   
-  * There are unit tests for each module. Running the unit test battery in debug mode (all
-    assertions active) verifies the correct operation in great detail. You can do that 
-    by the one-liner ``meson test -C build`` from the terminal command line. 
+  * There are unit tests for each module, including comprehensive statistical 
+    goodness-of-fit tests for the pseudo-random number distributions. Running the unit 
+    test battery in a debug build (all assertions active) verifies the correct 
+    operation in great detail. You can do that by the one-liner ``meson test -C 
+    build`` from the terminal command line. 
   
-  * Cimba is compatible with sanitizers for undefined behavior (UBSan), memory address safety 
-    (ASan), thread safety (TSan), and memory leaks (LeakSan). These sanitizers are executed automatically as 
-    GitHub runners on every push to the repository as public verification of our reliability 
-    claim, right here: https://github.com/ambonvik/cimba/actions
+  * Cimba is compatible with sanitizers for undefined behavior (UBSan), memory 
+    address safety (ASan), thread safety (TSan), and memory leaks (LeakSan). These 
+    sanitizers are executed  utomatically as GitHub runners on every push to the 
+    repository as public verification of our reliability claim, right 
+    here: https://github.com/ambonvik/cimba/actions
 
-  * The code is routinely reviewed by the latest and greatest AI tools as they become 
-    available, most recently Anthropic Claude Fable 5 (July 2026) and Claude Opus 5
-    (August 2026). Any bugs identified by these reviews are fixed and a follow-up review 
-    done. The latest reviews can be found here: https://github.com/ambonvik/cimba/tree/main/code_reviews
+  * The code is routinely reviewed adversially by the latest and greatest AI tools as 
+    they become available, most recently Anthropic Claude Fable 5 (August 2026) and 
+    OpenAI GPT 5.6 Sol (September 2026). Any bugs identified by these reviews are 
+    fixed, and a follow-up verification review is done. The reviews can be found here:
+    https://github.com/ambonvik/cimba/tree/main/code_reviews
 
 * *Free*: Cimba should fit well into the budget of most research groups.
 
@@ -149,42 +140,35 @@ It is a general-purpose discrete event simulation library, in the spirit of a
 
 If you look under the hood, you will also find additional reusable internal components.
 Cimba contains stackful coroutines doing their own thing on thread-safe cactus stacks. 
-There are fast memory pool allocators for generic small objects and hash-heaps combining 
-a binary heap and an open addressing hash map using Fibonacci hashing. Although not part 
-of the public Cimba API, these components can also be used in your model if needed.
+There are fast memory pool allocators for generic small objects, intrusive linked 
+lists, and hash-heaps combining a binary heap and an open addressing hash map using 
+Fibonacci hashing. Although not part of the public Cimba API, these components can also
+be used in your model if needed, but be aware that anything in the `cmi_` namespace may 
+change in future (minor) versions.
 
 ### What does the code look like?
-It is C code. As an illustration, this is the entire code for [our multithreaded M/M/1 
-benchmark](https://github.com/ambonvik/cimba/tree/main/benchmark) mentioned above:
+It is C code. As an illustration, this is the entire program for a single-threaded M/M/1 
+queue simulation, combining active processes with a few discrete control events 
+happening at specific times.
 
 ```
-    #include <inttypes.h>
-    #include <stdio.h>
-    #include <stdint.h>
-    
     #include <cimba.h>
+    #include <stdio.h>
     
-    #include "cmi_mempool.h"
-    
-    #define NUM_OBJECTS 1000000u
-    #define ARRIVAL_RATE 0.9
-    #define SERVICE_RATE 1.0
-    
-    CMB_THREAD_LOCAL struct cmi_mempool objectpool = CMI_MEMPOOL_STATIC_INIT(sizeof(void *), 512u);
+    #define USERFLAG1 0x00000001
     
     struct simulation {
-        struct cmb_process *arrival;
-        struct cmb_process *service;
-        struct cmb_objectqueue *queue;
+        struct cmb_process *arr;
+        struct cmb_buffer *que;
+        struct cmb_process *srv;
     };
     
     struct trial {
-        double arr_mean;
-        double srv_mean;
-        
-        uint64_t obj_cnt;
-        double sum_wait;
-        double avg_wait;
+        double arr_rate;
+        double srv_rate;
+        double warmup_s;
+        double duration_h;
+        double avg_queue_length;
     };
     
     struct context {
@@ -192,126 +176,200 @@ benchmark](https://github.com/ambonvik/cimba/tree/main/benchmark) mentioned abov
         struct trial *trl;
     };
     
-    void *arrivalfunc(struct cmb_process *me, void *vctx)
+    void end_sim_evnt(void *subject, void *object)
     {
-        cmb_unused(me);
-        const struct context *ctx = vctx;
-        
-        struct cmb_objectqueue *qp = ctx->sim->queue;
-        const double mean_hld = ctx->trl->arr_mean;
-        
-        for (uint64_t ui = 0; ui < NUM_OBJECTS; ui++) {
-            const double t_hld = cmb_random_exponential(mean_hld);
-            cmb_process_hold(t_hld);
-            
-            void *object = cmi_mempool_alloc(&objectpool);
-            double *dblp = object;
-            *dblp = cmb_time();
-            cmb_objectqueue_put(qp, object);
-        }
+        cmb_unused(subject);
+        cmb_assert_debug(object != NULL);
     
-        return NULL;
+        const struct context *ctx = object;
+        const struct simulation *sim = ctx->sim;
+        cmb_logger_user(stdout, USERFLAG1, "--- Game Over ---");
+        cmb_process_stop(sim->arr, NULL);
+        cmb_process_stop(sim->srv, NULL);
     }
     
-    void *servicefunc(struct cmb_process *me, void *vctx)
+    static void start_rec_evnt(void *subject, void *object)
+    {
+        cmb_unused(subject);
+        cmb_assert_debug(object != NULL);
+    
+        const struct context *ctx = object;
+        const struct simulation *sim = ctx->sim;
+        cmb_buffer_recording_start(sim->que);
+    }
+    
+    static void stop_rec_evnt(void *subject, void *object)
+    {
+        cmb_unused(subject);
+        cmb_assert_debug(object != NULL);
+    
+        const struct context *ctx = object;
+        const struct simulation *sim = ctx->sim;
+        cmb_buffer_recording_stop(sim->que);
+    }
+    
+    void *arrival_proc(struct cmb_process *me, void *vctx)
     {
         cmb_unused(me);
+        cmb_assert_debug(vctx != NULL);
+    
         const struct context *ctx = vctx;
-        
-        struct cmb_objectqueue *qp = ctx->sim->queue;
-        const double mean_srv = ctx->trl->srv_mean;
-        uint64_t *cnt = &(ctx->trl->obj_cnt);
-        double *sum = &(ctx->trl->sum_wait);
-        
+        const struct simulation *sim = ctx->sim;
+        const struct trial *trl = ctx->trl;
+        struct cmb_buffer *que = sim->que;
+    
+        cmb_assert_debug(trl->arr_rate > 0.0);
+        const double t_ia_mean = 1.0 / trl->arr_rate;
+    
         while (true) {
-            void *object = NULL;
-            cmb_objectqueue_get(qp, &object);
-            
-            const double *dblp = object;
-            const double t_srv = cmb_random_exponential(mean_srv);
-            cmb_process_hold(t_srv);
-            
-            *sum += cmb_time() - *dblp;
-            *cnt += 1u;
-            cmi_mempool_free(&objectpool, object);
+            const double t_ia = cmb_random_exponential(t_ia_mean);
+            cmb_logger_user(stdout, USERFLAG1, "Holds for %f time units", t_ia);
+            cmb_process_hold(t_ia);
+            uint64_t n = 1;
+            cmb_logger_user(stdout, USERFLAG1, "Puts one into the queue");
+            cmb_buffer_put(que, &n);
         }
     }
     
-    void run_trial(void *vtrl)
+    void *service_proc(struct cmb_process *me, void *vctx)
     {
+        cmb_unused(me);
+        cmb_assert_debug(vctx != NULL);
+    
+        const struct context *ctx = vctx;
+        const struct simulation *sim = ctx->sim;
+        const struct trial *trl = ctx->trl;
+        struct cmb_buffer *que = sim->que;
+    
+        cmb_assert_debug(trl->srv_rate > 0.0);
+        const double t_srv_mean = 1.0 / trl->srv_rate;
+    
+        while (true) {
+            uint64_t m = 1;
+            cmb_logger_user(stdout, USERFLAG1, "Gets one from the queue");
+            cmb_buffer_get(que, &m);
+            const double t_srv = cmb_random_exponential(t_srv_mean);
+            cmb_logger_user(stdout, USERFLAG1, "Got one, services it for %f time units", t_srv);
+            cmb_process_hold(t_srv);
+        }
+    }
+    
+    void run_MM1_trial(void *vtrl)
+    {
+        cmb_assert_debug(vtrl != NULL);
         struct trial *trl = vtrl;
     
-        cmb_logger_flags_off(CMB_LOGGER_INFO);
-        cmb_random_initialize(cmb_random_hwseed());
+        struct context ctx = {};
+        struct simulation sim = {};
+        ctx.sim = &sim;
+        ctx.trl = trl;
+    
+        const uint64_t seed = cmb_random_hwseed();
+        cmb_random_initialize(seed);
+    
+        cmb_logger_flags_off(CMB_LOGGER_INFO | USERFLAG1);
+    
         cmb_event_queue_initialize(0.0);
-        
-        struct context *ctx = malloc(sizeof(*ctx));
-        ctx->trl = trl;
-        struct simulation *sim = malloc(sizeof(*sim));
-        ctx->sim = sim;
     
-        sim->queue = cmb_objectqueue_create();
-        cmb_objectqueue_initialize(sim->queue, "Queue", CMB_UNLIMITED);
+        ctx.sim->que = cmb_buffer_create();
+        cmb_buffer_initialize(ctx.sim->que, "Queue", CMB_UNLIMITED);
     
-        sim->arrival = cmb_process_create();
-        cmb_process_initialize(sim->arrival, "Arrival", arrivalfunc, ctx, 0);
-        cmb_process_start(sim->arrival);
-        
-        sim->service = cmb_process_create();
-        cmb_process_initialize(sim->service, "Service", servicefunc, ctx, 0);
-        cmb_process_start(sim->service);
+        ctx.sim->arr = cmb_process_create();
+        cmb_process_initialize(ctx.sim->arr, "Arrival", arrival_proc, &ctx, 0);
+        cmb_process_start(ctx.sim->arr);
+    
+        ctx.sim->srv = cmb_process_create();
+        cmb_process_initialize(ctx.sim->srv, "Server", service_proc, &ctx, 0);
+        cmb_process_start(ctx.sim->srv);
+    
+        double t = trl->warmup_s;
+        cmb_event_schedule(start_rec_evnt, NULL, &ctx, t, 0);
+        t += trl->duration_h;
+        cmb_event_schedule(stop_rec_evnt, NULL, &ctx, t, 0);
+        cmb_event_schedule(end_sim_evnt, NULL, &ctx, t, -100);
     
         cmb_event_queue_execute();
     
-        cmb_process_terminate(sim->arrival);
-        cmb_process_destroy(sim->arrival);
+        cmb_buffer_print_report(sim.que, stdout);
         
-        cmb_process_stop(sim->service, NULL);
-        cmb_process_terminate(sim->service);
-        cmb_process_destroy(sim->service);
-        
-        cmb_objectqueue_terminate(sim->queue);
-        cmb_objectqueue_destroy(sim->queue);
+        struct cmb_wtdsummary wtdsum;
+        cmb_wtdsummary_initialize(&wtdsum);
+        const struct cmb_timeseries *ts = cmb_buffer_history(ctx.sim->que);
+        cmb_timeseries_summarize(ts, &wtdsum);
+        ctx.trl->avg_queue_length = cmb_wtdsummary_mean(&wtdsum);
+        cmb_wtdsummary_terminate(&wtdsum);
+    
+        cmb_process_terminate(ctx.sim->srv);
+        cmb_process_destroy(ctx.sim->srv);
+    
+        cmb_process_terminate(ctx.sim->arr);
+        cmb_process_destroy(ctx.sim->arr);
+    
+        cmb_buffer_terminate(ctx.sim->que);
+        cmb_buffer_destroy(ctx.sim->que);
     
         cmb_event_queue_terminate();
         cmb_random_terminate();
-    
-        free(sim);
-        free(ctx);
     }
     
     int main(void)
     {
-        struct trial *trl = malloc(sizeof(*trl));
-        trl->arr_mean = 1.0 / ARRIVAL_RATE;
-        trl->srv_mean = 1.0 / SERVICE_RATE;
-        trl->obj_cnt = 0u;
-        trl->sum_wait = 0.0;
-        
-        run_trial(trl);
+        struct trial trl = {};
+        trl.arr_rate = 0.75;
+        trl.srv_rate = 1.0;
+        trl.warmup_s = 1000.0;
+        trl.duration_h = 1e6;
     
-        printf("Average system time %f (expected %f)\n",
-                trl->sum_wait / (double)trl->obj_cnt,
-                1.0 / (SERVICE_RATE - ARRIVAL_RATE));
+        run_MM1_trial(&trl);
     
-        free(trl);
+        printf("Average queue length %f\n", trl.avg_queue_length);
     
         return 0;
     }
 
 ```
+It will produce this output:
+```
+    Buffer levels for Queue
+    Count   	Mean    	StdDev  	Variance	Skewness	Excess kurtosis
+    1.313e+06	   2.275	   3.286	   10.80	   2.226	   6.687
+    --------------------------------------------------------------------------------
+    ( -Infinity,      0.000)   |
+    [     0.000,      2.000)   |##################################################
+    [     2.000,      4.000)   |###############=
+    [     4.000,      6.000)   |#########-
+    [     6.000,      8.000)   |#####-
+    [     8.000,      10.00)   |##=
+    [     10.00,      12.00)   |#=
+    [     12.00,      14.00)   |=
+    [     14.00,      16.00)   |=
+    [     16.00,      18.00)   |-
+    [     18.00,      20.00)   |-
+    [     20.00,      22.00)   |-
+    [     22.00,      24.00)   |-
+    [     24.00,      26.00)   |-
+    [     26.00,      28.00)   |-
+    [     28.00,      30.00)   |-
+    [     30.00,      32.00)   |-
+    [     32.00,      34.00)   |-
+    [     34.00,      36.00)   |-
+    [     36.00,      38.00)   |-
+    [     38.00,   Infinity)   |
+    --------------------------------------------------------------------------------
+    Average queue length 2.275343
+```
+
 Note that we have intentionally left out comments in the code above, hopefully 
-demonstrating that it is fairly self-explanatory. We have also used one "internal"
-`cmi_` feature, the memory pool for fast allocation of the queue objects. See
+demonstrating that it is fairly self-explanatory. See
 [our tutorial](https://cimba.readthedocs.io/en/latest/tutorial.html) at ReadTheDocs for more usage examples with explanations.
 
 ### So, what can I use all that speed for?
-As shown above, it is some 45 times faster than SimPy in a relevant benchmark. It means 
+As shown above, it is some 70 times faster than SimPy in a relevant benchmark. It means 
 getting your results almost immediately rather than after a "go brew a pot of coffee" 
 delay breaking your line of thought.
 
 If you can run, say, 10 replications with SimPy within a certain budget for time and 
-computing resources, you can run 450 with Cimba. That will tighten the confidence 
+computing resources, you can run 700 with Cimba. That will tighten the confidence 
 intervals in your results by a factor of about 8. The details are in our 
 blog post on the topic, 
 [Speed is (statistical) power](https://ambonvik.github.io/speed-is-power/).
@@ -333,22 +391,21 @@ Or, for a more "real" example, see
 [our tutorial 5](https://cimba.readthedocs.io/en/latest/tutorial.html#adding-cuda-gpu-power-for-simulation-physics).
 Using the same 64-core Threadripper and dual RTX 3090 GPUs, it runs 300 trials of an AWACS
 scenario with detailed three-dimensional
-physics in 78 seconds. Each trial is a six-hour simulation of a thousand target
-processes (coroutines) and one sensor process (coroutine) on a 1000 x 1000 nm
-synthetic terrain with one arcsecond resolution. The sensor process models a scanning S-band 
-surveillance radar including 
+physics in 73 seconds. Each trial is a six-hour simulation of a thousand target
+processes (coroutines) and one sensor process (coroutine) on a 1000 x 1000 nautical mile
+synthetic terrain with one arcsecond resolution (approximately 30 meters). The sensor 
+process models a scanning S-band surveillance radar including 
 line-of-sight geometry, terrain masking, constant-gamma clutter with CA-CFAR detection, 
-and specular multipath. The model uses radar dwell itervals (time steps) of 0.04 seconds.
+and specular multipath. The model uses radar dwell intervals (time steps) of 0.04 seconds.
 
 The screenshot below shows one frame from this simulation. The size of
 each target is its current radar cross-section, the color is the current detection status.
-The vectors on the sphere representing the AWACS indicate the current direction of the
-platform and the current direction of the radar lobe. The visualization is done in 
-ParaView.
+The vector on the sphere representing the AWACS indicates the current direction of 
+the radar lobe. The visualization is done in [ParaView](https://www.paraview.org).
 
 ![AWACS racetrack](images/tut_5_1c.png)
 
-Cimba is able to harness all the computing power available in modern computer 
+Cimba is able to harness *all* the computing power available in modern computer 
 architectures for your simulation purposes, whatever they are.
 
 ### What do you mean by "well engineered"?
@@ -370,22 +427,21 @@ can find [more details here](https://cimba.readthedocs.io/en/latest/background.h
 
 The stackful coroutines for simulated processes are combined with a higher
 level of concurrency in the Posix pthreads managing the trials and replications in an
-experiment design, and with a lower level of massive parallelism in GPGPU-based
+experiment design, and with a lower level of massive parallelism in GP GPU-based
 physics calculations. These three layers of concurrency have clearly separated
 semantics in the model code.
 
 The C code is liberally sprinkled with `assert` statements testing for preconditions,
 invariants, and postconditions wherever possible, applying 
 [Design by Contract](https://en.wikipedia.org/wiki/Design_by_contract) 
-principles for high reliability. The Cimba library contains 958 asserts in 7132 lines of 
-C code, for a very high assert density of 13.4 %. These are custom-written 
-assert macros that will report 
+principles for high reliability. As of v 3.0, the Cimba library contains 9623 
+lines of C code. Of these, there are 1175 assert statements, for a very high assert 
+density of 12 %. These are custom-written assert macros that will report 
 what trial, what process, the simulated time, the function and line number, and even the 
 random number seed used, if anything should go wrong. All time-consuming invariants and 
 postconditions are debug asserts, while the release asserts mostly check preconditions 
 like function argument validity. Turning off the debug asserts doubles the speed of your
-model when you are ready for it, while turning off the release asserts as well gives 
-a small incremental improvement. (Again, 
+model when you are ready for it. (Again, 
 [more explanation here](https://cimba.readthedocs.io/en/latest/background.html#error-handling-the-loud-crashing-noise).)
 
 Extensive unit testing of each module ensures that
@@ -412,11 +468,11 @@ Hence (like the Linux kernel), we chose the simpler platform for speed, clarity,
 and reliability. If you need to call Cimba from some other language, the C calling
 convention is well-known and well-documented.
 
-### Version 3.0.0, you say. Why haven't I heard about Cimba before?
+### Version 3.0, you say. Why haven't I heard about Cimba before?
 Because it was not made public before. What retrospectively can be called Cimba 1.0
 was implemented in K&R C at MIT in the early 1990's, followed by a parallelized
 version 2.0 in ANSI C and Perl around 1995–96. The present version written in 
-C17 with POSIX pthreads is the third major rebuild, and the first public version.
+C23 with POSIX pthreads is the third major rebuild, and the first public version.
 
 ### You had me at "free." How do I get my hands on Cimba?
 It is right here. You clone the repository, build, and install it. You

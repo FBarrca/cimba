@@ -40,7 +40,6 @@ install_headers(
     'cmi_hashheap.h',
     'cmi_holdable.h',
     'cmi_slist.h',
-    'cmi_mempool.h',
     'cmi_memregistry.h',
     'cmi_memutils.h',
     'cmi_resourcebase.h',
@@ -51,13 +50,36 @@ install_headers(
 # Platform and operating system dependent source code
 subdir('port')
 
+# Link-time optimisation of the library, by default in release builds only
+# Not available on Windows due to the usual DLL issues
+cimba_lto = []
+cimba_lto_args = []
+lto_feature = get_option('lto')
+if host_machine.system() == 'windows'
+    cimba_lto = ['b_lto=false']
+    if lto_feature.enabled()
+        warning('-Dlto=enabled is ignored on Windows: LTO breaks MinGW DLL exports')
+    endif
+elif lto_feature.enabled() or (lto_feature.auto() and get_option('buildtype').startswith('release'))
+    cimba_lto = ['b_lto=true']
+    if get_option('default_library') != 'shared'
+        # Apple clang does not accept -ffat-lto-objects
+        cimba_lto_args = cc.get_supported_arguments('-ffat-lto-objects')
+    endif
+endif
+
+# Print a configuration summary
+summary({'LTO (libcimba)' : cimba_lto.contains('b_lto=true')}, section : 'Optimisation')
+
 cimba_lib = library('cimba',
                     sources,
                     include_directories : [inc_api, inc_int],
                     dependencies : [project_deps, codegen_deps],
                     install : true,
                     version : meson.project_version(),
-                    soversion : '1'
+                    soversion : '1',
+                    c_args : cimba_lto_args,
+                    override_options : cimba_lto
 )
 
 my_lib_dep = declare_dependency(

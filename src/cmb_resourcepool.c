@@ -428,11 +428,12 @@ static int64_t acquire_inner(struct cmb_resourcepool *rpp,
                              const uint64_t req_amount,
                              const bool preempt)
 {
-    cmb_assert_debug(rpp != NULL);
-    cmb_assert_debug(req_amount > 0u);
-    cmb_assert_debug(rpp->in_use <= rpp->capacity);
+    cmb_assert_release(rpp != NULL);
+    cmb_assert_release(req_amount > 0u);
+    cmb_assert_release(rpp->in_use <= rpp->capacity);
 
     struct cmb_process *caller = cmb_process_current();
+    cmb_assert_release(caller != NULL);
 
     /* Does the caller already hold some? */
     uint64_t initially_held = 0u;
@@ -633,20 +634,20 @@ void cmb_resourcepool_release(struct cmb_resourcepool *rpp,
     cmb_assert_release(rpp->in_use >= rel_amount);
     cmb_assert_release(rel_amount <= rpp->capacity);
     const struct cmi_resourcebase *rbp = &(rpp->core.base);
-    cmb_assert_debug(rbp->cookie == CMI_INITIALIZED);
+    cmb_assert_release(rbp->cookie == CMI_INITIALIZED);
 
     struct cmb_process *pp = cmb_process_current();
-    cmb_assert_debug(pp != NULL);
+    cmb_assert_release(pp != NULL);
     const uint64_t key = holder_key(pp);
 
     struct cmi_hashheap *hhp = &(rpp->holders);
     struct pool_item *pi = (struct pool_item *)cmi_hashheap_item(hhp, key);
-    cmb_assert_debug(pi->holder == pp);
+    cmb_assert_release(pi->holder == pp);
     cmb_logger_info(stdout,
                     "%s has %" PRIu64 ", releasing %" PRIu64 ", total in use %" PRIu64,
                     rbp->name, pi->amount, rel_amount, rpp->in_use);
-    cmb_assert_debug(pi->amount >= rel_amount);
-    cmb_assert_debug(pi->amount <= rpp->in_use);
+    cmb_assert_release(pi->amount >= rel_amount);
+    cmb_assert_release(pi->amount <= rpp->in_use);
 
     if (pi->amount == rel_amount) {
         /* Release all we have, delete the record from the resource */

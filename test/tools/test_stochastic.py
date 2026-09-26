@@ -17,6 +17,7 @@ Exit code is 0 only if every test passes.
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -58,15 +59,20 @@ class StochasticTest:
 TESTS: list[StochasticTest] = [
     StochasticTest(name="buffer", binary="test_buffer", seed=0x34f05c64d7ad598f),
     StochasticTest(name="condition", binary="test_condition", seed=0x34f05c64d7ad598f),
-    StochasticTest(name="data", binary="test_data", seed=0x34f05c64d7ad598f, timeout=300),
+    StochasticTest(name="data", binary="test_data", seed=0x34f05c64d7ad598f,
+                   timeout=300),
     StochasticTest(name="event", binary="test_event", seed=0x34f05c64d7ad598f),
     StochasticTest(name="hashheap", binary="test_hashheap", seed=0x34f05c64d7ad598f),
     StochasticTest(name="objectqueue", binary="test_objectqueue", seed=0x34f05c64d7ad598f),
     StochasticTest(name="priorityqueue", binary="test_priorityqueue", seed=0x34f05c64d7ad598f),
-    StochasticTest(name="random",  binary="test_random",  seed=0x34f05c64d7ad598f, timeout=300),
+    StochasticTest(name="random",  binary="test_random",  seed=0x34f05c64d7ad598f,
+                   timeout=600),
     StochasticTest(name="resource", binary="test_resource", seed=0x34f05c64d7ad598f),
     StochasticTest(name="resourceguard", binary="test_resourceguard", seed=0x34f05c64d7ad598f),
     StochasticTest(name="resourcepool", binary="test_resourcepool", seed=0x34f05c64d7ad598f),
+    StochasticTest(name="testutils", binary="test_testutils", seed=0x34f05c64d7ad598f),
+    StochasticTest(name="MM1", binary="test_MM1", seed=0x34f05c64d7ad598f,
+                   timeout=600),
 ]
 
 
@@ -87,22 +93,28 @@ fail = lambda s: _colour(s, RED)
 warn = lambda s: _colour(s, YELLOW)
 bold = lambda s: _colour(s, BOLD)
 
+LOG_LINE_NUMBER_RE = re.compile(
+    r'^(\s*\S+\s+\S+\s+[A-Za-z_][A-Za-z0-9_]* )\(\d+\)(:\s+)'
+)
+
 
 def normalise(raw: bytes) -> list[str]:
-    """
-    Decode and normalise output for comparison.
-
-    - Decodes as UTF-8, replacing undecodable bytes so a partial output
-      does not cause a confusing UnicodeDecodeError.
-    - Splits on universal newlines, stripping all CR/LF variation.
-    - Drops trailing blank lines so a missing final newline is not a
-      spurious diff.
-    """
+    """Decode output and normalise platform-dependent line endings."""
     text = raw.decode("utf-8", errors="replace")
-    lines = text.splitlines()           # handles \n, \r\n, \r uniformly
+    lines = text.splitlines()
+
     while lines and not lines[-1].strip():
         lines.pop()
+
     return lines
+
+
+def normalise_for_comparison(lines: list[str]) -> list[str]:
+    """Remove non-semantic source line-number differences from logger output."""
+    return [
+        LOG_LINE_NUMBER_RE.sub(r'\1(<LINE>)\2', line)
+        for line in lines
+    ]
 
 
 def run_binary(test: StochasticTest) -> tuple[int, bytes, bytes]:
@@ -190,12 +202,16 @@ def verify_test(test: StochasticTest) -> bool:
     actual   = normalise(stdout)
     expected = normalise(test.ref_path.read_bytes())
 
-    if actual == expected:
+    actual_cmp   = normalise_for_comparison(actual)
+    expected_cmp = normalise_for_comparison(expected)
+
+    if actual_cmp == expected_cmp:
         print(ok(f"  [PASS] Output matches reference ({len(actual)} lines)"))
         return True
 
     print(fail(f"  [FAIL] Output differs from reference"))
-    diff = diff_lines(expected, actual)
+    diff = diff_lines(expected_cmp, actual_cmp)
+
     # Print at most 40 diff lines to keep CI logs readable
     for line in diff[:40]:
         print(f"    {line}")

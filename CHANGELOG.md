@@ -1,11 +1,47 @@
 ## Cimba change log
 
-Note: Version numbers are MAJOR.MINOR.PATCH, but we do *not* promise to follow Semantic 
-Versioning in the strictest sense. There may be minor breaking changes in some obscure 
-corner without this warranting a new major release. We will summarize new features, 
-changes, and bug fixes below. For complete details, see the git commit history.
+Note: Version numbers are MAJOR.MINOR.PATCH per [Semantic Versioning](https://semver.org).
+We will only summarize new features, changes, and bug fixes below. For complete details, 
+see the git commit history.
 
-### 2026-08-30: 3.0.0 Release Candidate 2
+### 2026-09-22: 3.0.1
+* Bug fix: A multithreaded, purely event-based model would fire an assert from the 
+  memory registry. Added a clause for initialization in the is_empty predicate function.
+* Fixed performance regression due to Clang portability concerns, linker-time 
+  optimizations reinstated (not available for Windows due to DLL incompatibilities)
+* Performance improvement: Aligned hashheap arrays to 64-byte memory addresses.
+* Updated benchmark cases in documentation: Now runs the multithreaded M/M/1 benchmark 
+  case 70 times faster than SimPy, 65 times faster single-threaded.
+
+### 2026-09-20: 3.0.0
+* Minor bug fixes and documentation updates
+  * Promoted some debug asserts to release asserts to enforce function preconditions 
+    also in release builds.
+  * Ensured that new coroutines inherit the floating point control bits (in MXCSR 
+    register) from parent for consistent rounding modes throughout a model.
+* Bug fixes and improvements to the CI test matrix
+  * Added clang compiler for Linux cases, fixed some minor portability issues between 
+    gcc and clang
+  * Fixed Windows CI matrix bug, previously only running the release build, not debug.
+  * Added a test case on goodness-of-fit for distributions of number of customers in
+    system and customer time in system for an M/M/1 queuing model.
+* Updated benchmark numbers in documentation to reflect current performance.
+* Added a documentation section on result replicability across versions, compilers, and 
+  hardware.
+
+### 2026-09-16: 3.0.0-rc3 Release Candidate 3
+* Minor bug fixes and performance improvements
+  * Data collector edge cases (such as taking the median of an empty set).
+  * Faster dataset sorting in debug builds.
+* Comprehensive statistical tests for pseudo-random number generators and 
+  distributions, all passing multiple quality tests.
+  * Surfaced and fixed a small bias for normal and exponential distributions, 
+    underrepresenting sample values close to zero (exponential) or to the mean 
+    (normal). Measured bias -3.1 % for t <= 0.001, affecting all versions of Cimba 
+    before Sep 15, 2026 (fixed in commit d80a2ea)
+* Expanded documentation section on pseudo-random number generator verification.
+
+### 2026-08-30: 3.0.0-rc2 Release Candidate 2
 * Minor bug fixes and performance improvements.
 * Faster random number algorithms for integer-valued distributions (Poisson, binomial, 
   geometric, Pascal) based on transformed rejection methods.
@@ -13,7 +49,7 @@ changes, and bug fixes below. For complete details, see the git commit history.
 * Better-looking autoscaling of histograms.
 * Runs 15-30 % faster than RC1 on our M/M/1 queue benchmarks.
 
-### 2026-08-21: 3.0.0 Release Candidate 1
+### 2026-08-21: 3.0.0-rc1 Release Candidate 1
 * Possibly breaking change: Tightened enforcement of the Create - Initialize -
   Terminate - Destroy object lifecycle, necessary for proper memory recovery in error
   handling for multithreaded trials.
@@ -52,7 +88,6 @@ changes, and bug fixes below. For complete details, see the git commit history.
   GitHub CI runners after each git push.
 * Coroutines adapted for Windows 11 and modern CPUs with improved stack security measures.
 * Added `cmb_random_fmix64()` to bootstrap deterministic thread seeds from a master seed.
-* Added tutorial 5 demonstrating CUDA integration.
 
 ### 2025-12-27: 3.0.0 beta
 * Initial public version

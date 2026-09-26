@@ -238,9 +238,10 @@ int64_t cmb_resource_acquire(struct cmb_resource *rp)
     cmb_assert_release(rp != NULL);
     const struct cmi_resourcebase *rbp = &(rp->core.base);
     cmb_assert_release(rbp->cookie == CMI_INITIALIZED);
+    struct cmb_process *pp = cmb_process_current();
+    cmb_assert_release(pp != NULL);
 
     cmb_logger_info(stdout, "Acquiring resource %s", rbp->name);
-    struct cmb_process *pp = cmb_process_current();
 
     /* On the first attempt we may grab only if no one is already queued, so a
      * new caller never jumps ahead of waiting processes. After we have waited
@@ -303,7 +304,7 @@ void cmb_resource_release(struct cmb_resource *rp) {
  */
 static void wakeup_event_preempt(void *vp, void *arg)
 {
-    cmb_assert_debug(vp != NULL);
+    cmb_assert_release(vp != NULL);
 
     struct cmb_process *pp = (struct cmb_process *)vp;
     cmb_logger_info(stdout, "Wakes %s signal %" PRIi64,
@@ -323,6 +324,7 @@ int64_t cmb_resource_preempt(struct cmb_resource *rp)
 
     int64_t ret;
     struct cmb_process *pp = cmb_process_current();
+    cmb_assert_release(pp != NULL);
     const int64_t myprio = pp->priority;
     struct cmi_holdable *hrp = &(rp->core);
     cmb_logger_info(stdout, "Preempting resource %s", hrp->base.name);

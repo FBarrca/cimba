@@ -22,6 +22,7 @@ cc = meson.get_compiler('c')
 common_flags = [
     '-Wno-pedantic',
     '-fno-semantic-interposition',
+    '-ffp-contract=off',
 ]
 
 if host_machine.system() == 'linux'
@@ -44,14 +45,13 @@ endif
 # 'debug'    : full asserts and logging, no optimization
 # 'release'  : standard optimized build, release asserts only
 buildtype_flags = {
-    'debug'   : ['-fno-omit-frame-pointer'],
-    'release' : ['-DNDEBUG', '-DNLOGINFO'],
+    'debug'   : ['-fno-omit-frame-pointer', '-Og'],
+    'release' : ['-DNDEBUG', '-DNLOGINFO', '-O3'],
     'plain'   : [],
 }
 
-# No-holds-barred optimized build: meson setup --buildtype=release -Dbenchopt=use
-benchopt_flags = [
-    '-O3',
+# No-holds-barred optimized build: meson setup --buildtype=release -Dpgo=use
+pgo_flags = [
     '-DNDEBUG',
     '-DNLOGINFO',
     '-DNASSERT',
@@ -61,8 +61,7 @@ benchopt_flags = [
 ]
 
 # Need to generate profile before using it
-benchopt_gen_flags = [
-    '-O3',
+pgo_gen_flags = [
     '-DNDEBUG',
     '-DNLOGINFO',
     '-DNASSERT',
@@ -74,24 +73,19 @@ benchopt_gen_flags = [
 buildtype = get_option('buildtype')
 desired_flags = common_flags + buildtype_flags.get(buildtype, [])
 
-if get_option('benchopt') == 'generate'
-    desired_flags += benchopt_gen_flags
-elif get_option('benchopt') == 'use'
-    desired_flags += benchopt_flags
+if cc.get_id() == 'gcc'
+    # Suppress spurious gcc warnings related to its own glibc macros
+     desired_flags += ['-Wno-clobbered']
+endif
+
+if get_option('pgo') == 'generate'
+    desired_flags += pgo_gen_flags
+elif get_option('pgo') == 'use'
+    desired_flags += pgo_flags
 endif
 
 if host_machine.system() == 'linux'
-    # The initial-exec model is faster than the default global-dynamic for TLS
-    # access  and is safe as long as the library is loaded at program startup
-    # (i.e. linked directly, not via dlopen at runtime).
-    # The NASM objects carry no GNU CET property notes, so linking Cimba on
-    # Linux clears IBT/SHSTK and runs the host process without Intel CET.
-    # Intentional, as the hand-rolled context switch isn't CET-safe, and mirrors
-    # -fcf-protection=none on Windows here.
-    desired_flags += ['-ftls-model=initial-exec',
-                      '-flto=auto',
-                      '-fuse-linker-plugin'
-    ]
+    desired_flags += ['-ftls-model=initial-exec' ]
 endif
 
 if host_machine.system() == 'windows'
@@ -124,6 +118,12 @@ if get_option('external_context_switch_wrapper')
         language : 'c',
     )
 endif
+
+# Print a configuration summary
+summary({'PGO'             : get_option('pgo'),
+         'Release asserts' : get_option('pgo') == 'none',
+         'MXCSR isolation' : get_option('pgo') == 'none'},
+        section : 'Optimisation', bool_yn : true)
 
 # Build Cimba
 subdir('include')

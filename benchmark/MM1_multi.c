@@ -28,7 +28,7 @@
 #define NUM_OBJECTS 1000000u
 #define ARRIVAL_RATE 0.9
 #define SERVICE_RATE 1.0
-#define NUM_TRIALS 100
+#define NUM_TRIALS 128
 
 CMB_THREAD_LOCAL struct cmi_mempool objectpool = CMI_MEMPOOL_STATIC_INIT(8u, 512u);
 
@@ -51,7 +51,7 @@ struct context {
     struct trial *trl;
 };
 
-void *arrivalfunc(struct cmb_process *me, void *vctx)
+void *arrival_proc(struct cmb_process *me, void *vctx)
 {
     cmb_unused(me);
     const struct context *ctx = vctx;
@@ -69,7 +69,7 @@ void *arrivalfunc(struct cmb_process *me, void *vctx)
     return NULL;
 }
 
-void *servicefunc(struct cmb_process *me, void *vctx)
+void *service_proc(struct cmb_process *me, void *vctx)
 {
     cmb_unused(me);
     const struct context *ctx = vctx;
@@ -106,10 +106,10 @@ void run_trial(void *vtrl)
     cmb_objectqueue_initialize(sim->queue, "Queue", CMB_UNLIMITED);
 
     sim->arrival = cmb_process_create();
-    cmb_process_initialize(sim->arrival, "Arrival", arrivalfunc, ctx, 0);
+    cmb_process_initialize(sim->arrival, "Arrival", arrival_proc, ctx, 0);
     cmb_process_start(sim->arrival);
     sim->service = cmb_process_create();
-    cmb_process_initialize(sim->service, "Service", servicefunc, ctx, 0);
+    cmb_process_initialize(sim->service, "Service", service_proc, ctx, 0);
     cmb_process_start(sim->service);
 
     cmb_event_queue_execute();
@@ -137,10 +137,7 @@ int main(void)
         trl->sum_wait = 0.0;
     }
 
-    cimba_run(experiment,
-                         NUM_TRIALS,
-                         sizeof(*experiment),
-                         run_trial);
+    cimba_run(experiment, NUM_TRIALS, sizeof(*experiment), run_trial);
 
     struct cmb_datasummary summary;
     cmb_datasummary_initialize(&summary);
@@ -160,6 +157,7 @@ int main(void)
         const double ci_l = mean_tsys - ci_w;
         const double ci_u = mean_tsys + ci_w;
 
+        /* Note: We did not use a warm-up period, some undershoot bias will occur */
         printf("Average system time %f (n %u, conf.int. %f - %f, expected %f)\n",
                mean_tsys, un, ci_l, ci_u, 1.0 / (SERVICE_RATE - ARRIVAL_RATE));
 

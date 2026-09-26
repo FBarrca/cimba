@@ -30,17 +30,15 @@
 #define CIMBA_VERSION_MAJOR 3
 #define CIMBA_VERSION_MINOR 0
 #define CIMBA_VERSION_PATCH 0
-#define CIMBA_VERSION_PRE_RELEASE RC2
 
 #define CMI_STRINGIFY(x) #x
 
-#define CMI_TOSTRING(A, B, C, D) CMI_STRINGIFY(A) "." CMI_STRINGIFY(B) "." \
-                                 CMI_STRINGIFY(C) "-" CMI_STRINGIFY(D)
+#define CMI_TOSTRING(A, B, C) \
+                CMI_STRINGIFY(A) "." CMI_STRINGIFY(B) "." CMI_STRINGIFY(C)
 
 #define CIMBA_VERSION CMI_TOSTRING(CIMBA_VERSION_MAJOR, \
                                    CIMBA_VERSION_MINOR, \
-                                   CIMBA_VERSION_PATCH, \
-                                   CIMBA_VERSION_PRE_RELEASE)
+                                   CIMBA_VERSION_PATCH)
 /** \endcond */
 
 /**
@@ -121,10 +119,11 @@ typedef void (cimba_trial_func)(void *trial_struct);
  * pseudo-random number generators. The generators should be initialized with a
  * seed at the start of each trial. If you just want independent trials with no
  * need for reproducibility, call `cmb_random_hwseed()` to get one based on
- * hardware entropy. It will provide each trial with a unique, truly random seed.
+ * hardware entropy. It will provide each trial with a high-entropy seed using
+ * the best available hardware entropy source for the platform.
  *
  * If you need both randomness and reproducibility, call `cmb_random_hwseed()`
- * once in your main program to get a master seed, use `cmb_random_splitmix64()`
+ * once in your main program to get a master seed, use `cmb_random_fmix64()`
  * with that master seed and a running trial counter to get a unique and
  * reproducible seed for each trial, store this trial seed in your trial struct,
  * and then let the trial function use this pre-calculated and stored seed to

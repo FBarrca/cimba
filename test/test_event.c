@@ -32,7 +32,7 @@
 #include "cmb_random.h"
 #include "cmb_logger.h"
 
-#include "test.h"
+#include "testutils.h"
 
 #define USERFLAG 0x00000001
 
@@ -43,17 +43,18 @@ static const char *event_formatter(cmb_event_func *a, const void *s, const void 
 static void test_action(void *subject, void *object)
 {
     cmb_logger_user(stdout, USERFLAG, "%s", event_formatter(test_action, subject, object));
-    const uint64_t hdl = cmb_event_schedule(test_action, subject, object,
-                                            cmb_time() + cmb_random_exponential(10),
-                                            (int16_t)cmb_random_dice(1, 5));
+    const double t = cmb_time() + cmb_random_exponential(10.0);
+    const int64_t p = cmb_random_dice(1, 5);
+
+    const uint64_t hdl = cmb_event_schedule(test_action, subject, object, t, p);
     cmb_assert_always(hdl != 0u);
 }
 
 /* Another event: Closes the bar for good */
-static void end_sim(void *subject, void *object)
+static void end_sim_evnt(void *subject, void *object)
 {
-    cmb_logger_user(stdout, USERFLAG, "%s", event_formatter(end_sim, subject, object));
-    cmb_logger_user(stdout, USERFLAG, "===> end_sim: game over <===");
+    cmb_logger_user(stdout, USERFLAG, "%s", event_formatter(end_sim_evnt, subject, object));
+    cmb_logger_user(stdout, USERFLAG, "===> end_sim_evnt: game over <===");
     cmb_event_queue_clear();
 }
 
@@ -65,7 +66,7 @@ struct sym_tab_item {
 
 struct sym_tab_item sym_tab[] = {
     { "test_action", test_action },
-    { "end_sim", end_sim }
+    { "end_sim_evnt", end_sim_evnt }
 };
 
 static const char *evstrs[] = {"foo", "bar", "yuk"};
@@ -118,7 +119,7 @@ void test_events(const uint64_t seed)
     }
 
     printf("Scheduling end event\n");
-    uint64_t handle = cmb_event_schedule(end_sim, NULL, NULL, 100.0, 0);
+    uint64_t handle = cmb_event_schedule(end_sim_evnt, NULL, NULL, 100.0, 0);
     cmb_assert_always(handle != 0u);
     cmb_assert_always(cmb_event_is_scheduled(handle));
     cmb_event_queue_print(stdout, event_formatter);
@@ -220,7 +221,7 @@ int main(const int argc, char *argv[])
             case 's':
                 errno = 0;
                 seed = (uint64_t)strtoull(optarg, NULL, 0);
-                if (errno != 0 || seed == 0u) {
+                if (errno != 0) {
                     fprintf(stderr, "Invalid argument %s\n", optarg);
                     abort();
                 }

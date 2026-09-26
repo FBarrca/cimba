@@ -207,26 +207,34 @@ uint64_t cmb_wtdsummary_merge(struct cmb_wtdsummary *tgt,
     ts->count = dsp1->count + dsp2->count;
     ts->min = (dsp1->min < dsp2->min) ? dsp1->min : dsp2->min;
     ts->max = (dsp1->max > dsp2->max) ? dsp1->max : dsp2->max;
+    if (ts->count > 0u) {
+        const double w1 = ws1->wsum;
+        const double w2 = ws2->wsum;
+        const double ws = w1 + w2;
+        const double d21 = dsp2->m1 - dsp1->m1;
+        const double d21_w = d21 / ws;
+        const double d21_w_2 = d21_w * d21_w;
+        const double d21_w_3 = d21_w * d21_w_2;
 
-    const double w1 = ws1->wsum;
-    const double w2 = ws2->wsum;
-    const double ws = w1 + w2;
-    const double d21 = dsp2->m1 - dsp1->m1;
-    const double d21_w = d21 / ws;
-    const double d21_w_2 = d21_w * d21_w;
-    const double d21_w_3 = d21_w * d21_w_2;
-
-    tws.wsum = ws;
-    ts->m1 = dsp1->m1 + w2 * d21_w;
-    ts->m2 = dsp1->m2 + dsp2->m2
-                      + w1 * w2 * d21 * d21_w;
-    ts->m3 = dsp1->m3 + dsp2->m3
-                      + w1 * w2 * (w1 - w2) * d21 * d21_w_2
-                      + 3.0 * (w1 * dsp2->m2 - w2 * dsp1->m2) * d21_w;
-    ts->m4 = dsp1->m4 + dsp2->m4
-                      + w1 * w2 * (w1 * w1 - w1 * w2 + w2 * w2) * d21 * d21_w_3
-                      + 6.0 * (w1 * w1 * dsp2->m2 + w2 * w2 * dsp1->m2) * d21_w_2
-                      + 4.0 * (w1 * dsp2->m3 - w2 * dsp1->m3) * d21_w;
+        tws.wsum = ws;
+        ts->m1 = dsp1->m1 + w2 * d21_w;
+        ts->m2 = dsp1->m2 + dsp2->m2
+                          + w1 * w2 * d21 * d21_w;
+        ts->m3 = dsp1->m3 + dsp2->m3
+                          + w1 * w2 * (w1 - w2) * d21 * d21_w_2
+                          + 3.0 * (w1 * dsp2->m2 - w2 * dsp1->m2) * d21_w;
+        ts->m4 = dsp1->m4 + dsp2->m4
+                          + w1 * w2 * (w1 * w1 - w1 * w2 + w2 * w2) * d21 * d21_w_3
+                          + 6.0 * (w1 * w1 * dsp2->m2 + w2 * w2 * dsp1->m2) * d21_w_2
+                          + 4.0 * (w1 * dsp2->m3 - w2 * dsp1->m3) * d21_w;
+    }
+    else {
+        tws.wsum = 0.0;
+        ts->m1 = 0.0;
+        ts->m2 = 0.0;
+        ts->m3 = 0.0;
+        ts->m4 = 0.0;
+    }
 
     if (tgt->ds.cookie == CMI_INITIALIZED) {
         cmb_wtdsummary_terminate(tgt);
@@ -248,7 +256,7 @@ uint64_t cmb_wtdsummary_merge(struct cmb_wtdsummary *tgt,
 
 void cmb_wtdsummary_print(const struct cmb_wtdsummary *wsp,
                           FILE *fp,
-                          const bool lead_ins)
+                          const bool legend)
 {
     cmb_assert_release(wsp != NULL);
     cmb_assert_release(wsp->ds.cookie == CMI_INITIALIZED);
@@ -256,31 +264,41 @@ void cmb_wtdsummary_print(const struct cmb_wtdsummary *wsp,
 
     const uint64_t count = cmb_wtdsummary_count(wsp);
 
-    int r = fprintf(fp, "%s%8" PRIu64, ((lead_ins) ? "N " : ""), count);
-    cmb_assert_release(r > 0);
-
-    if (count > 0u) {
-        r = fprintf(fp, "%s%#8.4g",
-                    ((lead_ins) ? "  Mean " : "\t"), cmb_wtdsummary_mean(wsp));
+    int r = 0;
+    if (legend ) {
+        r = fprintf(fp, "Count   \tMean    \tStdDev  \tVariance\tSkewness\tExcess kurtosis\n");
         cmb_assert_release(r > 0);
     }
+
+    if (count < 100000u) {
+        r = fprintf(fp, "%8" PRIu64, count);
+    }
+    else {
+        r = fprintf(fp, "%#8.4g", (double)count);
+    }
+
+    cmb_assert_release(r > 0);
+    if (count > 0u) {
+        const double mean = cmb_wtdsummary_mean(wsp);
+        r = fprintf(fp, "\t%#8.4g", mean);
+        cmb_assert_release(r > 0);
+    }
+
     if (count > 1u) {
         const double var = cmb_wtdsummary_variance(wsp);
-        r = fprintf(fp, "%s%#8.4g",
-                    ((lead_ins) ? "  StdDev " : "\t"), cmb_wtdsummary_stddev(wsp));
+        r = fprintf(fp, "\t%#8.4g", cmb_wtdsummary_stddev(wsp));
         cmb_assert_release(r > 0);
-        r = fprintf(fp, "%s%#8.4g",
-                    ((lead_ins) ? "  Variance " : "\t"), var);
+        r = fprintf(fp, "\t%#8.4g", var);
         cmb_assert_release(r > 0);
     }
+
     if (count > 2u) {
-        r = fprintf(fp, "%s%#8.4g",
-                    ((lead_ins) ? "  Skewness " : "\t"), cmb_wtdsummary_skewness(wsp));
+        r = fprintf(fp, "\t%#8.4g", cmb_wtdsummary_skewness(wsp));
         cmb_assert_release(r > 0);
     }
+
     if (count > 3u) {
-        r = fprintf(fp, "%s%#8.4g",
-                    ((lead_ins) ? "  Kurtosis " : "\t"), cmb_wtdsummary_kurtosis(wsp));
+        r = fprintf(fp, "\t%#8.4g", cmb_wtdsummary_kurtosis(wsp));
         cmb_assert_release(r > 0);
     }
 

@@ -46,13 +46,13 @@ static void test_action(void *subject, void *object)
 }
 
 /* Another event: Closes the bar for good */
-static void end_sim(void *subject, void *object)
+static void end_sim_evnt(void *subject, void *object)
 {
     cmb_unused(subject);
     cmb_unused(object);
 
-    cmb_logger_info(stdout, "%p\t%s\t%s", (void *)end_sim, (char *)subject, (char *)object);
-    cmb_logger_warning(stdout, "===> end_sim: game over <===");
+    cmb_logger_info(stdout, "%p\t%s\t%s", (void *)end_sim_evnt, (char *)subject, (char *)object);
+    cmb_logger_warning(stdout, "===> end_sim_evnt: game over <===");
     cmb_event_queue_clear();
 }
 
@@ -107,7 +107,7 @@ void test_logger(uint64_t seed)
     }
 
     const double two_days = 2.0 * 24.0 * 60.0;
-    cmb_event_schedule(end_sim, NULL, NULL, two_days, 0);
+    cmb_event_schedule(end_sim_evnt, NULL, NULL, two_days, 0);
     while (cmb_event_execute_next()) { }
 }
 
@@ -121,7 +121,7 @@ int main(int argc, char *argv[])
             case 's':
                 errno = 0;
                 seed = (uint64_t)strtoull(optarg, NULL, 0);
-                if (errno != 0 || seed == 0u) {
+                if (errno != 0) {
                     fprintf(stderr, "Invalid argument %s\n", optarg);
                     abort();
                 }

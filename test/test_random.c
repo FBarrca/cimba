@@ -33,12 +33,11 @@
 #include "cmb_dataset.h"
 #include "cmb_random.h"
 
-#include "test.h"
+#include "testutils.h"
 
 /* Test macros */
 #define MOMENTS 15
 #define ACFS 15
-#define LEADINS true
 
 #define QTEST_PREPARE() \
     struct cmb_dataset ds = { 0 }; \
@@ -56,10 +55,16 @@
     struct cmb_datasummary dsu = { 0 }; \
     cmb_datasummary_initialize(&dsu); \
     cmb_dataset_summarize(&ds, &dsu); \
-    printf("Actual:   "); \
-    cmb_datasummary_print(&dsu, stdout, LEADINS); \
+    cmb_datasummary_print(&dsu, stdout, false); \
     cmb_dataset_histogram_print(&ds, stdout, 20, 0.0, 0.0); \
     cmb_datasummary_terminate(&dsu)
+
+#define QTEST_GOF_CONT(cdf, ctx) \
+    struct cmi_test_outcome result = { 0 }; \
+    cmi_test_gof_cont(cdf, ctx, &ds, &result); \
+    cmi_test_outcome_print(&result, stdout); \
+    cmb_assert_always((result.status == CMI_TEST_OK) \
+                  && (fabs(result.combined_sigma) < 6.0))
 
 #define QTEST_REPORT_ACFS() \
     printf("\nAutocorrelation factors (expected 0.0):\n"); \
@@ -72,17 +77,15 @@
     cmb_dataset_correlogram_print(&ds, stdout, ACFS, pacf)
 
 #define QTEST_FINISH() \
-    cmb_dataset_terminate(&ds); \
-    cmi_test_print_line("=")
+    cmb_dataset_terminate(&ds)
 
-static void print_single(const char *lead, const bool has_val, const double val)
+static void print_single(const bool has_val, const double val)
 {
-    printf("  %s ", lead);
     if (has_val) {
-        printf("%#8.4g", val);
+        printf("\t%#8.4g", val);
     }
     else {
-        printf("   ---  ");
+        printf("\t   ---  ");
     }
 }
 
@@ -92,18 +95,44 @@ static void print_expected(const uint64_t n,
                            const bool has_skew, const double skew,
                            const bool has_kurt, const double kurt)
 {
-    printf("\nExpected: N %8" PRIu64, n);
-    print_single("Mean", has_mean, mean);
-    print_single("StdDev", has_var, sqrt(var));
-    print_single("Variance", has_var, var);
-    print_single("Skewness", has_skew, skew);
-    print_single("Kurtosis", has_kurt, kurt);
+    printf("Expected vs actual:\n");
+    printf("Count   \tMean    \tStdDev  \tVariance\tSkewness\tExcess kurtosis\n");
+    if (n < 100000u) {
+        printf("%8" PRIu64, n);
+    }
+    else {
+        printf("%#8.4g", (double)n);
+    }
+
+    print_single(has_mean, mean);
+    print_single(has_var, sqrt(var));
+    print_single(has_var, var);
+    print_single(has_skew, skew);
+    print_single(has_kurt, kurt);
     printf("\n");
 }
 
 /**** Start of test scripts ****/
 
-static void test_quality_random(uint64_t nsamples)
+static double cdf_u01(const double x, void *ctx)
+{
+    cmb_unused(ctx);
+
+    double r;
+    if (x <= 0.0) {
+        r = 0;
+    }
+    if (x >= 1.0) {
+        r = 1.0;
+    }
+    else {
+        r = x;
+    }
+
+    return r;
+}
+
+static void test_quality_random(const uint64_t nsamples)
 {
     printf("\nQuality testing basic random number generator cmb_random(), uniform on [0,1)\n");
 
@@ -148,10 +177,43 @@ static void test_quality_random(uint64_t nsamples)
     }
     cmi_test_print_line("-");
 
+    /* Run goodness-of-fit test battery, no CDF transform needed */
+    printf("Testing Goodness of Fit vs the U(0,1) distribution\n");
+    struct cmi_test_outcome result = { 0 };
+    cmi_test_gof_cont(cdf_u01, NULL, &ds, &result);
+    cmi_test_outcome_print(&result, stdout);
+    cmb_assert_always((result.status == CMI_TEST_OK)
+                      && (fabs(result.combined_sigma) < 6.0));
+
     QTEST_FINISH();
 }
 
-static void test_quality_uniform(uint64_t nsamples, const double a, const double b)
+struct cdf_uniform_params {
+    double a;
+    double b;
+};
+
+static double cdf_uniform(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_uniform_params *pp = ctx;
+    cmb_assert_debug(pp->a <= pp->b);
+
+    double r;
+    if (x <= pp->a) {
+        r = 0.0;
+    }
+    else if (x < pp->b) {
+        r = (x - pp->a) / (pp->b - pp->a);
+    }
+    else {
+        r = 1.0;
+    }
+
+    return r;
+}
+
+static void test_quality_uniform(const uint64_t nsamples, const double a, const double b)
 {
     printf("\nQuality testing cmb_random_uniform(%g,%g)\n", a, b);
     QTEST_PREPARE();
@@ -162,10 +224,22 @@ static void test_quality_uniform(uint64_t nsamples, const double a, const double
     print_expected(nsamples, true, 0.5 * (a + b), true, var, true, 0.0, true, -6.0 / 5.0);
 
     QTEST_REPORT();
+
+    struct cdf_uniform_params cdfpar = { .a = a, .b = b };
+    QTEST_GOF_CONT(cdf_uniform, &cdfpar);
     QTEST_FINISH();
 }
 
-static void test_quality_std_exponential(uint64_t nsamples)
+static double cdf_std_exp(const double x, void *ctx)
+{
+    cmb_unused(ctx);
+
+    const double r = 1.0 - exp(-x);
+
+    return r;
+}
+
+static void test_quality_std_exponential(const uint64_t nsamples)
 {
     printf("\nQuality testing standard exponential distribution, mean = 1\n");
     QTEST_PREPARE();
@@ -175,6 +249,7 @@ static void test_quality_std_exponential(uint64_t nsamples)
 
     QTEST_REPORT();
     QTEST_REPORT_ACFS();
+    QTEST_GOF_CONT(cdf_std_exp, NULL);
     QTEST_FINISH();
 }
 
@@ -182,15 +257,11 @@ static void test_quality_std_exponential(uint64_t nsamples)
 static double exponential_inv(const double m)
 {
     cmb_assert_release(m > 0.0);
-    double x;
 
-    /* In the extremely unlikely case of exact zero, reject it and retry */
-    while ((x = cmb_random()) == 0.0) { }
-
-    return -log(x) * m;
+    return -log(1.0 - cmb_random()) * m;
 }
 
-static void test_speed_exponential(uint64_t nsamples, const double m)
+static void test_speed_exponential(const uint64_t nsamples, const double m)
 {
     printf("\nSpeed testing standard exponential distribution\n");
     printf("\nInversion method, drawing %" PRIu64 " samples...", nsamples);
@@ -218,7 +289,22 @@ static void test_speed_exponential(uint64_t nsamples, const double m)
     cmi_test_print_line("=");
 }
 
-static void test_quality_exponential(uint64_t nsamples, const double m)
+struct cdf_exp_params {
+    double m;
+};
+
+static double cdf_exp(const double x, void *ctx)
+{
+    cmb_unused(ctx);
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_exp_params *pp = ctx;
+
+    const double r = 1.0 - exp(-x / pp->m);
+
+    return r;
+}
+
+static void test_quality_exponential(const uint64_t nsamples, const double m)
 {
     printf("\nQuality testing exponential distribution, mean = %f\n", m);
     QTEST_PREPARE();
@@ -227,8 +313,72 @@ static void test_quality_exponential(uint64_t nsamples, const double m)
     print_expected(nsamples, true, m, true, m * m, true, 2.0, true, 6.0);
 
     QTEST_REPORT();
+
+    struct cdf_exp_params pp = { .m = m };
+    QTEST_GOF_CONT(cdf_exp, &pp);
     QTEST_FINISH();
 }
+
+static void test_tail_std_exponential(const uint64_t nsamples)
+{
+    const double t[] = {0.0005, 0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.1 };
+    const unsigned n_t = sizeof t / sizeof t[0];
+
+    struct cmb_dataset ds_z = { 0 };
+    struct cmb_dataset ds_i = { 0 };
+    cmb_dataset_initialize(&ds_z);
+    cmb_dataset_initialize(&ds_i);
+
+    for (uint64_t ui = 0; ui < nsamples; ui++) {
+        const double x = cmb_random_std_exponential();
+        cmb_dataset_add(&ds_z, x);
+        const double y = exponential_inv(1.0);
+        cmb_dataset_add(&ds_i, y);
+    }
+
+    printf("\nBinomial tail test, standard exponential, n = %" PRIu64 "\n", nsamples);
+    printf("t        expected      obs (zig)      deficit      sigma      obs (inv)      deficit      sigma\n");
+
+    double sigma_max = 0.0;
+    for (unsigned ut = 0; ut < n_t; ut++) {
+        uint64_t cnt_z = 0u;
+        uint64_t cnt_i = 0u;
+        for (uint64_t ui = 0; ui < ds_z.count; ui++) {
+            const double x = ds_z.xa[ui];
+            if (x <= t[ut]) {
+                cnt_z++;
+            }
+
+            const double y = ds_i.xa[ui];
+            if (y <= t[ut]) {
+                cnt_i++;
+            }
+        }
+
+        const double p  = 1.0 - exp(-t[ut]);
+        const double e  = (double)nsamples * p;
+        const double sd = sqrt((double)nsamples * p * (1.0 - p));
+        const double zz  = ((double)cnt_z - e) / sd;
+        const double zi  = ((double)cnt_i - e) / sd;
+
+        printf("%-8.3f %12.1f %12" PRIu64 " %10.4f%% %10.2f %12" PRIu64 " %10.4f%% %10.2f\n",
+               t[ut], e,
+               cnt_z, 100.0 * (e - (double)cnt_z) / e, zz,
+               cnt_i, 100.0 * (e - (double)cnt_i) / e, zi);
+
+        /* Focus on the quality of the production code, track ziggurat only */
+        const double sig_abs = fabs(zz);
+        if (sig_abs > sigma_max) {
+            sigma_max = sig_abs;
+        }
+    }
+
+    cmb_dataset_terminate(&ds_i);
+    cmb_dataset_terminate(&ds_z);
+
+    cmb_assert_always(sigma_max < 5.0);
+}
+
 
 /* Normal distribution using Box-Muller approach for comparison purposes */
 static double normal_bm(const double m, const double s)
@@ -269,7 +419,16 @@ static double normal_raw_moment(const uint16_t n, const double mu, const double 
     }
 }
 
-static void test_quality_std_normal(uint64_t nsamples)
+static double cdf_std_normal(const double x, void *ctx)
+{
+    cmb_unused(ctx);
+
+    const double r = 0.5 * (1.0 - erf(x / sqrt(2.0)));
+
+    return r;
+}
+
+static void test_quality_std_normal(const uint64_t nsamples)
 {
     printf("\nQuality testing standard normal distribution, mean = 0, sigma = 1\n");
     QTEST_PREPARE();
@@ -325,10 +484,26 @@ static void test_quality_std_normal(uint64_t nsamples)
 
     }
 
+    QTEST_GOF_CONT(cdf_std_normal, NULL);
     QTEST_FINISH();
 }
 
-static void test_quality_normal(uint64_t nsamples, const double m, const double s)
+struct cdf_normal_params {
+    double m;
+    double s;
+};
+
+static double cdf_normal(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_normal_params *pp = ctx;
+
+    const double r = 0.5 * (1.0 - erf((x - pp->m) / (pp->s * sqrt(2.0))));
+
+    return r;
+}
+
+static void test_quality_normal(const uint64_t nsamples, const double m, const double s)
 {
     printf("\nQuality testing normal distribution, mean = %f, sigma = %f\n", m, s);
     QTEST_PREPARE();
@@ -337,10 +512,12 @@ static void test_quality_normal(uint64_t nsamples, const double m, const double 
     print_expected(nsamples, true, m, true, s * s, true, 0.0, true, 0.0);
 
     QTEST_REPORT();
+    struct cdf_normal_params pp = { .m = m, .s = s };
+    QTEST_GOF_CONT(cdf_normal, &pp);
     QTEST_FINISH();
 }
 
-static void test_speed_normal(uint64_t nsamples, const double m, const double s)
+static void test_speed_normal(const uint64_t nsamples, const double m, const double s)
 {
     printf("\nSpeed testing normal distribution\n");
     printf("\nBox Muller method, drawing %" PRIu64 " samples...", nsamples);
@@ -368,7 +545,96 @@ static void test_speed_normal(uint64_t nsamples, const double m, const double s)
     cmi_test_print_line("=");
 }
 
-static void test_quality_triangular(uint64_t nsamples, const double a, const double b, const double c)
+static void test_tail_std_normal(const uint64_t nsamples)
+{
+    const double t[] = {0.0005, 0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.1 };
+    const unsigned n_t = sizeof t / sizeof t[0];
+
+    struct cmb_dataset ds_z = { 0 };
+    struct cmb_dataset ds_i = { 0 };
+    cmb_dataset_initialize(&ds_z);
+    cmb_dataset_initialize(&ds_i);
+
+    for (uint64_t ui = 0; ui < nsamples; ui++) {
+        const double x = cmb_random_std_normal();
+        cmb_dataset_add(&ds_z, x);
+        const double y = normal_bm(0.0, 1.0);
+        cmb_dataset_add(&ds_i, y);
+    }
+
+    printf("\nBinomial tail test, standard normal, n = %" PRIu64 "\n", nsamples);
+    printf("t        expected      obs (zig)      deficit      sigma      obs (B-M)      deficit      sigma\n");
+
+    double sigma_max = 0.0;
+    for (unsigned ut = 0; ut < n_t; ut++) {
+        uint64_t cnt_z = 0u;
+        uint64_t cnt_i = 0u;
+        for (uint64_t ui = 0; ui < ds_z.count; ui++) {
+            const double x = ds_z.xa[ui];
+            if (fabs(x) <= t[ut]) {
+                cnt_z++;
+            }
+
+            const double y = ds_i.xa[ui];
+            if (fabs(y) <= t[ut]) {
+                cnt_i++;
+            }
+        }
+
+        const double p  = erf(t[ut] / sqrt(2.0));
+        const double e  = (double)nsamples * p;
+        const double sd = sqrt((double)nsamples * p * (1.0 - p));
+        const double zz  = ((double)cnt_z - e) / sd;
+        const double zi  = ((double)cnt_i - e) / sd;
+
+        printf("%-8.4f %12.1f %12" PRIu64 " %10.4f%% %10.2f %12" PRIu64 " %10.4f%% %10.2f\n",
+               t[ut], e,
+               cnt_z, 100.0 * (e - (double)cnt_z) / e, zz,
+               cnt_i, 100.0 * (e - (double)cnt_i) / e, zi);
+
+        /* Focus on the quality of the production code, track ziggurat only */
+        const double sig_abs = fabs(zz);
+        if (sig_abs > sigma_max) {
+            sigma_max = sig_abs;
+        }
+    }
+
+    cmb_dataset_terminate(&ds_i);
+    cmb_dataset_terminate(&ds_z);
+
+    cmb_assert_always(sigma_max < 5.0);
+}
+
+struct cdf_triang_params {
+    double a;
+    double b;
+    double c;
+};
+
+static double cdf_triang(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_triang_params *pp = ctx;
+    cmb_assert_debug((pp->a <= pp->b) && (pp->b <= pp->c) && (pp->a < pp->c));
+
+    double r;
+    if (x <= pp->a) {
+        r = 0.0;
+    }
+    else if (x < pp->b) {
+        r = ((x - pp->a) * (x - pp->a)) / ((pp->b - pp->a) * (pp->c - pp->a));
+    }
+    else if (x < pp->c) {
+        r = 1.0 - ((pp->c - x) * (pp->c - x)) / ((pp->c - pp->b) * (pp->c - pp->a));
+    }
+    else {
+        r = 1.0;
+    }
+
+    return r;
+}
+
+static void test_quality_triangular(const uint64_t nsamples, const double a, const double b, const double c)
 {
     printf("\nQuality testing cmb_random_triangular(%g, %g, %g)\n", a, b, c);
     QTEST_PREPARE();
@@ -383,18 +649,66 @@ static void test_quality_triangular(uint64_t nsamples, const double a, const dou
     print_expected(nsamples, true, mean, true, var, true, snum / sden, true, -3.0 / 5.0);
 
     QTEST_REPORT();
+
+    struct cdf_triang_params cdfpar = { .a = a, .b = b, .c = c };
+    QTEST_GOF_CONT(cdf_triang, &cdfpar);
+
     QTEST_FINISH();
 }
 
-static void test_quality_erlang(uint64_t nsamples, const unsigned k, const double m)
+struct cdf_erlang_params {
+    unsigned k;
+    double m;
+};
+
+static double cdf_erlang(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_erlang_params *pp = ctx;
+    cmb_assert_debug(pp->m > 0.0);
+
+    double r;
+    if (x <= 0.0) {
+        r = 0.0;
+    }
+    else {
+        /* CDF expressed in terms of y = lambda x = x / m */
+        const double y = x / pp->m;
+        const unsigned k = pp->k;
+        /* Start with zeroth term to avoid dividing by zero, y^0 / 0! = 1.0 */
+        double t = 1.0;
+        double sum = 1.0;
+        for (unsigned ui = 1u; ui < k; ui++) {
+            t *= y / (double)ui;
+            sum += t;
+        }
+
+        r = 1.0 - exp(-y) * sum;
+
+        /* Cross-check: Erlang(k, m) is Gamma(k, m) at integer shape, so the
+         * direct series and the incomplete gamma must agree. */
+        double lp;
+        cmi_test_log_incomplete_gamma((double)pp->k, y, &lp, NULL);
+        cmb_assert_debug(fabs(r - exp(lp)) < 1e-12);
+    }
+
+    return r;
+}
+
+static void test_quality_erlang(const uint64_t nsamples, const unsigned k, const double m)
 {
     printf("\nQuality testing cmb_random_erlang(%u, %g)\n", k, m);
     QTEST_PREPARE();
     QTEST_EXECUTE(cmb_random_erlang(k, m), x >= 0.0);
 
-    print_expected(nsamples, true, k * m, true, k * m * m, true, 2.0 / sqrt((double)k), true, 6.0 / (double)k);
+    print_expected(nsamples, true, k * m, true, k * m * m,
+                             true, 2.0 / sqrt((double)k), true, 6.0 / (double)k);
 
     QTEST_REPORT();
+
+    struct cdf_erlang_params cdfpar = { .k = k, .m = m };
+    QTEST_GOF_CONT(cdf_erlang, &cdfpar);
+
     QTEST_FINISH();
 }
 
@@ -418,7 +732,8 @@ static void test_quality_hypoexponential(const uint64_t nsamples, const unsigned
         msumcube += m[i] * m[i] * m[i];
     }
 
-    print_expected(nsamples, true, msum, true, msumsq, true, 2.0 * msumcube / pow(msumsq, 1.5), false, 0.0);
+    print_expected(nsamples, true, msum, true, msumsq,
+                             true, 2.0 * msumcube / pow(msumsq, 1.5), false, 0.0);
 
     QTEST_REPORT();
     QTEST_FINISH();
@@ -457,6 +772,29 @@ static void test_quality_hyperexponential(const uint64_t nsamples,
     QTEST_FINISH();
 }
 
+struct cdf_weibull_params {
+    double shape;
+    double scale;
+};
+
+static double cdf_weibull(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_weibull_params *pp = ctx;
+
+    double r;
+    if (x < 0.0) {
+        r = 0.0;
+    }
+    else {
+        const double sh = pp->shape;
+        const double sc = pp->scale;
+        r = (1.0 - exp(-pow(x / sc, sh)));
+    }
+
+    return r;
+}
+
 static void test_quality_weibull(const uint64_t nsamples,
                                  const double shape,
                                  const double scale)
@@ -474,7 +812,27 @@ static void test_quality_weibull(const uint64_t nsamples,
     print_expected(nsamples, true, mean, true, var, false, 0.0, false, 0.0);
 
     QTEST_REPORT();
+
+    struct cdf_weibull_params cdfpar = { .shape = shape, .scale = scale };
+    QTEST_GOF_CONT(cdf_weibull, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_lognorm_params {
+    double m;
+    double s;
+};
+
+static double cdf_lognorm(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_lognorm_params *pp = ctx;
+
+    const double m = pp->m;
+    const double s = pp->s;
+
+    return 0.5 * erfc(-(log(x) - m) / (s * sqrt(2.0)));
 }
 
 static void test_quality_lognormal(const uint64_t nsamples, const double m, const double s)
@@ -488,10 +846,30 @@ static void test_quality_lognormal(const uint64_t nsamples, const double m, cons
     const double skew = (exp(s * s) + 2.0) * sqrt(exp(s * s) - 1);
     const double kurt = exp(4.0 * s * s) + 2.0 * exp(3.0 * s * s) + 3.0 * exp (2.0 * s * s) - 6;
 
-    print_expected(nsamples, true, mean, true,var,true, skew, true, kurt);
+    print_expected(nsamples, true, mean, true, var, true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    struct cdf_lognorm_params cdfpar = { .m = m, .s = s };
+    QTEST_GOF_CONT(cdf_lognorm, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_logistic_params {
+    double m;
+    double s;
+};
+
+static double cdf_logistic(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    struct cdf_lognorm_params *pp = ctx;
+
+    const double m = pp->m;
+    const double s = pp->s;
+
+    return 1.0 / (1.0 + exp(-(x - m) / s));
 }
 
 static void test_quality_logistic(const uint64_t nsamples, const double m, const double s)
@@ -502,10 +880,30 @@ static void test_quality_logistic(const uint64_t nsamples, const double m, const
 
     const double var = s * s * M_PI * M_PI / 3.0;
 
-    print_expected(nsamples, true, m, true,var,true, 0.0, true, 6.0 / 5.0);
+    print_expected(nsamples, true, m, true, var, true, 0.0, true, 6.0 / 5.0);
 
     QTEST_REPORT();
+
+    struct cdf_logistic_params cdfpar = { .m = m, .s = s };
+    QTEST_GOF_CONT(cdf_logistic, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_cauchy_params {
+    double m;
+    double s;
+};
+
+static double cdf_cauchy(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    struct cdf_cauchy_params *pp = ctx;
+
+    const double m = pp->m;
+    const double s = pp->s;
+
+    return atan((x - m) / s) / M_PI + 0.5;
 }
 
 static void test_quality_cauchy(const uint64_t nsamples, const double m, const double s)
@@ -517,7 +915,30 @@ static void test_quality_cauchy(const uint64_t nsamples, const double m, const d
     print_expected(nsamples, false, 0.0, false,0.0,false, 0.0, false, 0.0);
 
     QTEST_REPORT();
+
+    struct cdf_cauchy_params cdfpar = { .m = m, .s = s };
+    QTEST_GOF_CONT(cdf_cauchy, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_gamma_params {
+    double shape;
+    double scale;
+};
+
+static double cdf_gamma(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    struct cdf_gamma_params *pp = ctx;
+
+    const double sh = pp->shape;
+    const double sc = pp->scale;
+    const double y = x / sc;
+    double lp;
+    cmi_test_log_incomplete_gamma(sh, y, &lp, NULL);
+
+    return exp(lp);
 }
 
 static void test_quality_gamma(const uint64_t nsamples, const double shape, const double scale)
@@ -534,7 +955,27 @@ static void test_quality_gamma(const uint64_t nsamples, const double shape, cons
     print_expected(nsamples, true, mean, true,var,true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    struct cdf_gamma_params cdfpar = { .shape = shape, .scale = scale };
+    QTEST_GOF_CONT(cdf_gamma, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_pareto_params {
+    double a;
+    double b;
+};
+
+static double cdf_pareto(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_pareto_params *pp = ctx;
+
+    const double a = pp->a;
+    const double b = pp->b;
+
+    return 1.0 - pow(b / x, a);
 }
 
 static void test_quality_pareto(const uint64_t nsamples, const double a, const double b)
@@ -546,13 +987,47 @@ static void test_quality_pareto(const uint64_t nsamples, const double a, const d
     const double mean = (a > 1.0) ? (a * b / (a - 1.0)) : HUGE_VAL;
     const double var = (a > 2.0) ? ((a * b * b) / ((a - 1.0) * (a - 1.0) * (a - 2.0))) : HUGE_VAL;
     const double skew = (a > 3.0) ? 2.0 * ((1.0 + a) / (a - 3.0)) * sqrt((a - 2.0) / a) : HUGE_VAL;
-    const double kurt = (a > 3.0) ? 6.0 * ( a * a * a + a * a - 6.0 * a - 2.0)
+    const double kurt = (a > 4.0) ? 6.0 * ( a * a * a + a * a - 6.0 * a - 2.0)
                                         / (a * (a - 3.0) * (a - 4)) : HUGE_VAL;
 
     print_expected(nsamples, (a > 1.0), mean, (a > 2.0),var,(a > 3.0), skew, (a > 3.0), kurt);
 
     QTEST_REPORT();
+
+    struct cdf_pareto_params cdfpar = { .a = a, .b = b };
+    QTEST_GOF_CONT(cdf_pareto, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_beta_params {
+    double a;
+    double b;
+    double l;
+    double r;
+};
+
+static double cdf_beta(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_beta_params *pp = ctx;
+    cmb_assert_debug(pp->l < pp->r);
+
+    double r;
+    if (x <= pp->l) {
+        r = 0.0;
+    }
+    else if (x >= pp->r) {
+        r = 1.0;
+    }
+    else {
+        const double y = (x - pp->l) / (pp->r - pp->l);
+        double lp;
+        cmi_test_log_incomplete_beta(pp->a, pp->b, y, &lp, NULL);
+        r = exp(lp);
+    }
+
+    return r;
 }
 
 static void test_quality_beta(const uint64_t nsamples,
@@ -571,9 +1046,28 @@ static void test_quality_beta(const uint64_t nsamples,
 
     print_expected(nsamples, true, mean, true, var,true, skew, true, kurt);
 
-
     QTEST_REPORT();
+
+    struct cdf_beta_params cdfpar = { .a = a, .b = b, .l = l, .r = r };
+    QTEST_GOF_CONT(cdf_beta, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_std_beta_params {
+    double a;
+    double b;
+};
+
+static double cdf_std_beta(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_std_beta_params *pp = ctx;
+
+    double lp;
+    cmi_test_log_incomplete_beta(pp->a, pp->b, x, &lp, NULL);
+
+    return exp(lp);
 }
 
 static void test_quality_std_beta(const uint64_t nsamples, const double a, const double b)
@@ -591,7 +1085,26 @@ static void test_quality_std_beta(const uint64_t nsamples, const double a, const
     print_expected(nsamples, true, mean, true, var,true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    struct cdf_std_beta_params cdfpar = { .a = a, .b = b };
+    QTEST_GOF_CONT(cdf_std_beta, &cdfpar);
+
     QTEST_FINISH();
+}
+
+/* PERT is Beta(alpha, beta) scaled to [left, right].  Lambda weights the
+ * mode: lambda = 4 gives the classic PERT, larger values concentrate the
+ * distribution more tightly around the mode. */
+static void pert_shapes(const double left, const double mode, const double right,
+                        const double lambda, double *alpha, double *beta)
+{
+    cmb_assert_debug(left < right);
+    cmb_assert_debug((mode >= left) && (mode <= right));
+    cmb_assert_debug(lambda > 0.0);
+
+    const double w = right - left;
+    *alpha = 1.0 + lambda * (mode - left) / w;
+    *beta  = 1.0 + lambda * (right - mode) / w;
 }
 
 static void test_quality_PERT(const uint64_t nsamples,
@@ -601,16 +1114,14 @@ static void test_quality_PERT(const uint64_t nsamples,
     QTEST_PREPARE();
     QTEST_EXECUTE(cmb_random_PERT(left, mode, right), (x >= left) && (x <= right));
 
-    const double a = left;
-    const double b = mode;
-    const double c = right;
+    double alpha;
+    double beta;
+    pert_shapes(left, mode, right, 4.0, &alpha, &beta);
 
-    const double alpha = (4.0 * b + c - 5.0 * a) / (c - a);
-    const double beta = (5.0 * c - a - 4.0 * b) / (c - a);
-    const double mu = (a + 4.0 * b + c) / 6.0;
-
-    const double mean = mu;
-    const double var = (mu - a) * (c - mu) / 7.0;
+    const double s = alpha + beta;
+    const double mean = left + (right - left) * alpha / s;
+    const double var  = (right - left) * (right - left) * alpha * beta
+                      / (s * s * (s + 1.0));
     const double skew = 2.0 * ((beta - alpha) * sqrt(alpha + beta + 1.0))
                         / ((alpha + beta + 2.0) * sqrt(alpha * beta));
     const double kurt = 6.0 * ((alpha - beta) * (alpha - beta) * (alpha + beta + 1.0)
@@ -620,7 +1131,63 @@ static void test_quality_PERT(const uint64_t nsamples,
     print_expected(nsamples, true, mean, true,var,true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    struct cdf_beta_params cdfpar = { .a = alpha, .b = beta, .l = left, .r = right };
+    QTEST_GOF_CONT(cdf_beta, &cdfpar);
+
     QTEST_FINISH();
+}
+
+static void test_quality_PERT_mod(const uint64_t nsamples,
+                              const double left, const double mode, const double right,
+                              const double lambda)
+{
+    printf("\nQuality testing modified PERT distribution, left %g, mode %g, right %g, lambda %g\n",
+            left, mode, right, lambda);
+    QTEST_PREPARE();
+    QTEST_EXECUTE(cmb_random_PERT_mod(left, mode, right, lambda), (x >= left) && (x <= right));
+
+    double alpha;
+    double beta;
+    pert_shapes(left, mode, right, lambda, &alpha, &beta);
+
+    const double s = alpha + beta;
+    const double mean = left + (right - left) * alpha / s;
+    const double var  = (right - left) * (right - left) * alpha * beta
+                      / (s * s * (s + 1.0));
+    const double skew = 2.0 * ((beta - alpha) * sqrt(alpha + beta + 1.0))
+                        / ((alpha + beta + 2.0) * sqrt(alpha * beta));
+    const double kurt = 6.0 * ((alpha - beta) * (alpha - beta) * (alpha + beta + 1.0)
+                                   - alpha * beta * (alpha + beta + 2.0))
+                            / (alpha * beta * (alpha + beta + 2.0) * (alpha + beta + 3.0));
+
+    print_expected(nsamples, true, mean, true,var,true, skew, true, kurt);
+
+    QTEST_REPORT();
+
+    struct cdf_beta_params cdfpar = { .a = alpha, .b = beta, .l = left, .r = right };
+    QTEST_GOF_CONT(cdf_beta, &cdfpar);
+
+    QTEST_FINISH();
+}
+
+
+struct cdf_chisq_params {
+    double v;
+};
+
+static double cdf_chisq(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    struct cdf_chisq_params *pp = ctx;
+
+    const double v = pp->v;
+    const double a = v / 2.0;
+    const double b = x / 2.0;
+    double lp;
+    cmi_test_log_incomplete_gamma(a, b, &lp, NULL);
+
+    return exp(lp);
 }
 
 static void test_quality_chisquare(const uint64_t nsamples, const double v)
@@ -632,7 +1199,30 @@ static void test_quality_chisquare(const uint64_t nsamples, const double v)
     print_expected(nsamples, true, v, true, 2.0 * v,
                                  true, sqrt(8.0 / v), true, 12.0 / v);
     QTEST_REPORT();
+
+    struct cdf_chisq_params cdfpar = { .v = v };
+    QTEST_GOF_CONT(cdf_chisq, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_f_params {
+    double a;
+    double b;
+};
+
+static double cdf_f(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_f_params *pp = ctx;
+    const double a = 0.5 * pp->a;
+    const double b = 0.5 * pp->b;
+    const double y = a * x / (a * x + b);
+
+    double lp;
+    cmi_test_log_incomplete_beta(a, b, y, &lp, NULL);
+
+    return exp(lp);
 }
 
 static void test_quality_f_dist(const uint64_t nsamples, const double a, const double b) {
@@ -648,7 +1238,29 @@ static void test_quality_f_dist(const uint64_t nsamples, const double a, const d
     print_expected(nsamples, (b > 2.0), mean, (b > 4.0),var,(b > 6.0), skew, false, 0.0);
 
     QTEST_REPORT();
+
+    struct cdf_f_params cdfpar = { .a = a, .b = b };
+    QTEST_GOF_CONT(cdf_f, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_stdt_params {
+    double v;
+};
+
+static double cdf_stdt(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_stdt_params *pp = ctx;
+    const double v = pp->v;
+
+    const double y = v / (v + x * x);
+    double lp;
+    cmi_test_log_incomplete_beta(0.5 * v, 0.5, y, &lp, NULL);
+
+    const double half = 0.5 * exp(lp);
+    return (x > 0.0) ? (1.0 - half) : half;
 }
 
 static void test_quality_std_t_dist(const uint64_t nsamples, const double v)
@@ -665,7 +1277,36 @@ static void test_quality_std_t_dist(const uint64_t nsamples, const double v)
     print_expected(nsamples, (v > 1.0), mean, (v > 2.0),var,(v > 3.0), skew, (v > 4.0), kurt);
 
     QTEST_REPORT();
+
+    struct cdf_stdt_params cdfpar = { .v = v };
+    QTEST_GOF_CONT(cdf_stdt, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_t_params {
+    double m;
+    double s;
+    double v;
+};
+
+static double cdf_t(double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    const struct cdf_t_params *pp = ctx;
+    const double m = pp->m;
+    const double s = pp->s;
+    const double v = pp->v;
+
+    const double a = 0.5 * v;
+    const double b = 0.5;
+    const double z = (x - m) / s;
+    const double y = v / (v + z * z);
+    double lp;
+    cmi_test_log_incomplete_beta(a, b, y, &lp, NULL);
+
+    const double half = 0.5 * exp(lp);
+    return (z > 0.0) ? (1.0 - half) : half;
 }
 
 static void test_quality_t_dist(const uint64_t nsamples,
@@ -681,7 +1322,32 @@ static void test_quality_t_dist(const uint64_t nsamples,
     print_expected(nsamples, (v > 1.0), mean, (v > 2.0),var,false, 0.0, false, 0.0);
 
     QTEST_REPORT();
+
+    struct cdf_t_params cdfpar = { .m = m, .s = s, .v = v };
+    QTEST_GOF_CONT(cdf_t, &cdfpar);
+
     QTEST_FINISH();
+}
+
+struct cdf_rayleigh_params {
+    double s;
+};
+
+static double cdf_rayleigh(const double x, void *ctx)
+{
+    cmb_assert_debug(ctx != NULL);
+    struct cdf_rayleigh_params *pp = ctx;
+    const double s = pp->s;
+
+    double r;
+    if (x <= 0.0) {
+        r = 0.0;
+    }
+    else {
+        r = 1.0 - exp(-x * x / (2.0 * s * s));
+    }
+
+    return r;
 }
 
 static void test_quality_rayleigh(const uint64_t nsamples, const double s)
@@ -698,9 +1364,12 @@ static void test_quality_rayleigh(const uint64_t nsamples, const double s)
     print_expected(nsamples, true, mean, true, var, true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    struct cdf_rayleigh_params cdfpar = { .s = s };
+    QTEST_GOF_CONT(cdf_rayleigh, &cdfpar);
+
     QTEST_FINISH();
 }
-
 
 static void test_quality_flip(const uint64_t nsamples)
 {
@@ -716,6 +1385,16 @@ static void test_quality_flip(const uint64_t nsamples)
     print_expected(nsamples, true, mean, true, var, true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    const double p_vec[4] = {       0.0, 0.5, 0.5, 0.0      };
+    const double v_vec[4] = { -INFINITY, 0.0, 1.0, INFINITY };
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(2u, p_vec, v_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+    cmi_free(result);
+
     QTEST_FINISH();
 }
 
@@ -734,6 +1413,16 @@ static void test_quality_bernoulli(const uint64_t nsamples, const double p)
     print_expected(nsamples, true, mean, true, var,true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    const double p_vec[4] = {       0.0,  q,   p,   0.0      };
+    const double v_vec[4] = { -INFINITY, 0.0, 1.0, INFINITY };
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(2u, p_vec, v_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+    cmi_free(result);
+
     QTEST_FINISH();
 }
 
@@ -752,6 +1441,29 @@ static void test_quality_geometric(const uint64_t nsamples, const double p)
     print_expected(nsamples, true, mean, true, var, true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    double pg_vec[22] = { 0 };
+    double vg_vec[22] = { 0 };
+
+    pg_vec[0] = 0.0;
+    vg_vec[0] = 0.0;
+
+    double pg_tmp = p;
+    for (unsigned ui = 1u; ui <= 20u; ui++) {
+        pg_vec[ui] = pg_tmp;
+        vg_vec[ui] = (double)ui;
+        pg_tmp *= q;
+    }
+
+    pg_vec[21] = pow(1.0 - p, 20.0);
+    vg_vec[21] = 20.0 + 1.0 / p;
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(20u, pg_vec, vg_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+    cmi_free(result);
+
     QTEST_FINISH();
 }
 
@@ -770,12 +1482,41 @@ static void test_quality_binomial(const uint64_t nsamples, const unsigned n, con
     print_expected(nsamples, true, mean, true, var,true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    const unsigned m = n + 1u;
+    double *p_vec = cmi_calloc(m + 2u, sizeof(*p_vec));
+    double *v_vec = cmi_calloc(m + 2u, sizeof(*v_vec));
+
+    p_vec[0] = 0.0;
+    v_vec[0] = -INFINITY;
+
+    const double lgn = lgamma((double)n + 1.0);
+    for (unsigned k = 0u; k <= n; k++) {
+        const double lpk = lgn - lgamma((double)k + 1.0)
+                               - lgamma((double)(n - k) + 1.0)
+                         + (double)k * log(p)
+                         + (double)(n - k) * log1p(-p);
+        p_vec[k + 1u] = exp(lpk);
+        v_vec[k + 1u] = (double)k;
+    }
+
+    p_vec[m + 1u] = 0.0;
+    v_vec[m + 1u] = INFINITY;
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(m, p_vec, v_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+    cmi_free(result);
+    cmi_free(v_vec);
+    cmi_free(p_vec);
+
     QTEST_FINISH();
 }
 
-static void test_quality_pascal(const uint64_t nsamples, const unsigned m, const double p)
+static void test_quality_pascal(const uint64_t nsamples, const uint64_t m, const double p)
 {
-    printf("\nQuality testing negative binomial (Pascal) distribution, m = %d, p = %g\n", m, p);
+    printf("\nQuality testing negative binomial (Pascal) distribution, m = %" PRIu64 ", p = %g\n", m, p);
     QTEST_PREPARE();
     QTEST_EXECUTE((double)cmb_random_pascal(m, p), x >= 0);
 
@@ -788,20 +1529,87 @@ static void test_quality_pascal(const uint64_t nsamples, const unsigned m, const
     print_expected(nsamples, true, mean, true, var, true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    const unsigned kmax = (unsigned)ceil(m * q / p + 12.0 * sqrt(m * q) / p) + 20u;
+
+    double *p_vec = cmi_calloc(kmax + 3u, sizeof(*p_vec));
+    double *v_vec = cmi_calloc(kmax + 3u, sizeof(*v_vec));
+
+    p_vec[0] = 0.0;
+    v_vec[0] = -INFINITY;
+
+    const double c = (double)m * log(p) - lgamma((double)m);
+    for (unsigned k = 0u; k <= kmax; k++) {
+        const double lpk = c + lgamma((double)k + (double)m)
+                             - lgamma((double)k + 1.0)
+                             + (double)k * log1p(-p);
+        p_vec[k + 1u] = exp(lpk);
+        v_vec[k + 1u] = (double)k;
+    }
+
+    double lt0, lt1;
+    cmi_test_log_incomplete_beta((double)kmax + 1.0, (double)m,       q, &lt0, NULL);
+    cmi_test_log_incomplete_beta((double)kmax,       (double)m + 1.0, q, &lt1, NULL);
+
+    p_vec[kmax + 2u] = exp(lt0);
+    v_vec[kmax + 2u] = ((double)m * q / p) * exp(lt1 - lt0);
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(kmax + 1u, p_vec, v_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+
+    cmi_free(result);
+    cmi_free(v_vec);
+    cmi_free(p_vec);
+
     QTEST_FINISH();
 }
 
-
-static void test_quality_poisson(const uint64_t nsamples, const double r)
+static void test_quality_poisson(const uint64_t nsamples, const double rate)
 {
-    printf("\nQuality testing Poisson distribution, r = %g\n", r);
+    printf("\nQuality testing Poisson distribution, rate = %g\n", rate);
 
     QTEST_PREPARE();
-    QTEST_EXECUTE((double)cmb_random_poisson(r), x >= 0);
+    QTEST_EXECUTE((double)cmb_random_poisson(rate), x >= 0);
 
-    print_expected(nsamples, true, r, true, r, true, 1.0 / sqrt(r), true, 1.0 / r);
+    print_expected(nsamples, true, rate, true, rate, true, 1.0 / sqrt(rate), true, 1.0 / rate);
 
     QTEST_REPORT();
+
+    /* Unbounded support: truncate well above the mean, and give the overflow
+     * cell the remaining probability with its own conditional mean. */
+    const unsigned kmax = (unsigned)ceil(rate + 15.0 * sqrt(rate)) + 20u;
+
+    double *p_vec = cmi_calloc(kmax + 3u, sizeof(*p_vec));
+    double *v_vec = cmi_calloc(kmax + 3u, sizeof(*v_vec));
+
+    p_vec[0] = 0.0;
+    v_vec[0] = -INFINITY;
+
+    const double llam = log(rate);
+    for (unsigned k = 0u; k <= kmax; k++) {
+        const double lpk = (double)k * llam - rate - lgamma((double)k + 1.0);
+        p_vec[k + 1u] = exp(lpk);
+        v_vec[k + 1u] = (double)k;
+    }
+
+    double lt0, lt1;
+    cmi_test_log_incomplete_gamma((double)kmax + 1.0, rate, &lt0, NULL);
+    cmi_test_log_incomplete_gamma((double)kmax, rate, &lt1, NULL);
+
+    p_vec[kmax + 2u] = exp(lt0);
+    v_vec[kmax + 2u] = rate * exp(lt1 - lt0);
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(kmax + 1u, p_vec, v_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+
+    cmi_free(result);
+    cmi_free(v_vec);
+    cmi_free(p_vec);
+
     QTEST_FINISH();
 }
 
@@ -814,12 +1622,37 @@ static void test_quality_dice(const uint64_t nsamples, const long a, const long 
     const double mean = (double)(a + b) / 2.0;
     const double var = ((double)(b - a + 1) * (double)(b - a + 1) - 1.0) / 12.0;
     const double skew = 0.0;
-    const double n = (double)(b - a + 1);
-    const double kurt = - (6.0 *(n * n  + 1.0)) / (5.0 * ((n * n - 1.0)));
+    const double dn = (double)(b - a + 1);
+    const double kurt = - (6.0 * (dn * dn  + 1.0)) / (5.0 * ((dn * dn - 1.0)));
 
     print_expected(nsamples, true, mean, true,var,true, skew, true, kurt);
 
     QTEST_REPORT();
+
+    const uint64_t n = b - a + 1u;
+    double *p_vec = cmi_calloc(n + 2u, sizeof(*p_vec));
+    double *v_vec = cmi_calloc(n + 2u, sizeof(*v_vec));
+    p_vec[0] = 0.0;
+    v_vec[0] = -INFINITY;
+
+    const double p = 1.0 / dn;
+    for (uint64_t ui = 1u; ui <= n; ui++) {
+        p_vec[ui] = p;
+        v_vec[ui] = (double)a + (double)(ui - 1u);
+    }
+
+    p_vec[n + 1] = 0.0;
+    v_vec[n + 1] = INFINITY;
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(n, p_vec, v_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+
+    cmi_free(result);
+    cmi_free(v_vec);
+    cmi_free(p_vec);
+
     QTEST_FINISH();
 }
 
@@ -865,6 +1698,29 @@ static void test_quality_loaded_dice(const uint64_t nsamples, const unsigned n, 
     print_discrete_expects(nsamples, n, pa);
 
     QTEST_REPORT();
+
+    double *p_vec = cmi_calloc(n + 2u, sizeof(*p_vec));
+    double *v_vec = cmi_calloc(n + 2u, sizeof(*v_vec));
+    p_vec[0] = 0.0;
+    v_vec[0] = -INFINITY;
+
+    for (uint64_t ui = 1u; ui <= n; ui++) {
+        p_vec[ui] = pa[ui - 1u];
+        v_vec[ui] = (double)(ui - 1u);
+    }
+
+    p_vec[n + 1] = 0.0;
+    v_vec[n + 1] = INFINITY;
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(n, p_vec, v_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+
+    cmi_free(result);
+    cmi_free(v_vec);
+    cmi_free(p_vec);
+
     QTEST_FINISH();
 }
 
@@ -878,7 +1734,31 @@ static void test_quality_vose_alias(const uint64_t nsamples, const unsigned n, c
     print_discrete_expects(nsamples, n, pa);
 
     QTEST_REPORT();
+
+    double *p_vec = cmi_calloc(n + 2u, sizeof(*p_vec));
+    double *v_vec = cmi_calloc(n + 2u, sizeof(*v_vec));
+    p_vec[0] = 0.0;
+    v_vec[0] = -INFINITY;
+
+    for (uint64_t ui = 1u; ui <= n; ui++) {
+        p_vec[ui] = pa[ui - 1u];
+        v_vec[ui] = (double)(ui - 1u);
+    }
+
+    p_vec[n + 1] = 0.0;
+    v_vec[n + 1] = INFINITY;
+
+    struct cmi_test_outcome *result = cmi_malloc(sizeof(*result));
+    cmi_memset(result, 0, sizeof(*result));
+    cmi_test_gof_disc(n, p_vec, v_vec, &ds, result);
+    cmi_test_outcome_print(result, stdout);
+
+    cmi_free(result);
+    cmi_free(v_vec);
+    cmi_free(p_vec);
+
     cmb_random_alias_destroy(alp);
+
     QTEST_FINISH();
 }
 
@@ -950,7 +1830,7 @@ int main(const int argc, char *argv[])
                 errno = 0;
                 seed = (uint64_t)strtoull(optarg, NULL, 0);
                 fixed_seed = true;
-                if (errno != 0 || seed == 0u) {
+                if (errno != 0) {
                     fprintf(stderr, "Invalid argument %s\n", optarg);
                     abort();
                 }
@@ -959,7 +1839,7 @@ int main(const int argc, char *argv[])
                 timing_enabled = true;
                 break;
             default:
-                fprintf(stderr, "Usage: %s [-s <seed>][-t]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-n <nsamples>][-s <seed>][-t]\n", argv[0]);
                 return EXIT_FAILURE;
         }
     }
@@ -981,6 +1861,8 @@ int main(const int argc, char *argv[])
     test_quality_triangular(nsamples, -1.0, 2.0, 3.0);
 
     test_quality_std_normal(nsamples);
+    test_tail_std_normal(10u * nsamples);
+
     test_quality_normal(nsamples, 2.0, 1.0);
     if (fixed_seed == false) {
         /* Probably trying to compare outputs, and this one is not deterministic */
@@ -988,7 +1870,12 @@ int main(const int argc, char *argv[])
     }
 
     test_quality_std_exponential(nsamples);
+    test_tail_std_exponential(10u * nsamples);
+
     test_quality_exponential(nsamples, 2.0);
+    test_quality_exponential(nsamples, 0.01);
+    test_quality_exponential(nsamples, 1.0e6);
+
     if (fixed_seed == false) {
          test_speed_exponential(nsamples, 2.0);
     }
@@ -1016,8 +1903,10 @@ int main(const int argc, char *argv[])
     test_quality_beta(nsamples, 2.0, 5.0, 0.0, 1.0);
     test_quality_beta(nsamples, 0.5, 2.0, 0.0, 1.0);
     test_quality_beta(nsamples, 0.5, 0.5, 2.0, 5.0);
-    test_quality_beta(nsamples, 0.1, 0.5, -2.0, 2.0);
+    test_quality_beta(nsamples, 0.5, 0.5, -2.0, 2.0);
     test_quality_PERT(nsamples, 2.0, 5.0, 10.0);
+    test_quality_PERT_mod(nsamples, 2.0, 5.0, 10.0, 5.0);
+    test_quality_PERT_mod(nsamples, 2.0, 3.0, 5.0, 2.0);
     test_quality_pareto(nsamples, 3.0, 2.0);
 
     test_quality_chisquare(nsamples, 4);
@@ -1029,21 +1918,34 @@ int main(const int argc, char *argv[])
     printf("************************* Integer-valued distributions *************************\n");
 
     test_quality_flip(nsamples);
+
+    test_quality_bernoulli(nsamples, 0.1);
     test_quality_bernoulli(nsamples, 0.6);
+
     test_quality_geometric(nsamples, 0.1);
+    test_quality_geometric(nsamples, 0.6);
+
     test_quality_binomial(nsamples, 10, 0.1);
     test_quality_binomial(nsamples, 100, 0.5);
+    test_quality_binomial(nsamples, 50, 0.7);
+
     test_quality_pascal(nsamples, 10, 0.1);
+    test_quality_pascal(nsamples, 50, 0.7);
+    test_quality_pascal(nsamples, 1, 0.1);
 
     test_quality_poisson(nsamples, 5.0);
-    test_quality_poisson(nsamples, 50.0);
-    test_quality_poisson(nsamples, 1.0e13);
+    test_quality_poisson(nsamples, 16.9);
+    test_quality_poisson(nsamples, 17.1);
+    test_quality_poisson(nsamples, 100.0);
+    test_quality_poisson(nsamples, 5000.0);
 
     test_quality_dice(nsamples, 1, 6);
+    test_quality_dice(nsamples, -1, 5);
 
     double q[7] = { 0.05, 0.05, 0.1, 0.1, 0.2, 0.2, 0.3 };
     test_quality_loaded_dice(nsamples, 7, q);
     test_quality_vose_alias(nsamples, 7, q);
+
     if (fixed_seed == false) {
         test_speed_vose_alias(nsamples, 5, 50, 5);
     }
