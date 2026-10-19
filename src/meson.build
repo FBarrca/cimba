@@ -61,10 +61,17 @@ if host_machine.system() == 'windows'
         warning('-Dlto=enabled is ignored on Windows: LTO breaks MinGW DLL exports')
     endif
 elif lto_feature.enabled() or (lto_feature.auto() and get_option('buildtype').startswith('release'))
-    cimba_lto = ['b_lto=true']
-    if get_option('default_library') != 'shared'
-        # Apple clang does not accept -ffat-lto-objects
-        cimba_lto_args = cc.get_supported_arguments('-ffat-lto-objects')
+    # A static library is linked into consumers that are not themselves built
+    # with LTO, so it needs fat objects. Apple clang accepts
+    # -ffat-lto-objects on its own and then rejects it once -flto is set
+    # ("unsupported option '-ffat-lto-objects'"), so probe the pair.
+    if get_option('default_library') == 'shared'
+        cimba_lto = ['b_lto=true']
+    elif cc.has_multi_arguments('-flto', '-ffat-lto-objects')
+        cimba_lto = ['b_lto=true']
+        cimba_lto_args = ['-ffat-lto-objects']
+    elif lto_feature.enabled()
+        warning('-Dlto=enabled is ignored: this compiler cannot emit fat LTO objects for a static library')
     endif
 endif
 
