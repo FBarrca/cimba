@@ -127,10 +127,13 @@
     __attribute__((format(printf, fmt_idx, first_arg)))
 
 /*
- * Thread-local storage qualifier. _Thread_local is C11; on Linux we pin the TLS
- * model to initial-exec for fast access from the worker threads.
+ * Thread-local storage qualifier. _Thread_local is C11; on x86-64 Linux we pin
+ * the TLS model to initial-exec for fast access from the worker threads. Not on
+ * arm64 Linux: a library dlopen'ed late (e.g. from Python) can then fail with
+ * "cannot allocate memory in static TLS block", and the default TLS descriptor
+ * model is already cheap there.
  */
-#if CMI_OS == CMI_LINUX
+#if CMI_OS == CMI_LINUX && CMI_ARCH == CMI_AMD64
     #define CMB_THREAD_LOCAL _Thread_local __attribute__((tls_model("initial-exec")))
 #else
     #define CMB_THREAD_LOCAL _Thread_local
